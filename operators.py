@@ -10,6 +10,7 @@
 import bpy
 import math
 from . import utils
+from . import combine
 from mathutils import Vector
 from . import globalVariables as gvar
 
@@ -130,10 +131,51 @@ class CombineMotionData(bpy.types.Operator):
 
         return combined
     
+    def combine_pose(self, context):
+        scene = context.scene
+        # Always combine from the raw front data, so Combine Data can be re-run with other settings
+        front = gvar.positionList_raw if gvar.positionList_raw is not None else gvar.positionList
+        side = gvar.zlist
+        if not front or not side:
+            self.report({'ERROR'}, "Track both the front and the side video first")
+            return {'CANCELLED'}
+
+        have_meta = (len(gvar.position_times) == len(front) and len(gvar.position_vis) == len(front)
+                     and len(gvar.zlist_times) == len(side) and len(gvar.zlist_vis) == len(side))
+        method = scene.combine_method
+        if method == 'IMPROVED' and have_meta and len(front) >= 10 and len(side) >= 10:
+            combined, rep = combine.combine_improved(
+                front, side, gvar.position_times, gvar.zlist_times, gvar.position_vis, gvar.zlist_vis,
+                smoothing=scene.combine_smoothing, bone_strength=scene.combine_bone_strength,
+                offset=None if scene.combine_auto_offset else scene.combine_offset)
+            if scene.combine_auto_offset:
+                scene.combine_offset = rep["offset_s"]   # start manual tweaking from what was found
+            msg = "Combined: " + combine.format_report(rep)
+            level = {'WARNING'} if rep["sync_corr"] < 0.4 else {'INFO'}
+            if rep["sync_corr"] < 0.4:
+                msg += ". Low sync match: check that both videos show the same performance"
+        else:
+            combined = combine.combine_simple(front, side, 40)
+            msg = f"Combined {len(combined)} frames (original method)."
+            level = {'INFO'}
+            if method == 'IMPROVED':
+                msg = ("Improved combine needs frame times from tracking: re-track both videos with this "
+                       "version of the add-on. Used the original method.")
+                level = {'WARNING'}
+
+        if gvar.positionList_raw is None:
+            gvar.positionList_raw = list(front)
+        gvar.positionList = combined
+        if gvar.front_fps:
+            gvar.fps = gvar.front_fps   # the combined take runs at the front video's frame rate
+        print("[Open Mocap]", msg)
+        self.report(level, msg)
+        return {'FINISHED'}
+
     def execute(self, context):
 
         if self.mode == "pose":
-            gvar.positionList = self.combine_lists(gvar.positionList, gvar.zlist, 40)
+            return self.combine_pose(context)
 
         elif self.mode == "hand":
             # Right hand
@@ -164,6 +206,10 @@ class AnimatePose(bpy.types.Operator):
     """
 
     def execute(self, context):
+        if not gvar.positionList:
+            self.report({'ERROR'}, "No tracked pose data. Run Start Pose Tracking first "
+                                   "(the capture cache is emptied when Blender restarts or the add-on reloads)")
+            return {'CANCELLED'}
         gvar.bones_list.clear()
         gvar.object_list.clear()
         # --- Get or create collection ---
@@ -336,6 +382,11 @@ class AnimateHand(bpy.types.Operator):
             bpy.ops.screen.animation_play()
 
         else:
+            if not gvar.R_hand_positionList and not gvar.L_hand_positionList:
+                self.report({'ERROR'}, "No tracked hand data. Run Start Hand Tracking first "
+                                       "(the capture cache is emptied when Blender restarts or the add-on reloads)")
+                return {'CANCELLED'}
+
             # --- Create Right Hand ---
             if not self.hand_exists("R"):
                 self.create_hand(context, "R")
@@ -443,6 +494,11 @@ class BakeMotion(bpy.types.Operator):
             self.report({'ERROR'}, "Please select a valid Armature object")
             return {'CANCELLED'}
 
+        # mode_set and nla.bake work on the active object, so make the rig active first
+        if context.mode != 'OBJECT' and context.active_object is not obj:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        context.view_layer.objects.active = obj
+        obj.select_set(True)
         bpy.ops.object.mode_set(mode='POSE')
 
         # Determine bones to bake
@@ -458,11 +514,18 @@ class BakeMotion(bpy.types.Operator):
 
         self.report({'INFO'}, f"Baking motion for {len(bones)} bone(s)...")
 
-        # Deselect all bones
+        # Deselect all bones (pose bone selection lives on PoseBone since Blender 5.0)
+        def set_selected(pb, state):
+            if hasattr(pb, "select"):
+                pb.select = state
+            else:
+                pb.bone.select = state
+
+        bones = list(bones)
         for pb in obj.pose.bones:
-            pb.bone.select = False
+            set_selected(pb, False)
         for pb in bones:
-            pb.bone.select = True
+            set_selected(pb, True)
 
         # Perform bake
         bpy.ops.nla.bake(
@@ -499,6 +562,9 @@ class ClearMoCapCache(bpy.types.Operator):
         if self.cache == "pose":
             gvar.positionList.clear()
             gvar.zlist.clear()
+            for lst in (gvar.position_times, gvar.position_vis, gvar.zlist_times, gvar.zlist_vis):
+                lst.clear()
+            gvar.positionList_raw = None
             gvar.object_list.clear()
             gvar.bones_list.clear()
             self.report({'INFO'}, "Body Motion Capture data cleared.")
@@ -600,9 +666,13 @@ class ToggleCopyRotationConstraints(bpy.types.Operator):
             self.report({'WARNING'}, "Please select a valid armature rig.")
             return {'CANCELLED'}
 
+        # Manual copy constraints, plus the "OM ..." constraints made by Retarget to Mixamo
+        def is_mocap_constraint(c):
+            return c.type in {'COPY_ROTATION', 'COPY_LOCATION'} or c.name.startswith("OM ")
+
         # Check if at least one constraint is currently active (unmuted)
         any_enabled = any(
-            (c.type in {'COPY_ROTATION', 'COPY_LOCATION'}) and not c.mute
+            is_mocap_constraint(c) and not c.mute
             for bone in obj.pose.bones
             for c in bone.constraints
         )
@@ -614,12 +684,12 @@ class ToggleCopyRotationConstraints(bpy.types.Operator):
         # Toggle constraints
         for bone in obj.pose.bones:
             for c in bone.constraints:
-                if c.type in {'COPY_ROTATION', 'COPY_LOCATION'}:
+                if is_mocap_constraint(c):
                     c.mute = not enable
                     count += 1
 
         state = "enabled" if enable else "disabled"
-        self.report({'INFO'}, f"{count} Copy constraints {state}.")
+        self.report({'INFO'}, f"{count} mocap constraints {state}.")
         return {'FINISHED'}
     
 

@@ -1,20 +1,259 @@
+import time
+import threading
 import bpy
 import numpy as np
 from . import globalVariables as gvar
+from . import PackageInstaller
 
 
 
 # -------------------------------------------------------------
 # IMPORTING EXTERNAL LIBRARIES
 # -------------------------------------------------------------
-try:
-    import cv2
-    from cvzone.PoseModule import PoseDetector
-    from cvzone.HandTrackingModule import HandDetector
-except ModuleNotFoundError:
-    cv2 = None
-    PoseDetector = None
-    HandDetector = None
+# Imported lazily so the add-on can be enabled before the dependencies are installed,
+# and picks them up right after "Install Dependencies" without restarting Blender.
+cv2 = None
+mp = None
+mp_vision = None
+mp_base_options = None
+
+
+def load_libraries():
+    """
+        Import OpenCV and MediaPipe from the add-on's private package folder.
+        :return: True if both are available.
+    """
+    global cv2, mp, mp_vision, mp_base_options
+    if cv2 is not None and mp_vision is not None:
+        return True
+    PackageInstaller.add_lib_to_path()
+    try:
+        import cv2 as _cv2
+        import mediapipe as _mp
+        from mediapipe.tasks.python import vision as _vision
+        from mediapipe.tasks.python import BaseOptions as _BaseOptions
+    except ImportError as e:
+        print(f"[Open Mocap] Could not import OpenCV/MediaPipe: {e}")
+        return False
+    cv2, mp, mp_vision, mp_base_options = _cv2, _mp, _vision, _BaseOptions
+    return True
+
+
+
+# -------------------------------------------------------------
+# MEDIAPIPE TASKS DETECTORS
+# Drop-in replacements for the cvzone PoseDetector / HandDetector that the add-on
+# used with mediapipe 0.10.14. Landmarks are returned in the same format cvzone used:
+# [int(x * width), int(y * height), int(z * width)] in pixels.
+# -------------------------------------------------------------
+def close_in_background(detector):
+    """
+        Close a MediaPipe detector without blocking Blender. MediaPipe 0.10.33+ uploads usage logs
+        when a landmarker closes and waits for the upload (~1 s, ~40 s if the connection hangs).
+    """
+    def _close():
+        try:
+            detector.close()
+        except Exception as e:  # noqa: BLE001
+            print(f"[Open Mocap] Closing the tracker failed: {e}")
+    threading.Thread(target=_close, daemon=True, name="OpenMocapCloseTracker").start()
+
+
+class _TimestampClock:
+    """VIDEO running mode needs strictly increasing timestamps in milliseconds."""
+
+    def __init__(self, fps=None):
+        self.fps = fps
+        self.frame = 0
+        self.last = -1
+        self.start = time.monotonic()
+
+    def next(self):
+        if self.fps:
+            ts = int(self.frame * 1000.0 / self.fps)
+        else:
+            ts = int((time.monotonic() - self.start) * 1000.0)
+        self.frame += 1
+        ts = max(ts, self.last + 1)
+        self.last = ts
+        return ts
+
+
+def _to_mp_image(img_bgr):
+    rgb = np.ascontiguousarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    return mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+
+def _draw_landmarks(img, points, connections, line_color, point_color):
+    for c in connections:
+        if c.start < len(points) and c.end < len(points):
+            p1 = tuple(points[c.start][:2])
+            p2 = tuple(points[c.end][:2])
+            cv2.line(img, p1, p2, line_color, 2)
+    for p in points:
+        cv2.circle(img, tuple(p[:2]), 4, point_color, cv2.FILLED)
+
+
+class PoseDetector:
+    def __init__(self, fps=None, detection_con=0.5, track_con=0.5):
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=mp_base_options(model_asset_path=PackageInstaller.model_path("pose")),
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=detection_con,
+            min_pose_presence_confidence=detection_con,
+            min_tracking_confidence=track_con,
+        )
+        self.landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+        self.clock = _TimestampClock(fps)
+        self.visibility = []
+
+    def find_pose(self, img, draw=True):
+        """
+            :return: (img, landmarks). landmarks is a list of 33 [x, y, z] pixel
+                     coordinates, or an empty list if no person was found.
+                     self.visibility then holds the 33 visibility scores (0..1).
+        """
+        result = self.landmarker.detect_for_video(_to_mp_image(img), self.clock.next())
+        if not result.pose_landmarks:
+            self.visibility = []
+            return img, []
+        h, w = img.shape[:2]
+        landmarks = [[int(lm.x * w), int(lm.y * h), int(lm.z * w)] for lm in result.pose_landmarks[0]]
+        self.visibility = [lm.visibility if lm.visibility is not None else 1.0 for lm in result.pose_landmarks[0]]
+        if draw:
+            _draw_landmarks(img, landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
+                            (255, 255, 255), (255, 0, 255))
+        return img, landmarks
+
+    def close(self):
+        self.landmarker.close()
+
+
+# COCO-WholeBody (133 points, RTMW) -> MediaPipe pose layout (33 points) used by the add-on.
+# COCO body/feet/hands are the subject's own left/right, like MediaPipe.
+_WB_LHAND, _WB_RHAND = 91, 112
+_WB_TO_MP = [0, 1, 1, 1, 2, 2, 2, 3, 4, 23 + 54, 23 + 48,        # nose, eyes, ears, mouth corners
+             5, 6, 7, 8, 9, 10,                                  # shoulders, elbows, wrists
+             _WB_LHAND + 17, _WB_RHAND + 17,                     # pinky knuckles
+             _WB_LHAND + 5, _WB_RHAND + 5,                       # index knuckles
+             _WB_LHAND + 4, _WB_RHAND + 4,                       # thumb tips
+             11, 12, 13, 14, 15, 16,                             # hips, knees, ankles
+             19, 22, 17, 20]                                     # heels, big toes
+# RTMW scores are not 0..1. Calibrated against MediaPipe visibility on test footage:
+# ~2.4 -> <0.3, ~3.8 -> 0.5, ~4.9 -> 0.8, ~5.8 -> ~1.
+_RTMW_SCORE_LOW, _RTMW_SCORE_RANGE = 2.0, 3.5
+
+
+class RTMWDetector:
+    """
+        RTMW whole-body pose (rtmlib, ONNX Runtime) for x/y, with MediaPipe running alongside for
+        the depth estimate (RTMW has none). Same interface as PoseDetector.
+    """
+
+    def __init__(self, fps=None, device='dml'):
+        import rtmlib
+        from rtmlib.tools import base as rtm_base
+        rtm_base.RTMLIB_SETTINGS['onnxruntime'].setdefault('dml', 'DmlExecutionProvider')
+        self.model = rtmlib.Wholebody(
+            det=PackageInstaller.rtmw_model_path("det"), det_input_size=(640, 640),
+            pose=PackageInstaller.rtmw_model_path("pose"), pose_input_size=(288, 384),
+            backend='onnxruntime', device=device)
+        self.depth = PoseDetector(fps)
+        self.previous = None            # hip centre of the tracked person, to stay on the same one
+        self.visibility = []
+
+    def _pick_person(self, keypoints, scores):
+        body = keypoints[:, :23]
+        if self.previous is not None and len(keypoints) > 1:
+            hips = (keypoints[:, 11] + keypoints[:, 12]) / 2
+            return int(np.argmin(np.linalg.norm(hips - self.previous, axis=1)))
+        size = np.ptp(body[:, :, 0], axis=1) * np.ptp(body[:, :, 1], axis=1)
+        return int(np.argmax(size * scores[:, :23].mean(axis=1)))
+
+    def find_pose(self, img, draw=True):
+        """:return: (img, 33 [x, y, z] pixel landmarks or []), self.visibility like PoseDetector."""
+        _img, mp_landmarks = self.depth.find_pose(img, draw=False)
+        mp_visibility = self.depth.visibility
+        keypoints, scores = self.model(img)
+        if len(keypoints) == 0:
+            # RTMW found nobody: fall back to MediaPipe for this frame
+            self.visibility = mp_visibility
+            if draw and mp_landmarks:
+                _draw_landmarks(img, mp_landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
+                                (255, 255, 255), (255, 0, 255))
+            return img, mp_landmarks
+        k = self._pick_person(keypoints, scores)
+        pts, sc = keypoints[k][_WB_TO_MP], scores[k][_WB_TO_MP]
+        self.previous = (keypoints[k][11] + keypoints[k][12]) / 2
+        landmarks = [[int(x), int(y), (mp_landmarks[i][2] if mp_landmarks else 0)]
+                     for i, (x, y) in enumerate(pts)]
+        self.visibility = np.clip((sc - _RTMW_SCORE_LOW) / _RTMW_SCORE_RANGE, 0.0, 1.0).tolist()
+        if draw:
+            _draw_landmarks(img, landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
+                            (255, 255, 255), (0, 200, 0))
+        return img, landmarks
+
+    def close(self):
+        self.depth.close()
+        self.model = None
+
+
+def create_pose_detector(fps=None):
+    """The pose tracker chosen in the add-on preferences (falls back to MediaPipe)."""
+    if PackageInstaller.pose_tracker() == 'RTMW':
+        missing = PackageInstaller.rtmw_missing()
+        if not missing:
+            try:
+                det = RTMWDetector(fps, PackageInstaller.rtmw_device())
+                print(f"[Open Mocap] Pose tracker: RTMW ({PackageInstaller.rtmw_device()}) + MediaPipe depth")
+                return det
+            except Exception as e:  # noqa: BLE001
+                print(f"[Open Mocap] RTMW failed to start ({e}); using MediaPipe.")
+        else:
+            print(f"[Open Mocap] RTMW is not installed ({', '.join(missing)}); using MediaPipe. "
+                  "Click Install Dependencies in the add-on preferences.")
+    return PoseDetector(fps)
+
+
+class HandDetector:
+    def __init__(self, max_hands=2, fps=None, detection_con=0.5, track_con=0.5):
+        options = mp_vision.HandLandmarkerOptions(
+            base_options=mp_base_options(model_asset_path=PackageInstaller.model_path("hand")),
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_hands=max_hands,
+            min_hand_detection_confidence=detection_con,
+            min_hand_presence_confidence=detection_con,
+            min_tracking_confidence=track_con,
+        )
+        self.landmarker = mp_vision.HandLandmarker.create_from_options(options)
+        self.clock = _TimestampClock(fps)
+
+    def find_hands(self, img, draw=True):
+        """
+            :return: (hands, img). Each hand is {"type": "Right"/"Left", "lmList": 21 [x, y, z]}.
+        """
+        result = self.landmarker.detect_for_video(_to_mp_image(img), self.clock.next())
+        h, w = img.shape[:2]
+        hands = []
+        for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
+            lm_list = [[int(lm.x * w), int(lm.y * h), int(lm.z * w)] for lm in landmarks]
+            # The Tasks API reports the subject's own hand for a non-mirrored image,
+            # which is what cvzone produced after its flipType swap.
+            hand_type = handedness[0].category_name if handedness else "Right"
+            hands.append({"type": hand_type, "lmList": lm_list})
+            if draw:
+                _draw_landmarks(img, lm_list, mp_vision.HandLandmarksConnections.HAND_CONNECTIONS,
+                                (255, 255, 255), (255, 0, 255))
+                xs = [p[0] for p in lm_list]
+                ys = [p[1] for p in lm_list]
+                x0, y0, x1, y1 = min(xs) - 20, min(ys) - 20, max(xs) + 20, max(ys) + 20
+                cv2.rectangle(img, (x0, y0), (x1, y1), (255, 0, 255), 2)
+                cv2.putText(img, hand_type, (x0, y0 - 10), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 255), 2)
+        return hands, img
+
+    def close(self):
+        self.landmarker.close()
 
 
 
@@ -117,7 +356,8 @@ class VideoPlaneManager:
 
         # Create material with image texture
         mat = bpy.data.materials.new("CameraFeed_Mat")
-        mat.use_nodes = True
+        if bpy.app.version < (5, 0, 0):
+            mat.use_nodes = True  # always on (and deprecated) since Blender 5.0
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
         for n in list(nodes):
@@ -150,8 +390,11 @@ class VideoPlaneManager:
                 area.spaces[0].shading.type = 'MATERIAL'
 
         # Setup scene view transform and look
-        bpy.context.scene.view_settings.view_transform = 'Standard'
-        bpy.context.scene.view_settings.look = 'Medium High Contrast'
+        try:
+            bpy.context.scene.view_settings.view_transform = 'Standard'
+            bpy.context.scene.view_settings.look = 'Medium High Contrast'
+        except TypeError as e:
+            print(f"[Open Mocap] Could not set the view transform: {e}")
         
         print("Video plane ready for realtime feed.")
         return cls.plane_obj
@@ -203,10 +446,10 @@ class PoseTracking:
         self.mode = mode
         self.running = False
         """
-            It uses cvzone.PoseModule (uses mediapipe) to do pose tracking.
+            It uses the MediaPipe Tasks PoseLandmarker to do pose tracking.
         """
-        if cv2 is None:
-            print("OpenCV (cv2) is not installed! Install via the Addon Preferences first.")
+        if not load_libraries():
+            print("OpenCV/MediaPipe are not installed! Install via the Addon Preferences first.")
             return
 
         # Determine video path or realtime mode
@@ -265,19 +508,29 @@ class PoseTracking:
             :param img: Image on which pose dectection is to be performed.
             :return: Image with pose landmarks and lines connecting the landmarks drawn on it.
         """
-        if PoseDetector is None:
-            print("cvzone.PoseModule not installed. Install via the Addon Preferences first. Skipping pose detection.")
+        if mp_vision is None:
+            print("MediaPipe is not installed. Install via the Addon Preferences first. Skipping pose detection.")
             return img
-        
+
         if self.detector is None:
-            self.detector = PoseDetector()
+            self.detector = create_pose_detector(fps=None if self.mode == "rt_pose" else gvar.fps)
+            self.video_fps = gvar.fps or 30
+            self.frame_index = -1
+            if self.mode == "side_pose":
+                gvar.side_fps = self.video_fps
+            else:
+                gvar.front_fps = self.video_fps
+        self.frame_index += 1          # every call is one video frame, detected or not
 
-        img = self.detector.findPose(img)
         height, width = img.shape[:2]
-        landmarksList, boundingBoxInfo = self.detector.findPosition(img)
+        img, landmarksList = self.detector.find_pose(img)
 
-        if not boundingBoxInfo:
+        if not landmarksList:
             return img
+
+        # Per-landmark visibility (33 + the 7 centroids below, which take the lower of their pair)
+        vis = list(self.detector.visibility)
+        frame_time = self.frame_index / self.video_fps
 
         # --- Calculate custom points (centroids) ---
         point_pairs = [
@@ -295,6 +548,7 @@ class PoseTracking:
             centroid = MathUtility.centroid([landmarksList[a], landmarksList[b]])
             normalized = MathUtility.normalize_coordinates(centroid, height, width, 400)
             extra_points.append(normalized)
+            vis.append(min(vis[a], vis[b]))
 
         # --- Handle mode: front, side, or realtime ---
         if self.mode in ["front_pose", "rt_pose"]:
@@ -307,6 +561,8 @@ class PoseTracking:
                 listOf32Landmarks.extend(point)
 
             gvar.positionList.append(listOf32Landmarks)
+            gvar.position_times.append(frame_time)
+            gvar.position_vis.append(vis)
 
         elif self.mode == "side_pose" and gvar.positionList:
             zframe = []
@@ -318,6 +574,8 @@ class PoseTracking:
                 zframe.extend(point)
 
             gvar.zlist.append(zframe)
+            gvar.zlist_times.append(frame_time)
+            gvar.zlist_vis.append(vis)
 
         return img
 
@@ -361,6 +619,10 @@ class PoseTracking:
             print("Pose tracking stopped.")
         self.running = False
 
+        if self.detector is not None:
+            close_in_background(self.detector)
+            self.detector = None
+
         if hasattr(self, 'cap') and self.cap.isOpened():
             self.cap.release()
 
@@ -390,13 +652,13 @@ class HandTracking:
         self.mode = mode
         self.running = False
         """
-            It uses cvzone.HandTrackingModule (uses mediapipe) to do hand tracking.
+            It uses the MediaPipe Tasks HandLandmarker to do hand tracking.
             :param num_hands: Numbers of hands to track (1 or 2).
             :param mode: Different modes like realtime, offline: (front view / side view).
         """
 
-        if cv2 is None:
-            print("OpenCV (cv2) is not installed! Install via the Addon Preferences first.")
+        if not load_libraries():
+            print("OpenCV/MediaPipe are not installed! Install via the Addon Preferences first.")
             return
 
         # ---- Realtime Hand Tracking Mode ----
@@ -441,15 +703,17 @@ class HandTracking:
             :return: Image with hand landmarks and lines connecting the landmarks drawn on it.
         """
         
-        if HandDetector is None:
-            print("cvzone.HandTrackingModule not installed. Install via the Addon Preferences first. Skipping hand detection.")
+        if mp_vision is None:
+            print("MediaPipe is not installed. Install via the Addon Preferences first. Skipping hand detection.")
             return img
-        
+
         if self.detector is None:
-            self.detector = HandDetector(maxHands=self.num_hands, detectionCon=0.8)
+            self.detector = HandDetector(max_hands=self.num_hands,
+                                         fps=None if self.mode == "rt_hand" else gvar.fps,
+                                         detection_con=0.8)
 
         height, width = img.shape[:2]
-        hands, img = self.detector.findHands(img)
+        hands, img = self.detector.find_hands(img)
         if not hands:
             return img
 
@@ -520,6 +784,9 @@ class HandTracking:
         if self.running:
             print("Hand tracking stopped.")
         self.running = False
+        if self.detector is not None:
+            close_in_background(self.detector)
+            self.detector = None
         if hasattr(self, 'cap') and self.cap.isOpened():
             self.cap.release()
         if self.mode != "rt_hand":

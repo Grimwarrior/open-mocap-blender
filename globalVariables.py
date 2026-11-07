@@ -11,6 +11,14 @@ positionList = [] #each element of this list = list of [x,y,z] positions of 40 b
 object_list = [] #list of 40 empty objects corresponding to 40 pose landmarks
 zlist = [] #each element of this list = list of [x,y,z] positions of 40 body landmarks in a given frame (side view)
 bones_list = [] #list of bone objects
+# Recorded alongside positionList / zlist (one entry per tracked frame), used by Combine Data
+position_times = [] #time of each front frame in its video (seconds)
+position_vis = [] #40 visibility scores (0..1) per front frame
+zlist_times = [] #time of each side frame in its video (seconds)
+zlist_vis = [] #40 visibility scores per side frame
+front_fps = 0
+side_fps = 0
+positionList_raw = None #front data before Combine Data, so it can be re-combined with other settings
 root = None #root empty to which the skeleton rig is parented
 pose_tracker = None
 

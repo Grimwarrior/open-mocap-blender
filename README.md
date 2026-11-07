@@ -8,25 +8,26 @@ Designed for artists, animators, and researchers who want fast, accessible motio
 
 ⚠️ Blender & Dependencies Compatibility
 
-Open Mocap is compatible only with Blender 4.0.0 and earlier.
-Newer Blender versions currently do not support the add-on.
+Tested with Blender 5.1 (Python 3.13).
 
-Best Compatibilty as of now:
+Dependencies (installed by the add-on: Edit > Preferences > Add-ons > Open Mocap > Install Dependencies):
 
-Blender: 4.0.0 or earlier
+MediaPipe (brings OpenCV as opencv-contrib-python), chosen in the add-on preferences:
+- Stable: 0.10.32 (default, tested).
+- Latest: the newest release on PyPI, with a "Check for MediaPipe Update" button. Versions from 0.10.33 on (incl. 1.x) upload usage statistics to Google every time tracking stops; this cannot be turned off. Open Mocap closes trackers in the background, so Blender does not wait for that upload.
+Switching versions after tracking has run needs a Blender restart (the MediaPipe library stays loaded).
 
-Python: 3.10 (Blender’s bundled Python — no separate installation required)
+Optional pose tracker (add-on preferences > Pose Tracker > "RTMW + MediaPipe depth"):
+- OpenMMLab RTMW whole-body model through rtmlib and ONNX Runtime (Apache-2.0), with MediaPipe running alongside for the depth estimate RTMW does not provide. Steadier joints in fast moves (about 28% less jitter on a sword clip), real hand knuckles (better hand roll) and heel/toe points.
+- Install Dependencies also installs rtmlib and onnxruntime-directml and downloads the RTMW-x and YOLOX-m models (about 330 MB) from OpenMMLab.
+- RTMW Device: GPU (DirectML, any DirectX 12 card, about 11 frames per second including MediaPipe) or CPU (about 3 frames per second).
 
-MediaPipe: 0.10.14 (Must be installed using the addon)
+MediaPipe Tasks models: pose_landmarker_full.task and hand_landmarker.task (downloaded from Google's MediaPipe model storage)
 
-OpenCV-Python: 4.11.0.86 (Must be installed using the addon)
-
-CVZone: 1.6.1 (Must be installed using the addon)
+They are installed into `<Blender user folder>/<version>/datafiles/open_mocap/` (`lib` and `models`), not into Blender's own Python, so Blender's bundled numpy is never replaced and no admin rights are needed.
 
 > **Developer Note:**  
-> To ensure Open Mocap works correctly, install the versions listed above. Using newer versions of MediaPipe, OpenCV, CVZone, or Python may cause runtime errors.
-> However, developers are welcome to experiment with different versions to identify the best compatible setup. 
-> ⚠️ While installing OpenCV, many times a dummy or incorrect version may be installed. Installing and uninstalling the external libraries listed above was a challenging process during development, and this may be a Blender-specific issue.
+> MediaPipe 0.10.30 and newer (the only versions available for Python 3.13) removed the legacy `mediapipe.solutions` API that CVZone was built on. The add-on now uses the MediaPipe Tasks API (PoseLandmarker / HandLandmarker) directly, so CVZone is no longer needed. Landmarks keep the same pixel format CVZone produced, so tracking data and skeletons behave as before.
 
 ---
 

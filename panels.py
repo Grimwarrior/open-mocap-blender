@@ -1,5 +1,6 @@
 import bpy
 from . import globalVariables as gvar
+from . import PackageInstaller, retarget
 from .PackageInstaller import check_required_packages
 
 
@@ -9,20 +10,73 @@ from .PackageInstaller import check_required_packages
 # -------------------------------------------------------------
 class OpenMocapAddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
-    REQUIRED_PACKAGES = ["mediapipe", "opencv-python", "cvzone"]
+
+    mediapipe_channel: bpy.props.EnumProperty(
+        name="MediaPipe",
+        items=[
+            ('STABLE', f"Stable ({PackageInstaller.STABLE_VERSION})",
+             "Tested with Blender 5.1. Sends no usage statistics"),
+            ('LATEST', "Latest",
+             "Newest MediaPipe release from PyPI. Sends usage statistics to Google every time "
+             "tracking stops; this cannot be turned off"),
+        ],
+        default='STABLE')
+
+    pose_tracker: bpy.props.EnumProperty(
+        name="Pose Tracker",
+        items=[
+            ('MEDIAPIPE', "MediaPipe", "MediaPipe pose tracking (default)"),
+            ('RTMW', "RTMW + MediaPipe depth",
+             "OpenMMLab RTMW whole-body tracker for the joint positions (steadier, real hand and foot "
+             "points), MediaPipe alongside for depth. Downloads about 330 MB of models"),
+        ],
+        default='MEDIAPIPE')
+    rtmw_device: bpy.props.EnumProperty(
+        name="RTMW Device",
+        items=[
+            ('GPU', "GPU (DirectML)", "Any DirectX 12 graphics card, about 10x faster"),
+            ('CPU', "CPU", "Slower (about 3 frames per second on 1080p video)"),
+        ],
+        default='GPU')
 
     def draw(self, context):
         layout = self.layout
         col = layout.column(align=True)
         col.label(text="Dependency Management", icon="PREFERENCES")
 
-        missing = check_required_packages()
+        status = PackageInstaller.status
+        if status["busy"]:
+            col.label(text=status["message"] or "Working...", icon="SORTTIME")
+            return
+
+        col.prop(self, "mediapipe_channel")
+        if self.mediapipe_channel == 'LATEST':
+            col.label(text="Newer MediaPipe versions send usage statistics to Google when tracking stops.",
+                      icon="ERROR")
+        installed = PackageInstaller.installed_mediapipe_version()
+        col.label(text=f"Installed: MediaPipe {installed}" if installed else "Installed: no MediaPipe",
+                  icon="PACKAGE")
+        col.separator()
+        col.prop(self, "pose_tracker")
+        if self.pose_tracker == 'RTMW':
+            col.prop(self, "rtmw_device")
+        col.separator()
+
+        missing = check_required_packages(self.mediapipe_channel, self.pose_tracker)
 
         if missing:
-            col.label(text=f"Missing packages: {', '.join(missing)}", icon="ERROR")
+            col.label(text=f"Missing: {', '.join(missing)}", icon="ERROR")
             col.operator("addon.install_dependencies", text="Install Dependencies", icon="CONSOLE")
+            if PackageInstaller.mediapipe_loaded() and installed:
+                col.label(text="Switching versions needs a Blender restart once tracking has run.", icon="INFO")
         else:
             col.label(text="All dependencies are installed.", icon="CHECKMARK")
+            if self.mediapipe_channel == 'LATEST':
+                col.operator("addon.install_dependencies", text="Check for MediaPipe Update",
+                             icon="FILE_REFRESH").update = True
+            col.label(text=f"Location: {PackageInstaller.data_dir()}", icon="FILE_FOLDER")
+        if status["message"]:
+            col.label(text=status["message"], icon="INFO")
             #col.operator("addon.uninstall_dependencies", text="Uninstall Dependencies", icon="TRASH")
 
 
@@ -32,7 +86,7 @@ class OpenMocapAddonPreferences(bpy.types.AddonPreferences):
 # -------------------------------------------------------------
 class PoseTrackingPanel(bpy.types.Panel):
     bl_label = "Pose Tracking"
-    bl_idname = "Pose_Track_Panel"
+    bl_idname = "OPENMOCAP_PT_pose_tracking"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Open Mocap"
@@ -41,6 +95,14 @@ class PoseTrackingPanel(bpy.types.Panel):
     def draw(self, context):
         scene = context.scene
         layout = self.layout
+        if PackageInstaller.pose_tracker() == 'RTMW':
+            ready = not PackageInstaller.rtmw_missing()
+            device = "GPU" if PackageInstaller.rtmw_device() == 'dml' else "CPU"
+            layout.label(text=f"Tracker: RTMW ({device}) + MediaPipe depth" if ready
+                         else "Tracker: RTMW not installed, using MediaPipe",
+                         icon="CHECKMARK" if ready else "ERROR")
+        else:
+            layout.label(text="Tracker: MediaPipe", icon="ARMATURE_DATA")
         layout.prop(scene, "multi_view_tracking")
         #layout.label(text="Realtime Pose-tracking")
         #layout.operator("object.start_tracking", text="Start RealTime Pose Tracking", icon='PLAY').track = "rt_pose"
@@ -75,7 +137,17 @@ class PoseTrackingPanel(bpy.types.Panel):
         layout.label(text="Settings")
         layout.operator("object.stop_tracking", text="Stop Pose Tracking", icon='PAUSE')
         if scene.multi_view_tracking:
-            layout.operator("object.combine_data", text="Combine Data", icon='PLUS').mode = "pose"
+            box = layout.box()
+            box.prop(scene, "combine_method")
+            if scene.combine_method == 'IMPROVED':
+                row = box.row(align=True)
+                row.prop(scene, "combine_auto_offset", toggle=True)
+                sub = row.row(align=True)
+                sub.enabled = not scene.combine_auto_offset
+                sub.prop(scene, "combine_offset", text="Offset")
+                box.prop(scene, "combine_smoothing")
+                box.prop(scene, "combine_bone_strength")
+            box.operator("object.combine_data", text="Combine Data", icon='PLUS').mode = "pose"
         layout.operator("object.animate_obj", text="Animate", icon='RENDER_ANIMATION')
         layout.operator("object.hide_skeleton", text="Hide/Unhide Empties", icon='HIDE_OFF').collection_name = "PoseEmpties"
         layout.operator("object.hide_skeleton", text="Hide/Unhide Skeleton", icon='HIDE_OFF').collection_name = "PoseSkeleton"
@@ -84,6 +156,17 @@ class PoseTrackingPanel(bpy.types.Panel):
         layout.label(text="Animation Baking")
         layout.prop(scene, "bake_rig", text="Select Rig")
         if scene.bake_rig:
+            if retarget.is_mixamo_rig(scene.bake_rig):
+                box = layout.box()
+                box.prop(scene, "retarget_move_hips")
+                box.prop(scene, "retarget_mirror_depth")
+                row = box.row(align=True)
+                op = row.operator("object.open_mocap_retarget_mixamo", text="Retarget to Mixamo", icon="ARMATURE_DATA")
+                op.target_rig = scene.bake_rig.name
+                op.hips_motion = scene.retarget_move_hips
+                op.mirror_depth = scene.retarget_mirror_depth
+                op = row.operator("object.open_mocap_clear_retarget", text="", icon="X")
+                op.target_rig = scene.bake_rig.name
             op = layout.operator("pose.toggle_copy_rotation", text="Toggle Constraints", icon="CONSTRAINT")
             op.target_rig = scene.bake_rig.name
         layout.prop(scene, "bake_frame_start")
@@ -104,7 +187,7 @@ class PoseTrackingPanel(bpy.types.Panel):
 # -------------------------------------------------------------
 class HandTrackingPanel(bpy.types.Panel):
     bl_label = "Hand Tracking"
-    bl_idname = "Hand_Tracking_Panel"
+    bl_idname = "OPENMOCAP_PT_hand_tracking"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Open Mocap"
