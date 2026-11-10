@@ -178,7 +178,15 @@ class PoseTrackingPanel(bpy.types.Panel):
                 box = layout.box()
                 box.prop(scene, "retarget_source", icon="EMPTY_AXIS")
                 box.prop(scene, "retarget_arm_mode")
+                if scene.retarget_arm_mode == 'POSITION':
+                    box.prop(scene, "retarget_grip")
+                box.prop(scene, "retarget_leg_mode")
                 box.prop(scene, "retarget_move_hips")
+                if scene.retarget_move_hips:
+                    box.prop(scene, "retarget_hip_height")
+                row = box.row(align=True)
+                row.prop(scene, "retarget_shoulders")
+                row.prop(scene, "retarget_spine_twist")
                 box.prop(scene, "retarget_mirror_depth")
                 row = box.row(align=True)
                 op = row.operator("object.open_mocap_retarget_mixamo", text="Retarget to Mixamo", icon="ARMATURE_DATA")
@@ -187,6 +195,11 @@ class PoseTrackingPanel(bpy.types.Panel):
                 op.hips_motion = scene.retarget_move_hips
                 op.mirror_depth = scene.retarget_mirror_depth
                 op.arm_mode = scene.retarget_arm_mode
+                op.leg_mode = scene.retarget_leg_mode
+                op.hip_height = scene.retarget_hip_height
+                op.shoulders = scene.retarget_shoulders
+                op.spine_twist = scene.retarget_spine_twist
+                op.grip = scene.retarget_grip
                 op = row.operator("object.open_mocap_clear_retarget", text="", icon="X")
                 op.target_rig = scene.bake_rig.name
             op = layout.operator("pose.toggle_copy_rotation", text="Toggle Constraints", icon="CONSTRAINT")
@@ -194,6 +207,7 @@ class PoseTrackingPanel(bpy.types.Panel):
         layout.prop(scene, "bake_frame_start")
         layout.prop(scene, "bake_frame_end")
         layout.prop(scene, "bake_only_selected")
+        layout.prop(scene, "bake_in_place")
         layout.prop(scene, "bake_action_name", text="Action", icon="ACTION")
 
         op = layout.operator("object.bake_motion", text="Bake Motion", icon="ACTION_TWEAK")
@@ -203,6 +217,7 @@ class PoseTrackingPanel(bpy.types.Panel):
         op.frame_end = scene.bake_frame_end
         op.only_selected_bones = scene.bake_only_selected
         op.action_name = scene.bake_action_name
+        op.in_place = scene.bake_in_place
 
 
 

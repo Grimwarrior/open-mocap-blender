@@ -78,9 +78,14 @@ KNEE_TOE_HINT = 0.5
 # Twist around the bone (Locked Track, bone Y locked): the bone is turned so that the axis lying
 # along the rig's rest line ref_from -> ref_to follows the mocap landmark line a -> b.
 # Mixamo bone: (a, b, ref_from, ref_to)
+# The twist between hips and shoulders is spread over the spine: each spine bone is turned part of
+# the way from what it inherits toward the shoulder line (influence), the last one all the way.
+# Mixamo bone: (a, b, ref_from, ref_to, influence)
 FACING_MAP = {
-    "Hips": (R_HIP, L_HIP, "RightUpLeg", "LeftUpLeg"),
-    "Spine2": (R_SHOULDER, L_SHOULDER, "RightUpLeg", "LeftUpLeg"),
+    "Hips": (R_HIP, L_HIP, "RightUpLeg", "LeftUpLeg", 1.0),
+    "Spine": (R_SHOULDER, L_SHOULDER, "RightUpLeg", "LeftUpLeg", 1.0 / 3.0),
+    "Spine1": (R_SHOULDER, L_SHOULDER, "RightUpLeg", "LeftUpLeg", 0.5),
+    "Spine2": (R_SHOULDER, L_SHOULDER, "RightUpLeg", "LeftUpLeg", 1.0),
 }
 
 # Arms and hands. MediaPipe's pose model gives only three hand points (index, pinky, thumb), close
@@ -228,10 +233,19 @@ ARM_IK_MAP = {"Left": (L_SHOULDER, L_ELBOW, L_WRIST), "Right": (R_SHOULDER, R_EL
 REACH_SMOOTH_S = 0.04       # smoothing of the hand and elbow positions for the arm solve (s)
 
 
-def arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, rig_shoulder_width):
+GRIP_SMOOTH_S = 0.25        # two-handed grip: smoothing of the direction from one hand to the other
+
+
+def arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, rig_shoulder_width,
+                         shoulders=None, grip='NONE'):
     """
         Two-bone solve per frame. :param upper_len, fore_len, rig_torso, rig_shoulder_width: rig
         lengths (any one unit).
+        :param shoulders: {side: (N, 3) upper arm head} from the collar bones; None: half the rig's
+                          shoulder width out along the mocap shoulder line.
+        :param grip: 'RIGHT' / 'LEFT': both hands hold one thing and that hand leads. The other
+                     hand keeps the take's usual distance to it, in a smoothed direction, so tracker
+                     jitter cannot pull the two hands apart or through each other.
         :return: {side: (shoulder, upper arm direction, forearm direction)} as (N, 3) arrays in the
                  empties' local space.
     """
@@ -244,10 +258,19 @@ def arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, r
     sigma = REACH_SMOOTH_S * fps
     body_fwd = _unit(np.cross(P[L_HIP] - P[R_HIP], P[SHOULDER_C] - P[HIP_C]))
     across = _unit(_gauss_np(P[L_SHOULDER] - P[R_SHOULDER], sigma))     # toward the actor's left
+    wrists = {side: P[w] for side, (s, e, w) in ARM_IK_MAP.items()}
+    if grip in ('RIGHT', 'LEFT'):
+        lead, other = ("Right", "Left") if grip == 'RIGHT' else ("Left", "Right")
+        rel = wrists[other] - wrists[lead]
+        usual = float(np.median(np.linalg.norm(rel, axis=1)))
+        wrists[other] = wrists[lead] + usual * _unit(_gauss_np(rel, GRIP_SMOOTH_S * fps))
     out = {}
     for side, (s, e, w) in ARM_IK_MAP.items():
-        rig_shoulder = P[SHOULDER_C] + (half if side == "Left" else -half) * across
-        T = _gauss_np(P[w] - rig_shoulder, sigma)           # hand relative to the rig's shoulder
+        if shoulders is not None and side in shoulders:
+            rig_shoulder = shoulders[side]
+        else:
+            rig_shoulder = P[SHOULDER_C] + (half if side == "Left" else -half) * across
+        T = _gauss_np(wrists[side] - rig_shoulder, sigma)   # hand relative to the rig's shoulder
         E = _gauss_np(P[e] - rig_shoulder, sigma)
         d = np.linalg.norm(T, axis=1)
         t = _unit(T)
@@ -262,10 +285,288 @@ def arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, r
     return out
 
 
+# Body frames. The rig's rest pose and the mocap are compared in a frame of the body: lateral (toward
+# the actor's left), up (hip centre -> shoulder centre, what the Hips and Spine bones aim along) and
+# forward = lateral x up. A rig offset measured in the rig's rest frame is the same three numbers in
+# the mocap's frame, times the mocap units per rig unit. Cross products need a right-handed body, so
+# all of this runs in the "true" space, with a mirrored take's depth flipped back (see _true).
+def _true(empties, indices, frames, mirror):
+    """{landmark: (N, 3)} keyed local positions, depth flipped if the take is mirrored."""
+    flip = np.array([1.0, -1.0 if mirror else 1.0, 1.0])
+    return {i: np.array([tuple(local_location(empties[i], f)) for f in frames]) * flip for i in indices}
+
+
+def _body_frame(line, up):
+    """(lateral, up, forward) unit vectors per frame from a left-right line and an up direction."""
+    up = _unit(up)
+    lat = _unit(line - np.sum(line * up, axis=1, keepdims=True) * up)
+    return lat, up, np.cross(lat, up)
+
+
+def _rig_components(rig, offset, left_name, right_name):
+    """A rig rest offset (world) as (lateral, up, forward) components of the rig's own body frame."""
+    mw = rig.matrix_world
+    line = (mw @ find_bone(rig, left_name).bone.head_local) - (mw @ find_bone(rig, right_name).bone.head_local)
+    lat, up, fwd = _body_frame(np.array([tuple(line)]), np.array([[0.0, 0.0, 1.0]]))
+    o = np.array(tuple(offset))
+    return float(o @ lat[0]), float(o @ up[0]), float(o @ fwd[0])
+
+
+def _from_components(c, frame):
+    lat, up, fwd = frame
+    return c[0] * lat + c[1] * up + c[2] * fwd
+
+
+# Feet. Copying the direction of thigh and shin leaves the rig's feet wherever its own proportions
+# and the tracker's jitter take them: a standing foot slides and bobs. "Foot Position" instead solves
+# each leg for the rig's own thigh and shin lengths so that the ankle goes where the mocap ankle is,
+# and "Planted" holds that ankle still while the foot is down. A foot counts as down while its ankle
+# is low (within PLANT_HEIGHT leg lengths of where it stands) and slow (under PLANT_SPEED leg lengths
+# per second); it is then held at the middle of where it was during that time, eased in and out over
+# PLANT_BLEND_S.
+# Size. The mocap is in picture units: an actor who steps toward the camera grows, legs, hip height
+# and all. Putting the rig's ankles straight onto the mocap ankles would make it crouch wherever the
+# actor looks small and stretch where he looks big. So the legs are solved free of size: each leg
+# points from hip to ankle as the mocap's does and is as bent as the mocap's (hip-ankle distance over
+# that leg's own length at that moment), and the hips stand as high above the floor, in leg lengths
+# of that moment, as the mocap's. That gives the rig's own ankle path, which is what gets held.
+# The floor. One camera also sees a foot that stands further away higher in the picture, so the
+# floor under the actor moves in the picture: it is taken per moment from whichever foot is down,
+# and a held foot is put on the rig's floor (plus however much higher than that foot's standing
+# height it is held, e.g. on its toes).
+# Where a held foot ends up further from the hip than the rig's leg is long (the mocap's bone
+# lengths vary with the tracker's depth), the hips are pulled toward the foot, by at most
+# PLANT_HIP_PULL leg lengths; beyond that the foot gives way.
+LEG_IK_MAP = {"Left": (L_HIP, L_KNEE, L_ANKLE), "Right": (R_HIP, R_KNEE, R_ANKLE)}
+PLANT_HEIGHT = 0.15
+PLANT_SPEED = 0.6
+PLANT_MIN_S = 0.15          # shorter contacts are not held
+PLANT_GAP_S = 0.07          # breaks this short inside a contact are bridged
+PLANT_BLEND_S = 0.1
+PLANT_SMOOTH_S = 0.05       # smoothing of the ankle before its speed is measured
+PLANT_HIP_PULL = 0.25
+PLANT_MERGE_S = 0.35        # two contacts this close in time ...
+PLANT_MERGE_DIST = 0.08     # ... and this close in place (leg lengths) are one
+PLANT_RAISE_MIN = 0.06      # a foot held less than this (leg lengths) above its standing height stands
+PLANT_PULL_SMOOTH_S = 0.08
+
+
+def _runs(mask):
+    """[(start, end)] inclusive index ranges where mask is True."""
+    edges = np.diff(np.concatenate([[0], mask.astype(int), [0]]))
+    return [(int(a), int(b)) for a, b in zip(np.where(edges == 1)[0], np.where(edges == -1)[0] - 1)]
+
+
+def foot_contacts(ankle, leg_length, fps):
+    """:return: (N,) bool, True while the foot of this ankle (N, 3, z up) is down."""
+    n = len(ankle)
+    if n < 3 or leg_length <= 1e-9:
+        return np.zeros(n, dtype=bool)
+    a = _gauss_np(ankle, PLANT_SMOOTH_S * fps)
+    speed = np.linalg.norm(np.gradient(a, axis=0), axis=1) * fps
+    floor = np.percentile(a[:, 2], 10)
+    down = (a[:, 2] < floor + PLANT_HEIGHT * leg_length) & (speed < PLANT_SPEED * leg_length)
+    for s, e in _runs(~down):                               # bridge short breaks
+        if s > 0 and e < n - 1 and e - s + 1 <= round(PLANT_GAP_S * fps):
+            down[s:e + 1] = True
+    for s, e in _runs(down):                                # drop short contacts
+        if e - s + 1 < max(2, round(PLANT_MIN_S * fps)):
+            down[s:e + 1] = False
+    # one contact, not two, where the foot is found in the same place again shortly after
+    runs = _runs(down)
+    for (s0, e0), (s1, e1) in zip(runs, runs[1:]):
+        apart = np.linalg.norm(np.median(a[s0:e0 + 1], axis=0) - np.median(a[s1:e1 + 1], axis=0))
+        if s1 - e0 - 1 <= round(PLANT_MERGE_S * fps) and apart < PLANT_MERGE_DIST * leg_length:
+            down[e0:s1 + 1] = True
+    return down
+
+
+FLOOR_SMOOTH_S = 0.3        # smoothing of the floor height and of the apparent leg length ...
+SIZE_SMOOTH_S = 0.5
+
+
+def mocap_floor(empties, frames, fps, mirror):
+    """
+        :return: (floor: the ankle height the mocap stands at over the take, {side: down mask},
+                 floor per frame (N,), apparent leg length per frame (N,)), in the empties' local units.
+    """
+    P = _true(empties, {L_HIP, L_KNEE, L_ANKLE, R_HIP, R_KNEE, R_ANKLE}, frames, mirror)
+    legs = [np.linalg.norm(P[h] - P[k], axis=1) + np.linalg.norm(P[k] - P[a], axis=1)
+            for h, k, a in ((L_HIP, L_KNEE, L_ANKLE), (R_HIP, R_KNEE, R_ANKLE))]
+    size = (legs[0] + legs[1]) / 2
+    leg = float(np.median(size))
+    half = max(1, int(round(FLOOR_SMOOTH_S * fps / 2)))
+    padded = np.pad(size, half, mode="edge")
+    size = np.array([np.median(padded[i:i + 2 * half + 1]) for i in range(len(size))])
+    size = np.maximum(_gauss_np(size, SIZE_SMOOTH_S * fps), 0.5 * leg)
+    down = {side: foot_contacts(P[an], leg, fps) for side, an in (("Left", L_ANKLE), ("Right", R_ANKLE))}
+    z = {side: _gauss_np(P[an][:, 2], PLANT_SMOOTH_S * fps) for side, an in (("Left", L_ANKLE), ("Right", R_ANKLE))}
+    stacked = np.stack([np.where(down[side], z[side], np.inf) for side in ("Left", "Right")], axis=1)
+    lowest = stacked.min(axis=1)
+    seen = np.isfinite(lowest)
+    if seen.any():
+        idx = np.arange(len(lowest))
+        per_frame = _gauss_np(np.interp(idx, idx[seen], lowest[seen]), FLOOR_SMOOTH_S * fps)
+        floor = float(np.median(lowest[seen]))
+    else:                                                   # no foot ever stands: the low end of both
+        floor = float(np.percentile(np.minimum(z["Left"], z["Right"]), 10))
+        per_frame = np.full(len(lowest), floor)
+    return floor, down, per_frame, size
+
+
+def plant_foot(ankle, down, fps, floor=None, leg_length=0.0):
+    """
+        Ankle positions with every contact held at its median position, eased in and out.
+        :param floor: the floor's height; a held foot is put on it (see "The floor" above).
+    """
+    out = ankle.copy()
+    n = len(ankle)
+    ramp = max(1, int(round(PLANT_BLEND_S * fps)))
+    best = np.zeros(n)
+    level = float(np.percentile(ankle[down, 2], 10)) if down.any() else 0.0
+    for s, e in _runs(down):
+        lock = np.median(ankle[s:e + 1], axis=0)
+        if floor is not None:
+            lock[2] = floor + max(0.0, lock[2] - level - PLANT_RAISE_MIN * leg_length)
+        w = np.zeros(n)
+        w[s:e + 1] = 1.0
+        for k in range(1, ramp + 1):
+            v = 1.0 - k / (ramp + 1)
+            v = v * v * (3 - 2 * v)
+            for j in (s - k, e + k):
+                if 0 <= j < n and not down[j]:
+                    w[j] = v
+        use = w > best
+        out[use] = ankle[use] + w[use, None] * (lock - ankle[use])
+        best[use] = w[use]
+    return out
+
+
+def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip_offsets, hips_lift,
+                   plant, floor_data=None):
+    """
+        Two-bone solve of both legs per frame.
+        :param ratio: mocap units per rig unit. :param thigh_len, shin_len: rig lengths.
+        :param hip_offsets: {side: rig hip joint relative to the Hips bone, body frame components}.
+        :param hips_lift: how far (rig units) the Hips bone sits above the mocap hip centre.
+        :param plant: hold the ankles still while the feet are down.
+        :param floor_data: mocap_floor's result to stand the rig on the floor; None: the hips keep
+                           the mocap hip centre's height.
+        :return: ({side: (hip joint, thigh direction, knee, shin direction)} as (N, 3) arrays in the
+                 empties' local space, hips shift (N, 3) in the same space or None,
+                 {side: share of frames the foot is held})
+    """
+    idx = {i for v in LEG_IK_MAP.values() for i in v} | {HIP_C, SHOULDER_C}
+    P = _true(empties, idx, frames, mirror)
+    frame = _body_frame(P[L_HIP] - P[R_HIP], P[SHOULDER_C] - P[HIP_C])
+    a, b = thigh_len * ratio, shin_len * ratio
+    reach = (a + b) * 0.999
+    flip = np.array([1.0, -1.0 if mirror else 1.0, 1.0])
+    n = len(frames)
+    # hips: as many leg lengths above the floor as the mocap's are at that moment
+    shift = np.zeros((n, 3))
+    floor = None
+    if floor_data is not None:
+        floor, down_masks, floor_now, size = floor_data
+        shift[:, 2] = floor + (P[HIP_C][:, 2] - floor_now) * (a + b) / size - P[HIP_C][:, 2]
+    else:
+        down_masks = {"Left": foot_contacts(P[L_ANKLE], a + b, fps), "Right": foot_contacts(P[R_ANKLE], a + b, fps)}
+    hips = P[HIP_C] + shift + np.array([0.0, 0.0, hips_lift * ratio])
+    sigma = REACH_SMOOTH_S * fps
+    joints, ankles, held, share = {}, {}, {}, {}
+    for side, (h, k, an) in LEG_IK_MAP.items():
+        joints[side] = hips + ratio * _from_components(hip_offsets[side], frame)
+        # the rig's own ankle path: the mocap leg's direction and bend, at the rig's leg length
+        T = _gauss_np(P[an] - P[h], sigma)
+        own = _gauss_np(np.linalg.norm(P[k] - P[h], axis=1) + np.linalg.norm(P[an] - P[k], axis=1), sigma)
+        bend = np.clip(np.linalg.norm(T, axis=1) / np.maximum(own, 1e-9), 0.3, 0.999)
+        natural = joints[side] + (bend * (a + b))[:, None] * _unit(T)
+        down = down_masks[side] if plant else np.zeros(n, dtype=bool)
+        ankles[side] = plant_foot(natural, down, fps, floor, a + b) if down.any() else natural
+        held[side] = down
+        share[side] = float(down.mean())
+    # hips pulled toward held feet that are out of reach
+    if plant and any(d.any() for d in held.values()):
+        pull = np.zeros((n, 3))
+        for _ in range(4):
+            for side in LEG_IK_MAP:
+                T = ankles[side] - (joints[side] + pull)
+                d = np.linalg.norm(T, axis=1)
+                over = np.where(held[side], np.maximum(0.0, d - reach * 0.995), 0.0)
+                pull += (over / np.maximum(d, 1e-9))[:, None] * T
+        limit = PLANT_HIP_PULL * (a + b)
+        size_ = np.linalg.norm(pull, axis=1, keepdims=True)
+        pull = _gauss_np(pull * np.minimum(1.0, limit / np.maximum(size_, 1e-9)), PLANT_PULL_SMOOTH_S * fps)
+        shift = shift + pull
+        for side in LEG_IK_MAP:
+            joints[side] = joints[side] + pull
+    out = {}
+    for side, (h, k, _an) in LEG_IK_MAP.items():
+        joint = joints[side]
+        T = ankles[side] - joint
+        d = np.clip(np.linalg.norm(T, axis=1), abs(a - b) * 1.02 + 1e-6, reach)
+        t = _unit(T)
+        K = _gauss_np(P[k] - P[h], sigma)                    # knee side, as the mocap leg bends
+        pole = K - np.sum(K * t, axis=1, keepdims=True) * t
+        hint = frame[2] - np.sum(frame[2] * t, axis=1, keepdims=True) * t
+        p = _unit(pole + 0.05 * a * _unit(hint))             # forward if the leg is straight
+        cos_a = np.clip((a * a + d * d - b * b) / (2 * a * d), -1.0, 1.0)
+        thigh = _unit(cos_a[:, None] * t + np.sqrt(1 - cos_a ** 2)[:, None] * p)
+        knee = joint + a * thigh
+        shin = _unit(joint + t * d[:, None] - knee)
+        out[side] = (joint * flip, thigh * flip, knee * flip, shin * flip)
+    moved = float(np.abs(shift).max()) > 1e-6
+    return out, (shift * flip if moved else None), share
+
+
+# Collar bones. The mocap shoulder points rise and fall with the collar bones (a shrug, a raised
+# arm), which shows as the shoulder line tilting against the spine. The rig's chest only turns about
+# the spine, so without this its shoulders stay level and a raised arm has to reach from too low.
+# Each collar bone is lifted by the tilt of its half of the shoulder line, plus CLAVICLE_ARM_SHARE of
+# the upper arm's angle above the horizontal (both arms up lifts both shoulders, which the line
+# cannot show), within CLAVICLE_RANGE degrees.
+CLAVICLE_ARM_SHARE = 0.2
+CLAVICLE_RANGE = (-10.0, 35.0)
+CLAVICLE_SMOOTH_S = 0.1
+
+
+def clavicle_directions(empties, frames, fps, mirror, ratio, heads, rests):
+    """
+        :param heads: {side: collar bone head relative to the chest centre (midpoint of the upper arm
+                      heads), body frame components, rig units}.
+        :param rests: {side: collar bone head -> upper arm head at rest, body frame components}.
+        :return: {side: (collar bone head, its direction, upper arm head)} as (N, 3) arrays in the
+                 empties' local space.
+    """
+    idx = {HIP_C, SHOULDER_C, L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW}
+    P = _true(empties, idx, frames, mirror)
+    frame = _body_frame(P[L_SHOULDER] - P[R_SHOULDER], P[SHOULDER_C] - P[HIP_C])
+    up = frame[1]
+    flip = np.array([1.0, -1.0 if mirror else 1.0, 1.0])
+    out = {}
+    for side, (s, e) in (("Left", (L_SHOULDER, L_ELBOW)), ("Right", (R_SHOULDER, R_ELBOW))):
+        tilt = np.arcsin(np.clip(np.sum(_unit(P[s] - P[SHOULDER_C]) * up, axis=1), -1.0, 1.0))
+        arm = np.arcsin(np.clip(np.sum(_unit(P[e] - P[s]) * up, axis=1), -1.0, 1.0))
+        lift = tilt + CLAVICLE_ARM_SHARE * np.clip(arm, 0.0, None)
+        lift = np.clip(_gauss_np(lift, CLAVICLE_SMOOTH_S * fps), *np.radians(CLAVICLE_RANGE))
+        head = P[SHOULDER_C] + ratio * _from_components(heads[side], frame)
+        rest = _from_components(rests[side], frame)                      # rig units, mocap body frame
+        length = np.linalg.norm(rest, axis=1, keepdims=True)
+        rest_dir = _unit(rest)
+        toward = _unit(up - np.sum(up * rest_dir, axis=1, keepdims=True) * rest_dir)
+        direction = np.cos(lift)[:, None] * rest_dir + np.sin(lift)[:, None] * toward
+        out[side] = (head * flip, direction * flip, (head + ratio * length * direction) * flip)
+    return out
+
+
 def _keyed_far_point(coll, points, name, origins, dirs, frames):
     """Helper in the mocap space, keyed per frame FAR from `origins` along `dirs` (local space)."""
-    obj = _new_empty(coll, name, parent=points.space)
-    locs = origins + FAR * dirs
+    return _keyed_point(coll, points.space, name, origins + FAR * dirs, frames)
+
+
+def _keyed_point(coll, parent, name, locs, frames):
+    """Helper empty under `parent` whose location is keyed per frame."""
+    obj = _new_empty(coll, name, parent=parent)
     obj.animation_data_create()
     act = bpy.data.actions.new(PREFIX + name)
     obj.animation_data.action = act
@@ -331,6 +632,16 @@ IKFK_STASH_PROP = "open_mocap_ikfk"
 
 def is_control_rig(rig):
     return all(n in rig.pose.bones for n in CONTROL_RIG_MAP.values())
+
+
+def clavicle_bone(rig, side):
+    """The collar bone to drive: the Mixamo bone, or on a control rig its control if there is one."""
+    if is_control_rig(rig):
+        for name in (f"Ctrl_Shoulder_{side}", f"Ctrl_Shoulder_FK_{side}"):
+            if name in rig.pose.bones:
+                return rig.pose.bones[name]
+        return None
+    return find_bone(rig, side + "Shoulder")
 
 
 def drive_bone(rig, short_name):
@@ -752,12 +1063,22 @@ def _restore_legacy_constraints(rig):
         del rig[LEGACY_MUTED_PROP]
 
 
-def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, arm_mode='POSITION'):
+def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, arm_mode='POSITION',
+                   leg_mode='PLANT', hip_height='FLOOR', shoulders=True, spine_twist=True, grip='NONE',
+                   info=None):
     """
         Builds helpers and constraints. :return: (list of mapped bone names, missing names, scale).
         :param arm_mode: 'POSITION' hands placed relative to the shoulder, elbows solved for the rig's
                          arm lengths; 'DIRECTION' each arm segment copies the mocap segment direction.
+        :param leg_mode: 'PLANT' ankles placed where the mocap ankles are and held while the foot is
+                         down, 'POSITION' the same without holding, 'DIRECTION' thigh and shin copy
+                         the mocap directions.
+        :param hip_height: 'FLOOR' the rig's ankles stand at their rest height when the mocap's
+                           stand on the floor; 'START' the hips start at their rest position.
+        :param shoulders: drive the collar bones. :param spine_twist: spread the twist over the spine.
+        :param grip: see arm_reach_directions. :param info: dict that receives numbers for the report.
     """
+    info = {} if info is None else info
     clear_retarget(rig)
     _stash_action(rig)
     _mute_legacy_constraints(rig)
@@ -772,8 +1093,15 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
     if is_control_rig(rig):
         _set_fk(rig)
 
+    frames = np.arange(scene.frame_start, scene.frame_end + 1, dtype=float)
+    fps = scene.render.fps / (scene.render.fps_base or 1.0)
+    floor_data = mocap_floor(empties, frames, fps, mirror_depth) if len(frames) >= 3 else None
+    floor = floor_data[0] if floor_data else None
+
     # --- Hips translation: mocap hip centre, scaled to the rig and anchored at its rest hips
     scale = 1.0
+    hips_location = None
+    follow = None
     if hips_motion:
         mocap_leg = mocap_leg_length(empties, scene.frame_start, scene.frame_end)
         rig_leg = rig_leg_length(rig)
@@ -788,16 +1116,63 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
         space.scale = (scale, depth_sign * scale, scale)
         start = local_location(empties[HIP_C], scene.frame_start)
         space.location = hips_rest - Vector((scale * start.x, depth_sign * scale * start.y, scale * start.z))
+        # Height from the floor instead of from the first frame (a take that starts crouched or in
+        # the air would float or sink for its whole length): when the mocap ankles are on the
+        # mocap's floor, the rig's hip joints are where its ankles at rest height need them.
+        feet = [find_bone(rig, n) for n in ("LeftFoot", "RightFoot")]
+        thighs = [find_bone(rig, n) for n in ("LeftUpLeg", "RightUpLeg")]
+        if hip_height == 'FLOOR' and floor is not None and all(feet) and all(thighs):
+            rig_ankle = sum((mw @ b.bone.head_local).z for b in feet) / 2
+            hips_lift = hips_rest.z - sum((mw @ b.bone.head_local).z for b in thighs) / 2
+            space.location.z = rig_ankle + hips_lift - scale * floor
+            info["hips_lift"] = hips_lift
         hips = drive_bone(rig, "Hips")
-        c = hips.constraints.new('COPY_LOCATION')
-        c.name = PREFIX + "Hips Location"
-        c.target = follow
+        hips_location = hips.constraints.new('COPY_LOCATION')
+        hips_location.name = PREFIX + "Hips Location"
+        hips_location.target = follow
 
     # --- Directions
     reach_bones = {f"{s}{n}" for s in ("Left", "Right") for n in ("Arm", "ForeArm")}
+    leg_bones = {n: find_bone(rig, n) for s in ("Left", "Right") for n in (s + "UpLeg", s + "Leg", s + "Foot")}
+    solve_legs = (leg_mode in ('PLANT', 'POSITION') and len(frames) >= 3 and all(leg_bones.values())
+                  and find_bone(rig, "Hips") is not None)
+    stand = "hips_lift" in info                             # the rig stands on the floor
+    if (solve_legs or stand) and len(frames) >= 3 and all(leg_bones.values()):
+        h = {n: mw @ b.bone.head_local for n, b in leg_bones.items()}
+        hips_head = mw @ find_bone(rig, "Hips").bone.head_local
+        rig_leg = rig_leg_length(rig)
+        mocap_leg = mocap_leg_length(empties, scene.frame_start, scene.frame_end)
+        ratio = mocap_leg / rig_leg if rig_leg > 1e-9 else 1.0
+        offsets = {s: _rig_components(rig, h[s + "UpLeg"] - hips_head, "LeftUpLeg", "RightUpLeg")
+                   for s in ("Left", "Right")}
+        # Feet are held where the rig is moved by the mocap hips; a rig that stays in place has
+        # nothing to hold them against
+        plant = leg_mode == 'PLANT' and hips_location is not None
+        legs, shift, down = leg_directions(
+            empties, frames, fps, mirror_depth, ratio, (h["LeftLeg"] - h["LeftUpLeg"]).length,
+            (h["LeftFoot"] - h["LeftLeg"]).length, offsets, info.get("hips_lift", 0.0), plant,
+            floor_data if stand else None)
+        info["feet_down"] = down
+        if not solve_legs:
+            legs = {}                                       # only the hips' height is used
+        if shift is not None and hips_location is not None:
+            hips_location.target = _keyed_point(coll, follow, "OM_hips_shift", shift, frames)
+            info["hips_pull"] = float(np.linalg.norm(shift, axis=1).max() / ratio)
+        for side, (joint, thigh_dir, knee, shin_dir) in legs.items():
+            for short, origin, dirs, nm in ((side + "UpLeg", joint, thigh_dir, "thigh"),
+                                            (side + "Leg", knee, shin_dir, "shin")):
+                pb = drive_bone(rig, short)
+                c = pb.constraints.new('DAMPED_TRACK')
+                c.name = PREFIX + "Aim"
+                c.target = _keyed_far_point(coll, points, f"OM_leg_{nm}_{side}", origin, dirs, frames)
+                c.track_axis = 'TRACK_Y'
+                mapped.append(pb.name)
+    solved = set(reach_bones) if arm_mode == 'POSITION' else set()
+    if solve_legs:
+        solved |= {s + n for s in ("Left", "Right") for n in ("UpLeg", "Leg")}
     for short, (a, b) in AIM_MAP.items():
-        if arm_mode == 'POSITION' and short in reach_bones:
-            continue                                        # see "Arm reach" below
+        if short in solved:
+            continue                                        # see "Arm reach" and "Feet"
         pb = drive_bone(rig, short)
         if pb is None:
             missing.append(short)
@@ -844,18 +1219,40 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
         mapped.append(pb.name)
 
     # --- Arms and hands (keyed, smoothed targets; see ARM_MAP)
-    frames = np.arange(scene.frame_start, scene.frame_end + 1, dtype=float)
-    fps = scene.render.fps / (scene.render.fps_base or 1.0)
     reach = {}
-    if len(frames) >= 2 and arm_mode == 'POSITION':
-        ref = {n: find_bone(rig, n) for n in ("LeftArm", "LeftForeArm", "LeftHand", "RightArm", "LeftUpLeg", "RightUpLeg")}
-        if all(ref.values()):
-            h = {n: mw @ b.bone.head_local for n, b in ref.items()}
-            upper_len = (h["LeftForeArm"] - h["LeftArm"]).length
-            fore_len = (h["LeftHand"] - h["LeftForeArm"]).length
-            rig_torso = ((h["LeftArm"] + h["RightArm"]) / 2 - (h["LeftUpLeg"] + h["RightUpLeg"]) / 2).length
-            rig_width = (h["LeftArm"] - h["RightArm"]).length
-            reach = arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, rig_width)
+    ref = {n: find_bone(rig, n) for n in ("LeftArm", "LeftForeArm", "LeftHand", "RightArm", "LeftUpLeg", "RightUpLeg")}
+    if len(frames) >= 2 and all(ref.values()):
+        h = {n: mw @ b.bone.head_local for n, b in ref.items()}
+        upper_len = (h["LeftForeArm"] - h["LeftArm"]).length
+        fore_len = (h["LeftHand"] - h["LeftForeArm"]).length
+        chest = (h["LeftArm"] + h["RightArm"]) / 2
+        rig_torso = (chest - (h["LeftUpLeg"] + h["RightUpLeg"]) / 2).length
+        rig_width = (h["LeftArm"] - h["RightArm"]).length
+        # Collar bones (on a control rig only if it has controls for them)
+        arm_heads = None
+        collars = {s: clavicle_bone(rig, s) for s in ("Left", "Right")} if shoulders else {}
+        if collars and all(collars.values()):
+            mocap_torso = _median([(local_location(empties[SHOULDER_C], f) - local_location(empties[HIP_C], f)).length
+                                   for f in range(scene.frame_start, scene.frame_end + 1,
+                                                  max(1, (scene.frame_end - scene.frame_start) // 60))])
+            ratio_torso = mocap_torso / max(rig_torso, 1e-9)
+            heads, rests = {}, {}
+            for s, pb in collars.items():
+                head = mw @ pb.bone.head_local
+                heads[s] = _rig_components(rig, head - chest, "LeftArm", "RightArm")
+                rests[s] = _rig_components(rig, h[s + "Arm"] - head, "LeftArm", "RightArm")
+            arm_heads = {}
+            for s, (head, direction, arm_head) in clavicle_directions(
+                    empties, frames, fps, mirror_depth, ratio_torso, heads, rests).items():
+                c = collars[s].constraints.new('DAMPED_TRACK')
+                c.name = PREFIX + "Aim"
+                c.target = _keyed_far_point(coll, points, f"OM_collar_{s}", head, direction, frames)
+                c.track_axis = 'TRACK_Y'
+                mapped.append(collars[s].name)
+                arm_heads[s] = arm_head
+        if arm_mode == 'POSITION':
+            reach = arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, rig_width,
+                                         shoulders=arm_heads, grip=grip)
     if len(frames) >= 2:
         for side, (wrist, elbow, curl, hand_dir, palm) in arm_directions(empties, frames, fps).items():
             arm, fore, hand = (drive_bone(rig, side + n) for n in ("Arm", "ForeArm", "Hand"))
@@ -916,7 +1313,9 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
         mapped.append(head.name)
 
     # --- Facing / roll (twist around the bone)
-    for short, (a, b, ref_from, ref_to) in FACING_MAP.items():
+    for short, (a, b, ref_from, ref_to, influence) in FACING_MAP.items():
+        if not spine_twist and short in ("Spine", "Spine1"):
+            continue
         pb = drive_bone(rig, short)
         rf, rt = find_bone(rig, ref_from), find_bone(rig, ref_to)
         if pb is None or rf is None or rt is None:
@@ -928,6 +1327,7 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
         c.target = _aim_point(coll, cache, points, a, b)
         c.lock_axis = 'LOCK_Y'
         c.track_axis = _twist_axis(rig, pb, ref_dir)
+        c.influence = influence
         if pb.name not in mapped:
             mapped.append(pb.name)
 
@@ -974,6 +1374,29 @@ class RetargetToMixamo(bpy.types.Operator):
                                             "arm proportions the hands land elsewhere"),
         ],
         default='POSITION')
+    leg_mode: bpy.props.EnumProperty(name="Legs", items=[
+            ('PLANT', "Foot Position, Planted", "Ankles go where the mocap ankles are (knees bend to fit the "
+                                                "rig's leg lengths) and are held still while the foot is down"),
+            ('POSITION', "Foot Position", "Ankles go where the mocap ankles are, without holding them"),
+            ('DIRECTION', "Bone Direction", "Thigh and shin copy the mocap directions; standing feet can slide"),
+        ], default='PLANT')
+    hip_height: bpy.props.EnumProperty(name="Hip Height", items=[
+            ('FLOOR', "From Floor", "The rig's feet stand on its floor when the mocap's feet stand on theirs"),
+            ('START', "From First Frame", "The hips start at the rig's rest position (use this if the "
+                                          "feet are not in the video)"),
+        ], default='FLOOR')
+    shoulders: bpy.props.BoolProperty(
+        name="Collar Bones", default=True,
+        description="Lift the collar bones with the mocap shoulders (shrugs, raised arms)")
+    spine_twist: bpy.props.BoolProperty(
+        name="Spread Spine Twist", default=True,
+        description="Spread the twist between hips and shoulders over the spine bones instead of "
+                    "turning only the top one")
+    grip: bpy.props.EnumProperty(name="Two-Handed Grip", items=[
+            ('NONE', "Off", "Each hand follows its own mocap hand"),
+            ('RIGHT', "Right Hand Leads", "Both hands hold one thing: the left hand keeps a steady distance to the right"),
+            ('LEFT', "Left Hand Leads", "Both hands hold one thing: the right hand keeps a steady distance to the left"),
+        ], default='NONE')
 
     def execute(self, context):
         rig = bpy.data.objects.get(self.target_rig)
@@ -992,7 +1415,11 @@ class RetargetToMixamo(bpy.types.Operator):
         scene = context.scene
         score = depth_mirror_score(empties, scene.frame_start, scene.frame_end)
         mirror = score < 0 if self.mirror_depth == 'AUTO' else self.mirror_depth == 'ON'
-        mapped, missing, scale = setup_retarget(context, rig, empties, self.hips_motion, mirror, self.arm_mode)
+        info = {}
+        mapped, missing, scale = setup_retarget(
+            context, rig, empties, self.hips_motion, mirror, self.arm_mode, leg_mode=self.leg_mode,
+            hip_height=self.hip_height, shoulders=self.shoulders, spine_twist=self.spine_twist,
+            grip=self.grip, info=info)
         mapped = list(dict.fromkeys(mapped))
         scene.bake_rig = rig
         scene.bake_frame_start = scene.frame_start
@@ -1001,6 +1428,9 @@ class RetargetToMixamo(bpy.types.Operator):
         root = empties[0].parent.name if empties[0].parent else "landmarks"
         msg = (f"Retargeted {root} to {len(mapped)} {target}bones of {rig.name} (hips scale {scale:.3f}, "
                f"depth {'mirrored' if mirror else 'as tracked'}, facing check {score:+.2f}).")
+        down = info.get("feet_down")
+        if down and self.leg_mode == 'PLANT' and self.hips_motion:
+            msg += f" Feet held: left {down['Left'] * 100:.0f}%, right {down['Right'] * 100:.0f}% of the take."
         if missing:
             msg += f" Not found: {', '.join(missing)}"
         self.report({'WARNING'} if missing else {'INFO'}, msg)

@@ -91,6 +91,13 @@ WARP_SMOOTH_S = 0.15      # time warp: smoothing of the found timing (s)
 WARP_VEL_WEIGHT = 0.7     # time warp: weight of signal velocities next to the heights
 ANGLE_RANGE = (40.0, 140.0)  # view angles searched (degrees)
 ANGLE_MIN_GAIN = 0.03     # an angle other than 90 must lower bone length variation by this much
+PEAK_SIGMA = 1.6          # peak-keeping smoothing: window width relative to the plain Gaussian's
+SMOOTH_PEAKS = True       # final smoothing keeps peaks (False: plain Gaussian, as before)
+FUSE_HEIGHTS = True       # heights of joints hidden in the front view come from the side view
+FUSE_MAX_HEIGHT_ERR = 2.5  # ... only if the views' heights agree this well (% of body height; two
+                          # cameras on one performance: about 1, separate takes: 5 and more)
+FUSE_FRONT_VIS = 0.5      # ... front visibility below which that starts (and side visibility above which)
+FUSE_VIS_RANGE = 0.3      # ... and the range over which it blends in
 GAP_FILL_S = 0.1          # occluded joints: side depth borrowed from frames within about this time
 
 
@@ -101,17 +108,26 @@ def _as_array(frames):
     return np.asarray(frames, dtype=np.float64).reshape(len(frames), N_PTS, 3)
 
 
-def _gauss(a, sigma, trend=False):
+def _gauss(a, sigma, trend=False, peaks=False):
     """
         Gaussian smoothing along axis 0 (time), edges reflected. trend=True reflects oddly
         (point-symmetric about the end value), which keeps a steady rise or fall at the ends instead
         of bending it toward the mirrored values (scale of an actor walking toward a camera, times).
+        peaks=True fits a parabola under the same Gaussian window instead of a constant (a
+        Savitzky-Golay filter with Gaussian weights): a plain average flattens every peak and
+        rounds every fast move, the parabola follows them, at PEAK_SIGMA times the width for
+        about the same noise reduction.
     """
     if sigma <= 0 or len(a) < 3:
         return a
+    if peaks:
+        sigma = sigma * PEAK_SIGMA
     radius = max(1, int(3 * sigma + 0.5))
     x = np.arange(-radius, radius + 1)
     k = np.exp(-0.5 * (x / sigma) ** 2)
+    if peaks and radius >= 2:
+        m0, m2, m4 = k.sum(), (k * x ** 2).sum(), (k * x ** 4).sum()
+        k = k * (m4 - m2 * x ** 2) / (m0 * m4 - m2 * m2)
     k /= k.sum()
     pad = [(radius, radius)] + [(0, 0)] * (a.ndim - 1)
     if len(a) > radius:
@@ -598,6 +614,21 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     report["lr_switches"] = swaps
     report["height_err"] = height_agreement(F, S, scale, visS, valid)
 
+    # 3b. Heights of joints the front view cannot see (an arm behind the body) taken from the side
+    #     view, which measures height too. Only for one performance filmed by two cameras, which
+    #     shows in how well the two views' heights agree (FUSE_MAX_HEIGHT_ERR): in separate takes
+    #     the heights differ by more than the front view's guess is off.
+    report["heights_from_side"] = 0.0
+    if FUSE_HEIGHTS and sync != "WARP" and report["height_err"] < FUSE_MAX_HEIGHT_ERR:
+        a = (np.clip((FUSE_FRONT_VIS - visF[:, :33]) / FUSE_VIS_RANGE, 0.0, 1.0)
+             * np.clip((visS[:, :33] - FUSE_FRONT_VIS) / FUSE_VIS_RANGE, 0.0, 1.0))
+        y_side = F[:, [HIP_C], 1] + (S[:, :33, 1] - S[:, [HIP_C], 1]) * scale[:, None]
+        F = F.copy()
+        F[:, :33, 1] = (1 - a) * F[:, :33, 1] + a * y_side
+        for c, (i, j) in CENTROIDS.items():
+            F[:, c, 1] = (F[:, i, 1] + F[:, j, 1]) / 2
+        report["heights_from_side"] = float(a.mean())
+
     # 4. View angle, then side x -> depth with the sign that makes the body right-handed
     U = S[:, :, 0] * scale[:, None]
     w = _side_weight(visS)
@@ -643,8 +674,8 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     w_eff = w + (1 - w) * conf
 
     # 6. Smoothing
-    D = _gauss(D, smoothing)
-    XY = _gauss(F[:, :, :2], smoothing / 2)
+    D = _gauss(D, smoothing, peaks=SMOOTH_PEAKS)
+    XY = _gauss(F[:, :, :2], smoothing / 2, peaks=SMOOTH_PEAKS)
     F_out = F.copy()
     F_out[:, :, :2] = XY
 

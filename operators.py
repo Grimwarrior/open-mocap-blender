@@ -98,6 +98,49 @@ def body_hand_frames(side, frames, times, fps):
     return out
 
 
+def keep_in_place(rig):
+    """
+        Remove the travel over the ground from the baked hips (the rig's root motion): every key keeps
+        its height, and the horizontal position of the first key. :return: True if keys were changed.
+    """
+    from . import retarget
+    hips = retarget.drive_bone(rig, "Hips")
+    ad = rig.animation_data
+    if hips is None or not ad or not ad.action:
+        return False
+    fcurves = None
+    try:
+        from bpy_extras.anim_utils import action_get_channelbag_for_slot
+        bag = action_get_channelbag_for_slot(ad.action, ad.action_slot)
+        fcurves = bag.fcurves if bag else None
+    except ImportError:
+        pass
+    if fcurves is None:
+        fcurves = getattr(ad.action, "fcurves", [])
+    path = hips.path_from_id("location")
+    fcs = {fc.array_index: fc for fc in fcurves if fc.data_path == path}
+    if len(fcs) != 3 or len({len(fc.keyframe_points) for fc in fcs.values()}) != 1:
+        return False
+    # bone location -> world directions (the bone's rest axes, turned by its parent's rest and the object)
+    to_world = rig.matrix_world.to_3x3() @ hips.bone.matrix_local.to_3x3()
+    back = to_world.inverted()
+    first = None
+    for k in range(len(fcs[0].keyframe_points)):
+        points = [fcs[i].keyframe_points[k] for i in range(3)]
+        world = to_world @ Vector([p.co[1] for p in points])
+        if first is None:
+            first = world.copy()
+        local = back @ Vector((first.x, first.y, world.z))
+        for i, p in enumerate(points):
+            delta = local[i] - p.co[1]
+            p.co[1] = local[i]
+            p.handle_left[1] += delta
+            p.handle_right[1] += delta
+    for fc in fcs.values():
+        fc.update()
+    return True
+
+
 # -------------------------------------------------------------
 # MAIN OPERATORS
 # -------------------------------------------------------------
@@ -581,6 +624,9 @@ class BakeMotion(bpy.types.Operator):
     action_name: bpy.props.StringProperty(
         name="Action Name", default="",
         description="Bake into a new action with this name (fake user). Empty: the rig's current action")
+    in_place: bpy.props.BoolProperty(
+        name="In Place", default=False,
+        description="After baking, remove the hips' travel over the ground (their height is kept)")
 
     """
         :param frame_start: Starting frame for baking animation.
@@ -691,6 +737,9 @@ class BakeMotion(bpy.types.Operator):
         if name and baked is not None:
             baked.name = name              # Blender adds .001 if the name is taken
             baked.use_fake_user = True
+        if self.in_place and baked is not None:
+            if not keep_in_place(obj):
+                self.report({'WARNING'}, "In Place: no baked location keys on the hips, nothing changed")
         self.report({'INFO'}, f"Baking complete: action '{baked.name}'." if baked else "Baking complete.")
         return {'FINISHED'}
 

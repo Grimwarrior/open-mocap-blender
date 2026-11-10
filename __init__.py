@@ -104,6 +104,33 @@ def register():
                                             "arm proportions the hands land elsewhere"),
         ],
         default='POSITION')
+    bpy.types.Scene.retarget_leg_mode = bpy.props.EnumProperty(name="Legs", items=[
+            ('PLANT', "Foot Position, Planted", "Ankles go where the mocap ankles are (knees bend to fit the "
+                                                "rig's leg lengths) and are held still while the foot is down"),
+            ('POSITION', "Foot Position", "Ankles go where the mocap ankles are, without holding them"),
+            ('DIRECTION', "Bone Direction", "Thigh and shin copy the mocap directions; standing feet can slide"),
+        ], default='PLANT')
+    bpy.types.Scene.retarget_hip_height = bpy.props.EnumProperty(name="Hip Height", items=[
+            ('FLOOR', "From Floor", "The rig's feet stand on its floor when the mocap's feet stand on theirs"),
+            ('START', "From First Frame", "The hips start at the rig's rest position (use this if the "
+                                          "feet are not in the video)"),
+        ], default='FLOOR')
+    bpy.types.Scene.retarget_shoulders = bpy.props.BoolProperty(
+        name="Collar Bones", default=True,
+        description="Lift the collar bones with the mocap shoulders (shrugs, raised arms)")
+    bpy.types.Scene.retarget_spine_twist = bpy.props.BoolProperty(
+        name="Spread Spine Twist", default=True,
+        description="Spread the twist between hips and shoulders over the spine bones instead of "
+                    "turning only the top one")
+    bpy.types.Scene.retarget_grip = bpy.props.EnumProperty(name="Two-Handed Grip", items=[
+            ('NONE', "Off", "Each hand follows its own mocap hand"),
+            ('RIGHT', "Right Hand Leads", "Both hands hold one thing: the left hand keeps a steady distance to the right"),
+            ('LEFT', "Left Hand Leads", "Both hands hold one thing: the right hand keeps a steady distance to the left"),
+        ], default='NONE')
+    bpy.types.Scene.bake_in_place = bpy.props.BoolProperty(
+        name="In Place", default=False,
+        description="After baking, remove the hips' travel over the ground (their height is kept), "
+                    "for engines that move the character themselves")
     bpy.types.Scene.retarget_move_hips = bpy.props.BoolProperty(
         name="Move Hips", default=True,
         description="Copy the hip translation (scaled to the rig's leg length), not only rotations")
@@ -144,6 +171,12 @@ def unregister():
     del bpy.types.Scene.retarget_mirror_depth
     del bpy.types.Scene.retarget_source
     del bpy.types.Scene.retarget_arm_mode
+    del bpy.types.Scene.retarget_leg_mode
+    del bpy.types.Scene.retarget_hip_height
+    del bpy.types.Scene.retarget_shoulders
+    del bpy.types.Scene.retarget_spine_twist
+    del bpy.types.Scene.retarget_grip
+    del bpy.types.Scene.bake_in_place
 
 
 
