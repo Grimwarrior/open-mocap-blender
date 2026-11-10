@@ -85,13 +85,12 @@ def _to_mp_image(img_bgr):
 
 
 def _draw_landmarks(img, points, connections, line_color, point_color):
+    px = [(int(round(p[0])), int(round(p[1]))) for p in points]      # landmarks are sub-pixel floats
     for c in connections:
-        if c.start < len(points) and c.end < len(points):
-            p1 = tuple(points[c.start][:2])
-            p2 = tuple(points[c.end][:2])
-            cv2.line(img, p1, p2, line_color, 2)
-    for p in points:
-        cv2.circle(img, tuple(p[:2]), 4, point_color, cv2.FILLED)
+        if c.start < len(px) and c.end < len(px):
+            cv2.line(img, px[c.start], px[c.end], line_color, 2)
+    for p in px:
+        cv2.circle(img, p, 4, point_color, cv2.FILLED)
 
 
 class PoseDetector:
@@ -111,15 +110,18 @@ class PoseDetector:
     def find_pose(self, img, draw=True):
         """
             :return: (img, landmarks). landmarks is a list of 33 [x, y, z] pixel
-                     coordinates, or an empty list if no person was found.
+                     coordinates (floats), or an empty list if no person was found.
                      self.visibility then holds the 33 visibility scores (0..1).
+                     z is the image landmarks' own depth. (MediaPipe's world landmarks were tried
+                     instead: scaled to the image they are the same depth, correlation 0.99, at
+                     about a quarter of the size, which normalize_coordinates' scale already does.)
         """
         result = self.landmarker.detect_for_video(_to_mp_image(img), self.clock.next())
         if not result.pose_landmarks:
             self.visibility = []
             return img, []
         h, w = img.shape[:2]
-        landmarks = [[int(lm.x * w), int(lm.y * h), int(lm.z * w)] for lm in result.pose_landmarks[0]]
+        landmarks = [[lm.x * w, lm.y * h, lm.z * w] for lm in result.pose_landmarks[0]]
         self.visibility = [lm.visibility if lm.visibility is not None else 1.0 for lm in result.pose_landmarks[0]]
         if draw:
             _draw_landmarks(img, landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
@@ -186,7 +188,7 @@ class RTMWDetector:
         k = self._pick_person(keypoints, scores)
         pts, sc = keypoints[k][_WB_TO_MP], scores[k][_WB_TO_MP]
         self.previous = (keypoints[k][11] + keypoints[k][12]) / 2
-        landmarks = [[int(x), int(y), (mp_landmarks[i][2] if mp_landmarks else 0)]
+        landmarks = [[float(x), float(y), (mp_landmarks[i][2] if mp_landmarks else 0.0)]
                      for i, (x, y) in enumerate(pts)]
         self.visibility = np.clip((sc - _RTMW_SCORE_LOW) / _RTMW_SCORE_RANGE, 0.0, 1.0).tolist()
         if draw:
@@ -237,7 +239,7 @@ class HandDetector:
         h, w = img.shape[:2]
         hands = []
         for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
-            lm_list = [[int(lm.x * w), int(lm.y * h), int(lm.z * w)] for lm in landmarks]
+            lm_list = [[lm.x * w, lm.y * h, lm.z * w] for lm in landmarks]
             # The Tasks API reports the subject's own hand for a non-mirrored image,
             # which is what cvzone produced after its flipType swap.
             hand_type = handedness[0].category_name if handedness else "Right"
@@ -247,7 +249,7 @@ class HandDetector:
                                 (255, 255, 255), (255, 0, 255))
                 xs = [p[0] for p in lm_list]
                 ys = [p[1] for p in lm_list]
-                x0, y0, x1, y1 = min(xs) - 20, min(ys) - 20, max(xs) + 20, max(ys) + 20
+                x0, y0, x1, y1 = int(min(xs)) - 20, int(min(ys)) - 20, int(max(xs)) + 20, int(max(ys)) + 20
                 cv2.rectangle(img, (x0, y0), (x1, y1), (255, 0, 255), 2)
                 cv2.putText(img, hand_type, (x0, y0 - 10), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 255), 2)
         return hands, img
@@ -458,11 +460,21 @@ class PoseTracking:
         elif self.mode == "side_pose":
             self.path = gvar.side_video_path
         else:
-            self.path = "" 
+            self.path = ""
+
+        # A new take replaces the earlier one of the same view (appending a second run to the
+        # first would double the take and restart its frame times half way)
+        if self.mode == "side_pose":
+            for lst in (gvar.zlist, gvar.zlist_times, gvar.zlist_vis):
+                lst.clear()
+        else:
+            for lst in (gvar.positionList, gvar.position_times, gvar.position_vis):
+                lst.clear()
+            gvar.positionList_raw = None
 
         # --- Handle realtime webcam tracking ---
         if self.mode == "rt_pose":
-            self.cap = cv2.VideoCapture(0)
+            self.cap = cv2.VideoCapture(bpy.context.scene.cam_index)
             if not self.cap.isOpened():
                 print("Failed to open camera.")
                 return
@@ -564,7 +576,7 @@ class PoseTracking:
             gvar.position_times.append(frame_time)
             gvar.position_vis.append(vis)
 
-        elif self.mode == "side_pose" and gvar.positionList:
+        elif self.mode == "side_pose":
             zframe = []
             for landmark in landmarksList:
                 normalized = MathUtility.normalize_coordinates(landmark, height, width, 400)
@@ -610,6 +622,7 @@ class PoseTracking:
             # --- Video file: show in OpenCV window ---
             cv2.imshow("Pose Tracking", img)
             cv2.waitKey(1)
+            return 0.0          # a video file is tracked as fast as the tracker runs, not at its frame rate
 
         return gvar.delay
 
@@ -694,6 +707,13 @@ class HandTracking:
             cv2.namedWindow("Hand Tracking", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("Hand Tracking", 640, 480)
             cv2.moveWindow("Hand Tracking", 0, 0)
+            # A new take replaces the earlier one of the same view
+            if self.mode == "front_hand":
+                for lst in (gvar.R_hand_positionList, gvar.L_hand_positionList, gvar.R_hand_times, gvar.L_hand_times):
+                    lst.clear()
+            else:
+                for lst in (gvar.R_hand_zlist, gvar.L_hand_zlist, gvar.R_hand_ztimes, gvar.L_hand_ztimes):
+                    lst.clear()
             self.running = True
             bpy.app.timers.register(self.update_frame, first_interval=0.0)
 
@@ -711,24 +731,35 @@ class HandTracking:
             self.detector = HandDetector(max_hands=self.num_hands,
                                          fps=None if self.mode == "rt_hand" else gvar.fps,
                                          detection_con=0.8)
+            self.video_fps = gvar.fps or 30
+            self.frame_index = -1
+            gvar.hand_fps = self.video_fps
+        self.frame_index += 1          # every call is one video frame, detected or not
+        frame_time = self.frame_index / self.video_fps
 
         height, width = img.shape[:2]
         hands, img = self.detector.find_hands(img)
         if not hands:
             return img
 
+        seen = set()
         for hand in hands:
             handType = hand['type']  # 'Right' or 'Left'
+            if handType in seen:
+                continue               # two detections with one label: keep the first (one entry per frame)
+            seen.add(handType)
             landmarksList = hand['lmList']
             if handType == "Right":
                 position_list = gvar.R_hand_positionList
                 z_list = gvar.R_hand_zlist
                 rt_hand_lmlist = gvar.rt_hand_lmlist_R
+                times, ztimes = gvar.R_hand_times, gvar.R_hand_ztimes
 
             else:
                 position_list = gvar.L_hand_positionList
                 z_list = gvar.L_hand_zlist
                 rt_hand_lmlist = gvar.rt_hand_lmlist_L
+                times, ztimes = gvar.L_hand_times, gvar.L_hand_ztimes
 
             normalized_landmarks = []
             for landmark in landmarksList:
@@ -742,12 +773,15 @@ class HandTracking:
                     rt_hand_lmlist.append(normalized)
                     flat_list.extend(normalized)
                 position_list.append(flat_list)
+                if self.mode == "front_hand":
+                    times.append(frame_time)
 
-            elif self.mode == "side_hand" and position_list:
+            elif self.mode == "side_hand":
                 zframe = []
                 for normalized in normalized_landmarks:
                     zframe.extend(normalized)
                 z_list.append(zframe)
+                ztimes.append(frame_time)
 
         return img
 
@@ -777,7 +811,7 @@ class HandTracking:
 
         cv2.imshow("Hand Tracking", img)
         cv2.waitKey(1)
-        return gvar.delay
+        return 0.0              # a video file is tracked as fast as the tracker runs
 
     def stop(self):
         """Stops hand tracking."""

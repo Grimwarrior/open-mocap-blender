@@ -43,6 +43,11 @@ def register():
     bpy.types.Scene.bake_frame_start = bpy.props.IntProperty(name="Start Frame", default=1, min = 1)
     bpy.types.Scene.bake_frame_end = bpy.props.IntProperty(name="End Frame", default=250, min = 1)
     bpy.types.Scene.bake_only_selected = bpy.props.BoolProperty(name="Only Selected Bones", default=False)
+    bpy.types.Scene.bake_action_name = bpy.props.StringProperty(
+        name="Action Name", default="",
+        description="Bake into a new action with this name (kept with a fake user, so each named take "
+                    "stays in the file). If the name is taken, Blender adds .001. "
+                    "Empty: bake into the rig's current action")
     bpy.types.Scene.multi_view_tracking = bpy.props.BoolProperty(name="Multi View Tracking", default=False)
     bpy.types.Scene.realtime_tracking = bpy.props.BoolProperty(name="Realtime Tracking", default=False)
     bpy.types.Scene.combine_method = bpy.props.EnumProperty(
@@ -62,11 +67,43 @@ def register():
     bpy.types.Scene.combine_offset = bpy.props.FloatProperty(
         name="Side Offset", default=0.0, min=-30.0, max=30.0, step=1, precision=2, unit='TIME_ABSOLUTE',
         description="Side video time minus front video time for the same moment (seconds). "
-                    "Combine Data reports the offset it found; adjust it here for separate performances "
-                    "whose timing drifts")
+                    "Combine Data reports the offset it found; adjust it here if the sync is off")
+    bpy.types.Scene.combine_sync = bpy.props.EnumProperty(
+        name="Timing",
+        items=[
+            ('OFFSET', "Filmed Together", "Both videos show the same performance (two cameras at once): "
+                                          "the side video is only shifted in time"),
+            ('WARP', "Separate Takes", "The side video is a second performance of the same move (e.g. one "
+                                       "camera, actor turned 90 degrees): its timing may drift by up to a "
+                                       "second and is matched frame by frame (time warp)"),
+        ],
+        default='OFFSET')
+    bpy.types.Scene.combine_auto_angle = bpy.props.BoolProperty(
+        name="Auto Angle", default=True,
+        description="Find the angle between the front and side views from constant bone lengths "
+                    "(stays at 90 unless another angle fits clearly better)")
+    bpy.types.Scene.combine_side_angle = bpy.props.FloatProperty(
+        name="View Angle", default=90.0, min=40.0, max=140.0, precision=0,
+        description="Angle between the front and side camera directions in degrees (90 = right angle). "
+                    "Combine Data reports the angle it found")
     bpy.types.Scene.combine_bone_strength = bpy.props.FloatProperty(
         name="Keep Bone Lengths", default=0.8, min=0.0, max=1.0, subtype='FACTOR',
-        description="How strongly depth is corrected so bones keep a constant length")
+        description="How strongly bones that come out too long in depth are shortened to their length "
+                    "(bones are never stretched in depth to reach it)")
+    bpy.types.Scene.retarget_source = bpy.props.PointerProperty(
+        name="Mocap", type=bpy.types.Object,
+        description="Mocap rig to retarget from: the empty whose children are the 40 landmark empties "
+                    "(RigRoot, RigRoot.001, ...). Empty: the newest take",
+        poll=lambda self, obj: obj.type == 'EMPTY' and retarget.is_mocap_root(obj))
+    bpy.types.Scene.retarget_arm_mode = bpy.props.EnumProperty(
+        name="Arms",
+        items=[
+            ('POSITION', "Hand Position", "Hands go where the mocap hands are relative to the shoulder "
+                                          "(scaled to the rig); elbows bend to fit the rig's arm lengths"),
+            ('DIRECTION', "Bone Direction", "Upper arm and forearm copy the mocap directions; with other "
+                                            "arm proportions the hands land elsewhere"),
+        ],
+        default='POSITION')
     bpy.types.Scene.retarget_move_hips = bpy.props.BoolProperty(
         name="Move Hips", default=True,
         description="Copy the hip translation (scaled to the rig's leg length), not only rotations")
@@ -92,6 +129,7 @@ def unregister():
     del bpy.types.Scene.bake_frame_start
     del bpy.types.Scene.bake_frame_end
     del bpy.types.Scene.bake_only_selected
+    del bpy.types.Scene.bake_action_name
     del bpy.types.Scene.multi_view_tracking
     del bpy.types.Scene.realtime_tracking
     del bpy.types.Scene.combine_method
@@ -99,8 +137,13 @@ def unregister():
     del bpy.types.Scene.combine_bone_strength
     del bpy.types.Scene.combine_auto_offset
     del bpy.types.Scene.combine_offset
+    del bpy.types.Scene.combine_sync
+    del bpy.types.Scene.combine_auto_angle
+    del bpy.types.Scene.combine_side_angle
     del bpy.types.Scene.retarget_move_hips
     del bpy.types.Scene.retarget_mirror_depth
+    del bpy.types.Scene.retarget_source
+    del bpy.types.Scene.retarget_arm_mode
 
 
 

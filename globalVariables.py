@@ -31,6 +31,13 @@ pose_tracker = None
 hand_front_video_path = "" 
 hand_side_video_path = "" 
 hand_tracker = None
+hand_fps = 0
+# Time (seconds, in its video) of each tracked frame of the lists below. A hand that is not found in a
+# frame gets no entry, so without these the frames after a miss would play too early.
+R_hand_times = [] #front view, right hand
+L_hand_times = []
+R_hand_ztimes = [] #side view
+L_hand_ztimes = []
 
 # RIGHT HAND
 R_hand_positionList = [] #each element of this list = list of [x,y,z] positions of 21 right hand landmarks in a given frame (front view)

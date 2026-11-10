@@ -46,6 +46,12 @@ MODELS = {
         "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
         "pose_landmarker_full/float16/latest/pose_landmarker_full.task",
     ),
+    # Larger pose model (about 30 MB instead of 9), chosen with "Pose Model" in the preferences
+    "pose_heavy": (
+        "pose_landmarker_heavy.task",
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+    ),
     "hand": (
         "hand_landmarker.task",
         "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -89,8 +95,30 @@ def models_dir():
     return os.path.join(data_dir(), "models")
 
 
+def pose_model():
+    """:return: 'FULL' or 'HEAVY', from the add-on preferences."""
+    return _pref("pose_model", 'FULL')
+
+
+def needed_models(model=None):
+    """:return: keys of MODELS that the chosen pose model needs."""
+    return ["pose_heavy" if (model or pose_model()) == 'HEAVY' else "pose", "hand"]
+
+
 def model_path(kind):
-    """:param kind: "pose" or "hand". :return: Path of the .task model file."""
+    """
+        :param kind: "pose" (the pose model chosen in the preferences; the full one if the heavy
+                     one is not downloaded yet), "pose_heavy" or "hand".
+        :return: Path of the .task model file.
+    """
+    if kind == "pose" and pose_model() == 'HEAVY':
+        heavy = os.path.join(models_dir(), MODELS["pose_heavy"][0])
+        if os.path.isfile(heavy):
+            return heavy
+    return os.path.join(models_dir(), MODELS[kind][0])
+
+
+def _model_file(kind):
     return os.path.join(models_dir(), MODELS[kind][0])
 
 
@@ -226,7 +254,7 @@ def mediapipe_loaded():
     return "mediapipe" in sys.modules
 
 
-def check_required_packages(ch=None, tracker=None):
+def check_required_packages(ch=None, tracker=None, model=None):
     """Return a list of missing requirements (packages and model files)."""
     ch = ch or channel()
     tracker = tracker or pose_tracker()
@@ -237,9 +265,9 @@ def check_required_packages(ch=None, tracker=None):
         missing.append(want + (f" (found {found})" if found else ""))
     if not is_installed("cv2"):
         missing.append("opencv-contrib-python")
-    for kind, (filename, _url) in MODELS.items():
-        if not os.path.isfile(model_path(kind)):
-            missing.append(filename)
+    for kind in needed_models(model):
+        if not os.path.isfile(_model_file(kind)):
+            missing.append(MODELS[kind][0])
     return missing
 
 
@@ -286,8 +314,9 @@ def _resolve_missing_requirements(*reqs):
 
 def _download_models():
     os.makedirs(models_dir(), exist_ok=True)
-    for kind, (filename, url) in MODELS.items():
-        target = model_path(kind)
+    for kind in needed_models():
+        filename, url = MODELS[kind]
+        target = _model_file(kind)
         if os.path.isfile(target):
             continue
         _set_status(f"Downloading {filename}...")

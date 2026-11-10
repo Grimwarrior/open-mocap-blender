@@ -31,6 +31,14 @@ class OpenMocapAddonPreferences(bpy.types.AddonPreferences):
              "points), MediaPipe alongside for depth. Downloads about 330 MB of models"),
         ],
         default='MEDIAPIPE')
+    pose_model: bpy.props.EnumProperty(
+        name="Pose Model",
+        items=[
+            ('FULL', "Full", "MediaPipe's standard pose model (default)"),
+            ('HEAVY', "Heavy", "MediaPipe's largest pose model: more accurate, slower to track. "
+                               "Downloads about 30 MB"),
+        ],
+        default='FULL')
     rtmw_device: bpy.props.EnumProperty(
         name="RTMW Device",
         items=[
@@ -60,9 +68,10 @@ class OpenMocapAddonPreferences(bpy.types.AddonPreferences):
         col.prop(self, "pose_tracker")
         if self.pose_tracker == 'RTMW':
             col.prop(self, "rtmw_device")
+        col.prop(self, "pose_model")
         col.separator()
 
-        missing = check_required_packages(self.mediapipe_channel, self.pose_tracker)
+        missing = check_required_packages(self.mediapipe_channel, self.pose_tracker, self.pose_model)
 
         if missing:
             col.label(text=f"Missing: {', '.join(missing)}", icon="ERROR")
@@ -140,11 +149,17 @@ class PoseTrackingPanel(bpy.types.Panel):
             box = layout.box()
             box.prop(scene, "combine_method")
             if scene.combine_method == 'IMPROVED':
+                box.prop(scene, "combine_sync")
                 row = box.row(align=True)
                 row.prop(scene, "combine_auto_offset", toggle=True)
                 sub = row.row(align=True)
                 sub.enabled = not scene.combine_auto_offset
                 sub.prop(scene, "combine_offset", text="Offset")
+                row = box.row(align=True)
+                row.prop(scene, "combine_auto_angle", toggle=True)
+                sub = row.row(align=True)
+                sub.enabled = not scene.combine_auto_angle
+                sub.prop(scene, "combine_side_angle", text="Angle")
                 box.prop(scene, "combine_smoothing")
                 box.prop(scene, "combine_bone_strength")
             box.operator("object.combine_data", text="Combine Data", icon='PLUS').mode = "pose"
@@ -152,19 +167,26 @@ class PoseTrackingPanel(bpy.types.Panel):
         layout.operator("object.hide_skeleton", text="Hide/Unhide Empties", icon='HIDE_OFF').collection_name = "PoseEmpties"
         layout.operator("object.hide_skeleton", text="Hide/Unhide Skeleton", icon='HIDE_OFF').collection_name = "PoseSkeleton"
         layout.operator("object.clear_mocap_cache", text="Clear Capture Cache", icon='TRASH').cache = "pose"
+        row = layout.row(align=True)
+        row.operator("object.open_mocap_save_capture", text="Save Capture", icon='EXPORT')
+        row.operator("object.open_mocap_load_capture", text="Load Capture", icon='IMPORT')
         layout.separator()
         layout.label(text="Animation Baking")
         layout.prop(scene, "bake_rig", text="Select Rig")
         if scene.bake_rig:
             if retarget.is_mixamo_rig(scene.bake_rig):
                 box = layout.box()
+                box.prop(scene, "retarget_source", icon="EMPTY_AXIS")
+                box.prop(scene, "retarget_arm_mode")
                 box.prop(scene, "retarget_move_hips")
                 box.prop(scene, "retarget_mirror_depth")
                 row = box.row(align=True)
                 op = row.operator("object.open_mocap_retarget_mixamo", text="Retarget to Mixamo", icon="ARMATURE_DATA")
                 op.target_rig = scene.bake_rig.name
+                op.source = scene.retarget_source.name if scene.retarget_source else ""
                 op.hips_motion = scene.retarget_move_hips
                 op.mirror_depth = scene.retarget_mirror_depth
+                op.arm_mode = scene.retarget_arm_mode
                 op = row.operator("object.open_mocap_clear_retarget", text="", icon="X")
                 op.target_rig = scene.bake_rig.name
             op = layout.operator("pose.toggle_copy_rotation", text="Toggle Constraints", icon="CONSTRAINT")
@@ -172,6 +194,7 @@ class PoseTrackingPanel(bpy.types.Panel):
         layout.prop(scene, "bake_frame_start")
         layout.prop(scene, "bake_frame_end")
         layout.prop(scene, "bake_only_selected")
+        layout.prop(scene, "bake_action_name", text="Action", icon="ACTION")
 
         op = layout.operator("object.bake_motion", text="Bake Motion", icon="ACTION_TWEAK")
         if scene.bake_rig:
@@ -179,6 +202,7 @@ class PoseTrackingPanel(bpy.types.Panel):
         op.frame_start = scene.bake_frame_start
         op.frame_end = scene.bake_frame_end
         op.only_selected_bones = scene.bake_only_selected
+        op.action_name = scene.bake_action_name
 
 
 
@@ -238,6 +262,9 @@ class HandTrackingPanel(bpy.types.Panel):
             layout.operator("object.combine_data", text="Combine Data", icon='PLUS').mode = "hand"
         layout.operator("object.animatehand", text="Animate", icon='RENDER_ANIMATION').mode = "offline"
         layout.operator("object.clear_mocap_cache", text="Clear Capture Cache", icon='TRASH').cache = "hand"
+        row = layout.row(align=True)
+        row.operator("object.open_mocap_save_capture", text="Save Capture", icon='EXPORT')
+        row.operator("object.open_mocap_load_capture", text="Load Capture", icon='IMPORT')
         layout.operator("object.hide_skeleton", text="Hide/Unhide R_Empties", icon='HIDE_OFF').collection_name = "RightHandEmpties"
         layout.operator("object.hide_skeleton", text="Hide/Unhide R_Skeleton", icon='HIDE_OFF').collection_name = "RightHandSkeleton"
         layout.operator("object.hide_skeleton", text="Hide/Unhide L_Empties", icon='HIDE_OFF').collection_name = "LeftHandEmpties"

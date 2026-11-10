@@ -5,32 +5,47 @@
     sees the front camera's depth as its own x. The original Combine Data simply replaced
     each front point's depth with the side point's x, frame N with frame N. That assumes both
     videos start at the same moment, run at the same fps, are filmed from the same distance,
-    and agree on which limb is left and which is right. The improved method fixes each of those:
+    at exactly 90 degrees, and agree on which limb is left and which is right. The improved
+    method fixes each of those:
 
     1. Sync      Both cameras see the same vertical motion. The side take is shifted in time
                  (with each video's own fps) until left/right-independent height signals
                  (hips, shoulders, nose, averaged wrists/elbows/knees/ankles) match best.
+                 A shift is only used when it matches clearly better than none (MIN_SYNC_GAIN):
+                 with two separate performances the match is weak and a few frames of shift can
+                 follow the noise. Time Warp (for two separate performances of the same move, e.g.
+                 one camera, actor turned 90 degrees for the second take) then lets the side
+                 timing drift by up to WARP_BAND_S around that offset (dynamic time warping).
     2. Scale     Per frame, the ratio of the body's vertical extent in the two views gives the
                  side camera's scale relative to the front one (also follows perspective when
                  the actor walks), so side x becomes depth in front-view units.
-    3. Left/right  A profile view often swaps the near and far limbs. For arms, legs and head
-                 a Viterbi pass picks, per frame, the labelling whose heights match the front
-                 view and whose motion is continuous.
-    4. Facing    The depth sign depends on which side of the actor the side camera stood. It is
+    3. Left/right  A profile view often swaps the near and far limbs. For arms and legs a
+                 Viterbi pass picks, per frame, the labelling whose heights match the front view and
+                 whose motion is continuous; a swap must be clearly better (LR_SWAP_BIAS), since in
+                 separate takes heights differ anyway. The head is left alone: left and right ear
+                 heights are nearly equal, so a swap there was a coin toss that turned the face.
+    4. Angle     A side camera at angle a sees x_side = cos(a) * x_front - sin(a) * depth. Two views
+                 alone cannot tell a from depth; the angle whose depth keeps the bones at a
+                 constant length while the actor moves is used (90 unless clearly better).
+       Facing    The depth sign depends on which side of the actor the side camera stood. It is
                  chosen so the body is right-handed (nose and toes point forward).
-    5. Fallback  Where the side view cannot see a joint (low visibility) or does not cover the
-                 frame, depth comes from the front view's own MediaPipe depth, calibrated
-                 against the side depth.
+    5. Gaps      Where the side view loses a joint for a moment (low visibility), its depth is
+                 interpolated from neighbouring frames that saw it; only longer gaps or frames
+                 the side video does not cover use the front view's own MediaPipe depth,
+                 calibrated against the side depth.
     6. Smoothing Gaussian smoothing over time (depth more than width/height).
-    7. Bones     Depth is corrected so bone lengths stay constant: with the front x/y kept,
-                 |depth step| = sqrt(L^2 - dx^2 - dy^2), sign taken from the measurement.
+    7. Bones     Bones that come out too long are shortened: with the front x/y kept, the
+                 depth step is limited to sqrt(L^2 - dx^2 - dy^2). L (left and right limbs share
+                 one) follows the actor's distance to the front camera, measured from 2D limb
+                 lengths only. Depth is never lengthened to reach L: setting every bone to exactly
+                 L made limbs pop front to back whenever the step changed sign, and stretched them
+                 in depth wherever L came out a little long.
 
     Data layout (as stored by utils.PoseTracking): per frame a flat list of 40 * [x, y, z],
     x = (px - w/2) / 100, y = (py - h) / 100, z = mediapipe z * w / 400.
     The combined output stores depth in the z slot, as before.
 """
 
-import math
 import numpy as np
 
 N_PTS = 40
@@ -64,8 +79,19 @@ SIDE_VIS_RANGE = 0.1      # ... blending to full side depth over this range. Med
 SCALE_SMOOTH_S = 1.0      # per-frame side scale smoothed over this many seconds (follows the actor
                           # walking toward/away from a camera); None: one scale for the whole take
 PERSPECTIVE_SMOOTH_S = 1.0  # smoothing of the front view's perspective scale used for bone lengths
+PERSPECTIVE_HOLD_S = 0.5  # ... its upper envelope of limb lengths is held over this time
 LR_SWITCH_PENALTY = 0.2   # extra cost for changing the left/right labelling, per joint
+LR_FIX_GROUPS = ("arms", "legs")  # label groups the left/right fix may swap (not the head)
+LR_SWAP_BIAS = 0.005      # extra cost of a swapped frame per joint, in body heights
+MIN_SYNC_GAIN = 0.075     # a time shift must raise the sync match by this much over no shift
 MIN_SYNC_MATCH = 0.3      # below this, the found offset is not trusted and 0 is used
+WARP_BAND_S = 1.0         # time warp: how far (s) the side timing may drift from the constant offset
+WARP_SLOPE_PENALTY = 0.3  # time warp: cost of speeding up / slowing down the side take for a frame
+WARP_SMOOTH_S = 0.15      # time warp: smoothing of the found timing (s)
+WARP_VEL_WEIGHT = 0.7     # time warp: weight of signal velocities next to the heights
+ANGLE_RANGE = (40.0, 140.0)  # view angles searched (degrees)
+ANGLE_MIN_GAIN = 0.03     # an angle other than 90 must lower bone length variation by this much
+GAP_FILL_S = 0.1          # occluded joints: side depth borrowed from frames within about this time
 
 
 # -------------------------------------------------------------
@@ -75,8 +101,12 @@ def _as_array(frames):
     return np.asarray(frames, dtype=np.float64).reshape(len(frames), N_PTS, 3)
 
 
-def _gauss(a, sigma):
-    """Gaussian smoothing along axis 0 (time), edges reflected."""
+def _gauss(a, sigma, trend=False):
+    """
+        Gaussian smoothing along axis 0 (time), edges reflected. trend=True reflects oddly
+        (point-symmetric about the end value), which keeps a steady rise or fall at the ends instead
+        of bending it toward the mirrored values (scale of an actor walking toward a camera, times).
+    """
     if sigma <= 0 or len(a) < 3:
         return a
     radius = max(1, int(3 * sigma + 0.5))
@@ -84,7 +114,10 @@ def _gauss(a, sigma):
     k = np.exp(-0.5 * (x / sigma) ** 2)
     k /= k.sum()
     pad = [(radius, radius)] + [(0, 0)] * (a.ndim - 1)
-    p = np.pad(a, pad, mode="reflect") if len(a) > radius else np.pad(a, pad, mode="edge")
+    if len(a) > radius:
+        p = np.pad(a, pad, mode="reflect", reflect_type="odd" if trend else "even")
+    else:
+        p = np.pad(a, pad, mode="edge")
     out = np.empty_like(a)
     flat_in = p.reshape(p.shape[0], -1)
     flat_out = out.reshape(a.shape[0], -1)
@@ -184,6 +217,23 @@ def combine_simple(front_list, side_list, num_points=40):
 # -------------------------------------------------------------
 # IMPROVED METHOD
 # -------------------------------------------------------------
+def _fps(t):
+    return 1.0 / max(float(np.median(np.diff(t))), 1e-6) if len(t) > 1 else 30.0
+
+
+def _offset_score(tF, sigF, tS, sigS, d, durF, durS):
+    """(score, correlation) of the height signals with side time = front time + d."""
+    tq = tF + d
+    valid = (tq >= tS[0]) & (tq <= tS[-1])
+    if valid.sum() < 8:
+        return -np.inf, 0.0
+    sS = _interp(tq[valid], tS, sigS)
+    sF = sigF[valid]
+    c = float(np.mean([np.mean(_zscore(sF[:, g]) * _zscore(sS[:, g])) for g in range(sF.shape[1])]))
+    overlap = (tq[valid][-1] - tq[valid][0]) / max(min(durF, durS), 1e-6)
+    return c - 0.1 * (1.0 - min(overlap, 1.0)), c
+
+
 def find_time_offset(tF, F, tS, S):
     """
         :return: (offset, correlation): side time = front time + offset (seconds), and the mean
@@ -194,32 +244,120 @@ def find_time_offset(tF, F, tS, S):
     min_overlap = 0.5 * min(durF, durS)
     lo = tS[0] - tF[-1] + min_overlap
     hi = tS[-1] - tF[0] - min_overlap
-    fps = max(1.0 / max(np.median(np.diff(tF)), 1e-6), 1.0 / max(np.median(np.diff(tS)), 1e-6))
-    step = 0.5 / fps
+    step = 1.0 / max(_fps(tF), _fps(tS))
     if hi < lo:
         lo = hi = 0.0
-    offsets = np.arange(lo, hi + step, step)
-    scores = np.full(len(offsets), -np.inf)
-    corrs = np.zeros(len(offsets))
-    for n, d in enumerate(offsets):
-        tq = tF + d
-        valid = (tq >= tS[0]) & (tq <= tS[-1])
-        if valid.sum() < 8:
-            continue
-        sS = _interp(tq[valid], tS, sigS)
-        sF = sigF[valid]
-        c = np.mean([np.mean(_zscore(sF[:, g]) * _zscore(sS[:, g])) for g in range(sF.shape[1])])
-        corrs[n] = c
-        overlap = (tq[valid][-1] - tq[valid][0]) / max(min(durF, durS), 1e-6)
-        scores[n] = c - 0.1 * (1.0 - min(overlap, 1.0))
-    best = int(np.argmax(scores))
-    d = offsets[best]
-    if 0 < best < len(offsets) - 1 and np.isfinite(scores[best - 1]) and np.isfinite(scores[best + 1]):
-        y0, y1, y2 = scores[best - 1], scores[best], scores[best + 1]
-        den = y0 - 2 * y1 + y2
-        if abs(den) > 1e-12:
-            d += step * 0.5 * (y0 - y2) / den
-    return float(d), float(corrs[best])
+    # Coarse search on a whole-frame grid through 0, then a fine search around the best offset.
+    # (A grid that does not contain 0 plus parabolic refinement was biased by up to half a frame.)
+    offsets = np.arange(np.floor(lo / step), np.ceil(hi / step) + 1) * step
+    scores = np.array([_offset_score(tF, sigF, tS, sigS, d, durF, durS)[0] for d in offsets])
+    best = offsets[int(np.argmax(scores))]
+    fine = best + np.linspace(-step, step, 21)
+    res = [_offset_score(tF, sigF, tS, sigS, d, durF, durS) for d in fine]
+    k = int(np.argmax([r[0] for r in res]))
+    # Keep the videos as they start unless a shift matches clearly better: with two separate
+    # performances the match is weak and a few frames of shift can just follow the noise.
+    _, c0 = _offset_score(tF, sigF, tS, sigS, 0.0, durF, durS)
+    if res[k][1] - c0 < MIN_SYNC_GAIN:
+        return 0.0, float(c0)
+    return float(fine[k]), float(res[k][1])
+
+
+def _warp_features(P):
+    """Per-frame features for time warping: z-scored height signals and their velocities."""
+    sig = _signals(P)
+    sig = (sig - sig.mean(axis=0)) / np.maximum(sig.std(axis=0), 1e-9)
+    vel = np.gradient(_gauss(sig, 1.5), axis=0)
+    vel = vel / np.maximum(vel.std(axis=0), 1e-9)
+    return np.concatenate([sig, WARP_VEL_WEIGHT * vel], axis=1)
+
+
+def time_warp(tF, F, tS, S, offset):
+    """
+        Dynamic time warping for two separate performances of the same move, whose timing drifts.
+        Searches within WARP_BAND_S of the constant offset, slopes between 1/2 and 2.
+        :return: side time for every front frame (seconds).
+    """
+    fpsF = _fps(tF)
+    band = max(WARP_BAND_S, 0.0)
+    # Side signals resampled on the front frame rate, padded by the band at both ends
+    # (padded columns are "no side video" and cost a neutral amount).
+    tg = np.arange(tS[0] - band, tS[-1] + band + 0.5 / fpsF, 1.0 / fpsF)
+    inside = (tg >= tS[0]) & (tg <= tS[-1])
+    fF = _warp_features(F)
+    fS = _warp_features(S)
+    fG = _interp(np.clip(tg, tS[0], tS[-1]), tS, fS)
+    n, m = len(tF), len(tg)
+    # Only a band of columns around the constant offset is stored per row: row i covers the
+    # columns base[i] .. base[i] + W - 1 (memory n * W instead of n * m for long takes).
+    half = int(np.ceil(band * fpsF))
+    W = 2 * half + 1
+    base = np.round((tF + offset - tg[0]) * fpsF).astype(int) - half
+    cols = base[:, None] + np.arange(W)[None, :]                       # (n, W) column index
+    ok = (cols >= 0) & (cols < m)
+    cc = np.clip(cols, 0, m - 1)
+    cost = np.mean((fG[cc] - fF[:, None, :]) ** 2, axis=2)
+    neutral = float(np.median(cost[ok & inside[cc]])) if (ok & inside[cc]).any() else 1.0
+    cost = np.where(inside[cc], cost, neutral)                         # padding: no side video
+    cost[~ok] = np.inf
+
+    def prev(Drow, b_prev, b_cur, delta):
+        """Values of a previous row's band at columns (current band columns - delta)."""
+        idx = np.arange(W) + (b_cur - b_prev) - delta
+        out = np.full(W, np.inf)
+        good = (idx >= 0) & (idx < W)
+        out[good] = Drow[idx[good]]
+        return out
+
+    # DP with steps (1,1), (1,2), (2,1); off-diagonal steps pay a slope penalty
+    pen = WARP_SLOPE_PENALTY
+    D = np.full((n, W), np.inf)
+    move = np.zeros((n, W), dtype=np.int8)
+    D[0] = cost[0]                                                     # free start column
+    for i in range(1, n):
+        opts = np.stack([prev(D[i - 1], base[i - 1], base[i], 1),
+                         prev(D[i - 1], base[i - 1], base[i], 2) + pen,
+                         prev(D[i - 2], base[i - 2], base[i], 1) + pen if i >= 2 else np.full(W, np.inf)])
+        k = np.argmin(opts, axis=0)
+        D[i] = cost[i] + opts[k, np.arange(W)]
+        move[i] = k
+    # Backtrack from the cheapest end column (free end)
+    b = int(np.argmin(D[-1]))
+    if not np.isfinite(D[-1, b]):
+        return tF + offset                                             # no path: keep the offset
+    col = np.full(n, np.nan)
+    i, j = n - 1, base[-1] + b
+    col[i] = j
+    while i > 0:
+        k = move[i, j - base[i]]
+        if k == 0:
+            i, j = i - 1, j - 1
+        elif k == 1:
+            i, j = i - 1, j - 2
+        else:
+            col[i - 1] = j - 0.5                                        # row skipped: halfway
+            i, j = i - 2, j - 1
+        if i >= 0:
+            col[i] = j
+    col = _fill_nan(col)
+    ts = tg[0] + col / fpsF
+    ts = _gauss(ts, WARP_SMOOTH_S * fpsF, trend=True)
+    return np.maximum.accumulate(ts)
+
+
+def height_agreement(F, S, scale, visS, valid):
+    """
+        How well the side view's joint heights match the front view's (both relative to the hips),
+        as mean error in % of the body height. Tells how well the two takes are synced.
+    """
+    yF = F[:, :33, 1] - F[:, [HIP_C], 1]
+    yS = (S[:, :33, 1] - S[:, [HIP_C], 1]) * scale[:, None]
+    body = np.abs(F[:, NOSE, 1] - (F[:, L_ANKLE, 1] + F[:, R_ANKLE, 1]) / 2)
+    w = visS[:, :33] * valid[:, None]
+    if w.sum() < 1e-9:
+        return float("nan")
+    err = np.abs(yF - yS) / np.maximum(body, 1e-9)[:, None]
+    return float(np.sum(err * w) / np.sum(w) * 100)
 
 
 def _scale_per_frame(F, S, valid, fps=30.0):
@@ -239,7 +377,7 @@ def _scale_per_frame(F, S, valid, fps=30.0):
     r = _median_filter(r, 9)
     if SCALE_SMOOTH_S is None:
         return np.full(len(r), np.median(r))
-    return _gauss(r, max(1.0, SCALE_SMOOTH_S * fps))
+    return _gauss(r, max(1.0, SCALE_SMOOTH_S * fps), trend=True)
 
 
 def _fix_left_right(F, S, visS, scale, valid):
@@ -250,7 +388,11 @@ def _fix_left_right(F, S, visS, scale, valid):
     yS = (S[:, :, 1] - S[:, [HIP_C], 1]) * scale[:, None]
     XS = S[:, :, :2] * scale[:, None, None]
     n = len(F)
+    body = np.abs(F[:, NOSE, 1] - (F[:, L_ANKLE, 1] + F[:, R_ANKLE, 1]) / 2)
     for name, (L, R) in LR_GROUPS.items():
+        if name not in LR_FIX_GROUPS:
+            counts[name] = 0
+            continue
         L, R = np.array(L), np.array(R)
         joints = np.concatenate([L, R])
         assign = [joints, np.concatenate([R, L])]          # state 0: keep, state 1: swap
@@ -259,6 +401,7 @@ def _fix_left_right(F, S, visS, scale, valid):
             src = assign[s]
             emit[:, s] = np.sum(np.abs(yS[:, src] - yF[:, joints]) * visS[:, src], axis=1)
         emit[~valid] = 0.0
+        emit[:, 1] += LR_SWAP_BIAS * len(joints) * body     # a swap must be clearly better
         cost = emit[0].copy()
         back = np.zeros((n, 2), dtype=int)
         for k in range(1, n):
@@ -291,46 +434,62 @@ def _side_weight(visS):
     return np.clip((visS - SIDE_VIS_LOW) / SIDE_VIS_RANGE, 0.0, 1.0)
 
 
-def front_perspective_scale(F, D, fps):
+def front_perspective_scale(F, fps):
     """
         How big the actor appears in the front video per frame, relative to the take's median
-        (walking toward the camera makes every bone longer in image units). Taken from the 3D
-        lengths of all limbs together, smoothed over about a second.
+        (walking toward the camera makes every bone longer in image units). From the front video's
+        2D limb lengths only, so wrong depth cannot feed back into it: per frame the limbs closest to
+        the image plane (upper envelope of 2D length / longest 2D length), held over
+        PERSPECTIVE_HOLD_S and smoothed over PERSPECTIVE_SMOOTH_S.
     """
-    ratios = []
-    for p, c in LIMB_SEGMENTS:
-        L3 = np.sqrt(np.sum((F[:, c, :2] - F[:, p, :2]) ** 2, axis=1) + (D[:, c] - D[:, p]) ** 2)
-        med = np.median(L3)
-        if med > 1e-9:
-            ratios.append(L3 / med)
-    if not ratios:
-        return np.ones(len(F))
-    s = np.median(np.stack(ratios, axis=1), axis=1)
-    s = _gauss(_median_filter(s, 9), max(1.0, PERSPECTIVE_SMOOTH_S * fps))
-    return s / np.median(s)
+    L2 = np.stack([np.linalg.norm(F[:, c, :2] - F[:, p, :2], axis=1) for p, c in LIMB_SEGMENTS], axis=1)
+    persp = np.ones(len(F))
+    hold = max(1, int(round(PERSPECTIVE_HOLD_S * fps)))
+    for _ in range(2):
+        ref = np.percentile(L2 / persp[:, None], 95, axis=0)
+        r = L2 / np.maximum(ref, 1e-9)
+        s = np.percentile(r, 80, axis=1)
+        p = np.pad(s, hold, mode="edge")
+        s = np.array([p[k:k + 2 * hold + 1].max() for k in range(len(s))])
+        s = _gauss(s, max(1.0, PERSPECTIVE_SMOOTH_S * fps), trend=True)
+        persp = s / np.median(s)
+    return persp
+
+
+# Left/right segments that share one length
+MIRRORED_SEGMENTS = {(23, 25): (24, 26), (25, 27): (26, 28), (11, 13): (12, 14), (13, 15): (14, 16),
+                     (33, 23): (33, 24), (34, 11): (34, 12), (27, 29): (28, 30), (27, 31): (28, 32)}
+
+
+def _segment_lengths(F, D, weight, persp):
+    """Length of each segment at perspective scale 1; mirrored left/right segments share one."""
+    out = {}
+    for p, c in SEGMENTS:
+        dxy = np.linalg.norm(F[:, c, :2] - F[:, p, :2], axis=1)
+        both = (weight[:, p] > 0.5) & (weight[:, c] > 0.5)
+        L3 = np.sqrt(dxy ** 2 + (D[:, c] - D[:, p]) ** 2)
+        l2 = np.percentile(dxy / persp, 90)
+        out[(p, c)] = max(l2, np.median(L3[both] / persp[both]) if both.sum() > 10 else 0.0)
+    for a, b in MIRRORED_SEGMENTS.items():
+        if a in out and b in out:
+            out[a] = out[b] = 0.5 * (out[a] + out[b])
+    return out
 
 
 def _enforce_bone_lengths(F, D, weight, strength, fps=30.0):
-    """Correct depth so segment lengths stay constant (front x/y unchanged), allowing for perspective."""
+    """Shorten the depth step of segments that come out too long (front x/y unchanged)."""
     if strength <= 0:
         return D
     Dn = D.copy()
-    n = len(F)
-    persp = front_perspective_scale(F, D, fps)
+    persp = front_perspective_scale(F, fps)
+    lengths = _segment_lengths(F, D, weight, persp)
     for p, c in SEGMENTS:
         dxy = np.linalg.norm(F[:, c, :2] - F[:, p, :2], axis=1)
         rel = D[:, c] - D[:, p]
-        both = (weight[:, p] > 0.5) & (weight[:, c] > 0.5)
-        L3 = np.sqrt(dxy ** 2 + rel ** 2)
-        L = max(np.percentile(dxy / persp, 90), np.median(L3[both] / persp[both]) if both.sum() > 10 else 0.0)
-        Lt = L * persp
-        dz_len = np.sqrt(np.maximum(0.0, Lt * Lt - dxy ** 2))
-        sign = 1.0 if (rel[0] if n else 0) >= 0 else -1.0
-        for k in range(n):
-            if abs(rel[k]) >= 0.1 * Lt[k]:
-                sign = 1.0 if rel[k] >= 0 else -1.0
-            dz = (1 - strength) * rel[k] + strength * sign * dz_len[k]
-            Dn[k, c] = Dn[k, p] + dz
+        Lt = lengths[(p, c)] * persp
+        dz_max = np.sqrt(np.maximum(0.0, Lt * Lt - dxy ** 2))
+        dz = np.sign(rel) * np.minimum(np.abs(rel), dz_max)
+        Dn[:, c] = Dn[:, p] + (1 - strength) * rel + strength * dz
         for f in FOLLOWERS.get(c, []):
             Dn[:, f] = D[:, f] - D[:, c] + Dn[:, c]
     for c, (a, b) in CENTROIDS.items():
@@ -338,8 +497,57 @@ def _enforce_bone_lengths(F, D, weight, strength, fps=30.0):
     return Dn
 
 
+def estimate_view_angle(F, U, w, valid, fps):
+    """
+        Angle between the two views (degrees, 90 = side camera at a right angle). Two orthographic
+        views cannot tell the angle apart from depth on their own; the right angle is the one whose
+        depth keeps the bones at a constant length while the actor moves.
+        :param U: side x in front units (N, 40), w: side weight per joint.
+        :return: (angle, bone variation at that angle, bone variation at 90 degrees)
+    """
+    m = valid & (np.mean(w[:, 11:29] > 0.5, axis=1) > 0.7)
+    if m.sum() < 20:
+        return 90.0, float("nan"), float("nan")
+    Fm, Um = F[m], U[m]
+    Xr, Ur = Fm[:, :, 0] - Fm[:, [HIP_C], 0], Um - Um[:, [HIP_C]]
+    persp = front_perspective_scale(F, fps)[m]
+
+    def cv(phi):
+        p = np.radians(phi)
+        D = _gauss((Ur - np.cos(p) * Xr) / np.sin(p), 1.5)
+        return bone_length_cv(to_blender(Fm, D), persp=persp)
+
+    grid = np.arange(ANGLE_RANGE[0], ANGLE_RANGE[1] + 0.1, 2.0)
+    vals = np.array([cv(a) for a in grid])
+    k = int(np.argmin(vals))
+    best, best_cv = float(grid[k]), float(vals[k])
+    if 0 < k < len(grid) - 1:
+        y0, y1, y2 = vals[k - 1], vals[k], vals[k + 1]
+        den = y0 - 2 * y1 + y2
+        if den > 1e-12:
+            best = float(grid[k] + 2.0 * 0.5 * (y0 - y2) / den)
+            best_cv = cv(best)
+    cv90 = cv(90.0)
+    if best_cv > cv90 * (1.0 - ANGLE_MIN_GAIN):
+        return 90.0, cv90, cv90           # no clear evidence: keep the right angle
+    return best, best_cv, cv90
+
+
+def _fill_gaps(rel, w, fps):
+    """
+        Side depth (relative to the hips) for joints the side view lost for a moment: interpolated
+        from neighbouring frames where the joint was seen. :return: (filled, confidence 0..1)
+    """
+    sigma = max(1.0, GAP_FILL_S * fps)
+    num = _gauss(rel * w, sigma)
+    den = _gauss(w, sigma)
+    filled = num / np.maximum(den, 1e-6)
+    conf = np.clip(den / 0.5, 0.0, 1.0)
+    return filled, conf
+
+
 def combine_improved(front_list, side_list, front_times, side_times, front_vis=None, side_vis=None,
-                     smoothing=1.5, bone_strength=0.8, offset=None):
+                     smoothing=1.5, bone_strength=0.8, offset=None, sync="OFFSET", side_angle=None):
     """
         :param front_list/side_list: tracked frames (flat 40 * [x, y, z]).
         :param front_times/side_times: time of each tracked frame in its own video (seconds).
@@ -347,6 +555,9 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
         :param smoothing: Gaussian sigma in frames for depth (half of it for x/y). 0 = off.
         :param bone_strength: 0..1, how strongly depth is corrected to keep bone lengths.
         :param offset: force the side time offset (seconds) instead of finding it.
+        :param sync: 'OFFSET' one time offset (both videos filmed at the same time), 'WARP' time warp
+                     on top of the offset (two separate performances of the same move).
+        :param side_angle: angle between the views in degrees; None = estimate it.
         :return: (combined frames as flat lists, report dict)
     """
     F = _as_array(front_list)
@@ -355,9 +566,10 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     tS = np.asarray(side_times, dtype=np.float64)
     visF = np.asarray(front_vis, dtype=np.float64) if front_vis is not None else np.ones((len(F), N_PTS))
     visS_raw = np.asarray(side_vis, dtype=np.float64) if side_vis is not None else np.ones((len(S_raw), N_PTS))
+    fps = _fps(tF)
     report = {}
 
-    # 1. Sync
+    # 1. Sync: one offset, then optionally a time warp for drifting timing
     if offset is None:
         offset, sync_corr = find_time_offset(tF, F, tS, S_raw)
         report["sync_trusted"] = sync_corr >= MIN_SYNC_MATCH
@@ -367,36 +579,53 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
         sync_corr = float("nan")
         report["sync_trusted"] = True
     tq = tF + offset
+    report["sync_mode"] = "offset"
+    if sync == "WARP" and report["sync_trusted"] and len(tF) >= 20 and len(tS) >= 20:
+        tq, report["sync_mode"] = time_warp(tF, F, tS, S_raw, offset), "warp"
     valid = (tq >= tS[0]) & (tq <= tS[-1])
     S = _interp(tq, tS, S_raw)
     visS = _interp(tq, tS, visS_raw) * valid[:, None]
-    report.update(offset_s=offset, sync_corr=sync_corr, coverage=float(valid.mean()))
+    drift = tq - tF - offset
+    report.update(offset_s=offset, sync_corr=sync_corr, coverage=float(valid.mean()),
+                  warp_range=(float(drift.min()), float(drift.max())))
 
     # 2. Scale
-    fps = 1.0 / max(float(np.median(np.diff(tF))), 1e-6) if len(tF) > 1 else 30.0
     scale = _scale_per_frame(F, S, valid, fps)
     report["scale"] = float(np.median(scale[valid])) if valid.any() else 1.0
 
     # 3. Left/right labels in the side view
     S, visS, swaps = _fix_left_right(F, S, visS, scale, valid)
     report["lr_switches"] = swaps
+    report["height_err"] = height_agreement(F, S, scale, visS, valid)
 
-    # 4. Facing: side x -> depth with the sign that makes the body right-handed
-    depth_side = S[:, :, 0] * scale[:, None]
+    # 4. View angle, then side x -> depth with the sign that makes the body right-handed
+    U = S[:, :, 0] * scale[:, None]
+    w = _side_weight(visS)
+    if side_angle is None:
+        angle, _, _ = estimate_view_angle(F, U, w, valid, fps)
+    else:
+        angle = float(np.clip(side_angle, ANGLE_RANGE[0], ANGLE_RANGE[1]))
+    report["side_angle"] = angle
+    p = np.radians(angle)
+    depth_side = (U - np.cos(p) * F[:, :, 0]) / np.sin(p)
     sign = -1.0
     if facing_score(to_blender(F, sign * depth_side)) < 0:
         sign = 1.0
     depth_side = sign * depth_side
     report["depth_sign"] = sign
 
-    # 5. Fallback from the front view's own depth, calibrated against the side depth
-    w = _side_weight(visS)
+    # 5. Short side occlusions filled from neighbouring frames where the joint was seen,
+    #    the front view's own depth (calibrated against the side depth) only where neither helps
     root = depth_side[:, HIP_C].copy()
     if valid.any() and not valid.all():
         idx = np.arange(len(F))
         root = np.interp(idx, idx[valid], root[valid])
-    zF_rel = F[:, :, 2] - F[:, [HIP_C], 2]
     side_rel = depth_side - root[:, None]
+    if GAP_FILL_S > 0:
+        filled, conf = _fill_gaps(side_rel, w, fps)
+    else:
+        filled, conf = side_rel, np.zeros_like(w)
+    zF_rel = F[:, :, 2] - F[:, [HIP_C], 2]
     good = (w > 0.8) & (visF > 0.5)
     k = 4.0
     if good.sum() > 50:
@@ -406,9 +635,12 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
             k_fit = float(np.dot(x, y) / den)
             corr = float(np.corrcoef(x, y)[0, 1]) if x.std() > 1e-9 and y.std() > 1e-9 else 0.0
             k = float(np.clip(k_fit, -8, 8)) if abs(corr) > 0.2 else 4.0 * (1 if k_fit >= 0 else -1)
-    fallback = root[:, None] + k * zF_rel
-    D = w * depth_side + (1 - w) * fallback
-    report["fallback_share"] = float(1 - w[:, :33].mean())
+    fallback = k * zF_rel
+    rest = conf * filled + (1 - conf) * fallback
+    D = root[:, None] + w * side_rel + (1 - w) * rest
+    report["fallback_share"] = float(np.mean((1 - w[:, :33]) * (1 - conf[:, :33])))
+    report["filled_share"] = float(np.mean((1 - w[:, :33]) * conf[:, :33]))
+    w_eff = w + (1 - w) * conf
 
     # 6. Smoothing
     D = _gauss(D, smoothing)
@@ -417,10 +649,10 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     F_out[:, :, :2] = XY
 
     # 7. Constant bone lengths
-    persp = front_perspective_scale(F_out, D, fps)
+    persp = front_perspective_scale(F_out, fps)
     report["perspective_range"] = (float(persp.min()), float(persp.max()))
     report["bone_cv_before"] = bone_length_cv(to_blender(F_out, D), persp=persp)
-    D = _enforce_bone_lengths(F_out, D, w, bone_strength, fps)
+    D = _enforce_bone_lengths(F_out, D, w_eff, bone_strength, fps)
     report["bone_cv_after"] = bone_length_cv(to_blender(F_out, D), persp=persp)
     report["facing"] = facing_score(to_blender(F_out, D))
 
@@ -431,7 +663,12 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
 def format_report(r):
     sw = r.get("lr_switches", {})
     match = "manual" if r["sync_corr"] != r["sync_corr"] else f"match {r['sync_corr']:.2f}"
-    return (f"side offset {r['offset_s']:+.2f}s ({match}), side scale {r['scale']:.2f}, "
+    sync = f"side offset {r['offset_s']:+.2f}s ({match})"
+    if r.get("sync_mode") == "warp":
+        lo, hi = r["warp_range"]
+        sync += f", time warp {lo:+.2f}..{hi:+.2f}s"
+    return (f"{sync}, heights agree to {r['height_err']:.1f}% of body height, "
+            f"view angle {r['side_angle']:.0f} deg, side scale {r['scale']:.2f}, "
             f"L/R fixes arms {sw.get('arms', 0)} legs {sw.get('legs', 0)}, "
-            f"depth from front view {r['fallback_share'] * 100:.0f}%, "
+            f"depth filled from neighbours {r.get('filled_share', 0) * 100:.0f}% / from front view {r['fallback_share'] * 100:.0f}%, "
             f"bone length variation {r['bone_cv_before']:.0f}% -> {r['bone_cv_after']:.0f}%")

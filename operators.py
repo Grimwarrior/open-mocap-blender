@@ -8,11 +8,52 @@
 """
 
 import bpy
+import json
 import math
+import os
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 from . import utils
 from . import combine
 from mathutils import Vector
 from . import globalVariables as gvar
+
+# -------------------------------------------------------------
+# FRAME TIMING
+# -------------------------------------------------------------
+def set_scene_fps(scene, fps):
+    """Scene frame rate = video frame rate, also for rates like 29.97 (fps 30 / base 1.001)."""
+    fps = float(fps) if fps and fps > 0 else 30.0
+    whole = max(1, int(round(fps)))
+    scene.render.fps = whole
+    scene.render.fps_base = whole / fps if abs(whole - fps) > 1e-3 else 1.0
+
+
+def frames_from_times(times, count, fps):
+    """
+        Scene frame of each of `count` tracked frames: its time in the video (video frame 0 = scene
+        frame 1). Without usable times (data from an older version): 1, 2, 3, ...
+    """
+    if count and len(times) >= count and fps and fps > 0:
+        frames = [int(round(t * fps)) + 1 for t in times[:count]]
+        if all(b > a for a, b in zip(frames, frames[1:])):
+            return frames
+    return list(range(1, count + 1))
+
+
+def match_by_time(times, other_times, fps):
+    """
+        For every entry of `times` the index of the entry of `other_times` closest in time, or None if
+        that one is more than three quarters of a frame away (the other view lost the hand there).
+    """
+    out = []
+    j = 0
+    limit = 0.75 / fps if fps and fps > 0 else 0.025
+    for t in times:
+        while j + 1 < len(other_times) and abs(other_times[j + 1] - t) <= abs(other_times[j] - t):
+            j += 1
+        out.append(j if other_times and abs(other_times[j] - t) <= limit else None)
+    return out
+
 
 # -------------------------------------------------------------
 # MAIN OPERATORS
@@ -147,9 +188,13 @@ class CombineMotionData(bpy.types.Operator):
             combined, rep = combine.combine_improved(
                 front, side, gvar.position_times, gvar.zlist_times, gvar.position_vis, gvar.zlist_vis,
                 smoothing=scene.combine_smoothing, bone_strength=scene.combine_bone_strength,
-                offset=None if scene.combine_auto_offset else scene.combine_offset)
+                offset=None if scene.combine_auto_offset else scene.combine_offset,
+                sync=scene.combine_sync,
+                side_angle=None if scene.combine_auto_angle else scene.combine_side_angle)
             if scene.combine_auto_offset:
                 scene.combine_offset = rep["offset_s"]   # start manual tweaking from what was found
+            if scene.combine_auto_angle:
+                scene.combine_side_angle = rep["side_angle"]
             msg = "Combined: " + combine.format_report(rep)
             level = {'WARNING'} if rep["sync_corr"] < 0.4 else {'INFO'}
             if rep["sync_corr"] < 0.4:
@@ -178,13 +223,28 @@ class CombineMotionData(bpy.types.Operator):
             return self.combine_pose(context)
 
         elif self.mode == "hand":
-            # Right hand
-            if gvar.R_hand_positionList and gvar.R_hand_zlist:
-                gvar.R_hand_positionList = self.combine_lists(gvar.R_hand_positionList, gvar.R_hand_zlist, 21)
-
-            # Left hand
-            if gvar.L_hand_positionList and gvar.L_hand_zlist:
-                gvar.L_hand_positionList = self.combine_lists(gvar.L_hand_positionList, gvar.L_hand_zlist, 21)
+            for side in ("R", "L"):
+                front = getattr(gvar, f"{side}_hand_positionList")
+                depth = getattr(gvar, f"{side}_hand_zlist")
+                times = getattr(gvar, f"{side}_hand_times")
+                ztimes = getattr(gvar, f"{side}_hand_ztimes")
+                if not front or not depth:
+                    continue
+                if len(times) == len(front) and len(ztimes) == len(depth):
+                    # Match the two views by time: either one can lose the hand for some frames,
+                    # after which frame N of one list is no longer frame N of the other. A front
+                    # frame the side view has no match for keeps its own depth.
+                    combined = []
+                    for frame, j in zip(front, match_by_time(times, ztimes, gvar.hand_fps or gvar.fps)):
+                        frame = list(frame)
+                        if j is not None:
+                            for i in range(21):
+                                frame[3 * i + 2] = -depth[j][3 * i + 0]
+                        combined.append(frame)
+                else:
+                    combined = self.combine_lists(front, depth, 21)
+                    del times[len(combined):]
+                setattr(gvar, f"{side}_hand_positionList", combined)
 
         else:
             self.report({'WARNING'}, f"Unknown mode: {self.mode}")
@@ -259,14 +319,15 @@ class AnimatePose(bpy.types.Operator):
                 obj.rotation_euler.rotate_axis('Y', math.radians(180))
 
         # --- Keyframe insertion ---
-        num_frames = len(gvar.positionList)
+        # Each tracked frame is keyed at its own time in the video: a frame where nobody was found
+        # has no entry, and keying the entries one after another would play the rest too early.
+        fps = gvar.front_fps or gvar.fps          # gvar.fps is the last tracked video's, maybe the side one
+        set_scene_fps(context.scene, fps)
+        frame_numbers = frames_from_times(gvar.position_times, len(gvar.positionList), fps)
         context.scene.frame_start = 1
-        context.scene.frame_end = num_frames
-        context.scene.render.fps = int(gvar.fps)
+        context.scene.frame_end = frame_numbers[-1]
 
-        for frame_index, frame in enumerate(gvar.positionList, start=1):
-            context.scene.frame_set(frame_index)
-
+        for frame_index, frame in zip(frame_numbers, gvar.positionList):
             for i in range(40):
                 location = utils.MathUtility.cv2blender_coordinates([frame[0 + (i * 3)],frame[1 + (i * 3)],frame[2 + (i * 3)]])
                 obj = gvar.object_list[i]
@@ -396,17 +457,20 @@ class AnimateHand(bpy.types.Operator):
                 self.create_hand(bpy.context, "L")
 
             # --- Determine total frame range ---
+            # Each tracked frame is keyed at its own time in the video (a hand that was not found
+            # in a frame has no entry there)
             num_frames_R = len(gvar.R_hand_positionList)
             num_frames_L = len(gvar.L_hand_positionList)
-            total_frames = max(num_frames_R, num_frames_L, 1)
+            fps = gvar.hand_fps or gvar.fps
+            frames_R = frames_from_times(gvar.R_hand_times, num_frames_R, fps)
+            frames_L = frames_from_times(gvar.L_hand_times, num_frames_L, fps)
             context.scene.frame_start = 1
-            context.scene.frame_end = total_frames
-            context.scene.render.fps = int(gvar.fps)
+            context.scene.frame_end = max(frames_R[-1:] + frames_L[-1:] + [1])
+            set_scene_fps(context.scene, fps)
 
             # --- Animate Right Hand ---
             if gvar.R_hand_object_list and num_frames_R > 0:
-                for frame_index, frame in enumerate(gvar.R_hand_positionList, start=1):
-                    context.scene.frame_set(frame_index)
+                for frame_index, frame in zip(frames_R, gvar.R_hand_positionList):
                     for i in range(21):
                         loc = utils.MathUtility.cv2blender_coordinates([
                             frame[i*3], frame[i*3+1], frame[i*3+2]
@@ -417,8 +481,7 @@ class AnimateHand(bpy.types.Operator):
 
             # --- Animate Left Hand ---
             if gvar.L_hand_object_list and num_frames_L > 0:
-                for frame_index, frame in enumerate(gvar.L_hand_positionList, start=1):
-                    context.scene.frame_set(frame_index)
+                for frame_index, frame in zip(frames_L, gvar.L_hand_positionList):
                     for i in range(21):
                         loc = utils.MathUtility.cv2blender_coordinates([
                             frame[i*3], frame[i*3+1], frame[i*3+2]
@@ -478,6 +541,9 @@ class BakeMotion(bpy.types.Operator):
         description="Bake only selected bones in Pose Mode"
     )
     target_rig: bpy.props.StringProperty(name="Target Rig")
+    action_name: bpy.props.StringProperty(
+        name="Action Name", default="",
+        description="Bake into a new action with this name (fake user). Empty: the rig's current action")
 
     """
         :param frame_start: Starting frame for baking animation.
@@ -485,6 +551,7 @@ class BakeMotion(bpy.types.Operator):
         :param only_selected_bones: Bake only selected bones in Pose Mode.
                                     Otherwise bakes animation for all the bones in the armature selected.
         :param target_rig: Armature, whose animation is to be baked.
+        :param action_name: Name for a new action to bake into; empty keeps the rig's current action.
     """
 
     def execute(self, context):
@@ -494,12 +561,46 @@ class BakeMotion(bpy.types.Operator):
             self.report({'ERROR'}, "Please select a valid Armature object")
             return {'CANCELLED'}
 
-        # mode_set and nla.bake work on the active object, so make the rig active first
-        if context.mode != 'OBJECT' and context.active_object is not obj:
+        # nla.bake bakes every selected object (each armature in pose mode), so only the rig may be
+        # selected; the user's selection comes back afterwards
+        start_mode = context.mode
+        if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
+        was_selected = [o for o in context.view_layer.objects if o.select_get()]
+        was_active = context.view_layer.objects.active
+        for o in was_selected:
+            o.select_set(False)
+        # A hidden rig cannot be selected or posed, and the bake would silently do nothing
+        was_hidden, was_hidden_viewport = obj.hide_get(), obj.hide_viewport
+        obj.hide_viewport = False
+        obj.hide_set(False)
+        if not obj.visible_get():
+            obj.hide_viewport = was_hidden_viewport
+            obj.hide_set(was_hidden)
+            for o in was_selected:
+                o.select_set(True)
+            self.report({'ERROR'}, f"{obj.name} is in a hidden or excluded collection: show it to bake")
+            return {'CANCELLED'}
         context.view_layer.objects.active = obj
         obj.select_set(True)
         bpy.ops.object.mode_set(mode='POSE')
+        try:
+            return self._bake(context, obj)
+        finally:
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            obj.select_set(False)
+            for o in was_selected:
+                if o.name in context.view_layer.objects:
+                    o.select_set(True)
+            context.view_layer.objects.active = was_active if was_active and was_active.name in context.view_layer.objects else obj
+            obj.hide_viewport = was_hidden_viewport
+            obj.hide_set(was_hidden)
+            active = context.view_layer.objects.active
+            if start_mode == 'POSE' and active.type == 'ARMATURE' and active.visible_get():
+                bpy.ops.object.mode_set(mode='POSE')
+
+    def _bake(self, context, obj):
 
         # Determine bones to bake
         bones = (
@@ -527,6 +628,17 @@ class BakeMotion(bpy.types.Operator):
         for pb in bones:
             set_selected(pb, True)
 
+        # A named bake goes into a new action, so it never overwrites an earlier take. The rig's current
+        # action is taken off (kept with a fake user if nothing else uses it) and the bake makes the
+        # new action itself, which it then gets renamed. (An empty action set up beforehand has no slot
+        # in Blender 5, so its baked keys would not play.)
+        name = self.action_name.strip()
+        if name and obj.animation_data and obj.animation_data.action:
+            previous = obj.animation_data.action
+            if not previous.use_fake_user and previous.users <= 1:
+                previous.use_fake_user = True
+            obj.animation_data.action = None
+
         # Perform bake
         bpy.ops.nla.bake(
             frame_start=self.frame_start,
@@ -538,7 +650,11 @@ class BakeMotion(bpy.types.Operator):
             bake_types={'POSE'}
         )
 
-        self.report({'INFO'}, "Baking complete.")
+        baked = obj.animation_data.action if obj.animation_data else None
+        if name and baked is not None:
+            baked.name = name              # Blender adds .001 if the name is taken
+            baked.use_fake_user = True
+        self.report({'INFO'}, f"Baking complete: action '{baked.name}'." if baked else "Baking complete.")
         return {'FINISHED'}
 
 
@@ -577,7 +693,93 @@ class ClearMoCapCache(bpy.types.Operator):
             gvar.L_hand_zlist.clear()
             gvar.L_hand_object_list.clear()
             gvar.L_hand_bones_list.clear()
+            for lst in (gvar.R_hand_times, gvar.L_hand_times, gvar.R_hand_ztimes, gvar.L_hand_ztimes):
+                lst.clear()
             self.report({'INFO'}, "Hand Motion Capture data cleared.")
+        return {'FINISHED'}
+
+
+
+# Tracked data lives in memory only and is gone when Blender closes or the add-on reloads. These two
+# write it to a file and read it back, so a take can be combined and animated again without tracking.
+CAPTURE_FORMAT = "open_mocap_capture"
+CAPTURE_LISTS = ("positionList", "zlist", "position_times", "position_vis", "zlist_times", "zlist_vis",
+                 "R_hand_positionList", "L_hand_positionList", "R_hand_zlist", "L_hand_zlist",
+                 "R_hand_times", "L_hand_times", "R_hand_ztimes", "L_hand_ztimes")
+CAPTURE_VALUES = ("fps", "front_fps", "side_fps", "hand_fps", "front_video_path", "side_video_path",
+                  "hand_front_video_path", "hand_side_video_path")
+
+
+class SaveCapture(bpy.types.Operator, ExportHelper):
+    bl_idname = "object.open_mocap_save_capture"
+    bl_label = "Save Capture"
+    bl_description = ("Save the tracked pose and hand data (front and side views, before and after "
+                      "Combine Data) to a file, to load it again in another Blender session")
+
+    filename_ext = ".json"
+    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return any(getattr(gvar, name) for name in CAPTURE_LISTS)
+
+    def invoke(self, context, event):
+        video = gvar.front_video_path or gvar.hand_front_video_path
+        if video and not self.filepath:
+            self.filepath = os.path.splitext(video)[0] + "_capture.json"
+        return super().invoke(context, event)
+
+    def execute(self, context):
+        data = {"format": CAPTURE_FORMAT, "version": 1}
+        for name in CAPTURE_LISTS + CAPTURE_VALUES:
+            data[name] = getattr(gvar, name)
+        data["positionList_raw"] = gvar.positionList_raw
+        try:
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except OSError as e:
+            self.report({'ERROR'}, f"Could not save the capture: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Saved {len(gvar.positionList)} front and {len(gvar.zlist)} side pose frames "
+                              f"to {self.filepath}")
+        return {'FINISHED'}
+
+
+class LoadCapture(bpy.types.Operator, ImportHelper):
+    bl_idname = "object.open_mocap_load_capture"
+    bl_label = "Load Capture"
+    bl_description = "Load tracked data saved with Save Capture. Replaces the tracked data in memory"
+
+    filename_ext = ".json"
+    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+
+    def execute(self, context):
+        try:
+            with open(self.filepath, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            self.report({'ERROR'}, f"Could not read the capture: {e}")
+            return {'CANCELLED'}
+        if not isinstance(data, dict) or data.get("format") != CAPTURE_FORMAT:
+            self.report({'ERROR'}, "This is not an Open Mocap capture file")
+            return {'CANCELLED'}
+        # The lists are filled in place: other parts of the add-on hold on to them
+        for name in CAPTURE_LISTS:
+            value = data.get(name)
+            target = getattr(gvar, name)
+            target.clear()
+            if isinstance(value, list):
+                target.extend(value)
+        for name in CAPTURE_VALUES:
+            if name in data:
+                setattr(gvar, name, data[name])
+        raw = data.get("positionList_raw")
+        gvar.positionList_raw = raw if isinstance(raw, list) else None
+        if gvar.fps:
+            gvar.delay = 1.0 / gvar.fps
+        self.report({'INFO'}, f"Loaded {len(gvar.positionList)} front and {len(gvar.zlist)} side pose frames, "
+                              f"{len(gvar.R_hand_positionList)} right and {len(gvar.L_hand_positionList)} "
+                              "left hand frames")
         return {'FINISHED'}
 
 
@@ -666,9 +868,14 @@ class ToggleCopyRotationConstraints(bpy.types.Operator):
             self.report({'WARNING'}, "Please select a valid armature rig.")
             return {'CANCELLED'}
 
-        # Manual copy constraints, plus the "OM ..." constraints made by Retarget to Mixamo
+        # The "OM ..." constraints made by Retarget to Mixamo. Only on rigs without them, any copy
+        # rotation/location (the older manual setup); a control rig's own copy constraints must stay.
+        has_om = any(c.name.startswith("OM ") for bone in obj.pose.bones for c in bone.constraints)
+
         def is_mocap_constraint(c):
-            return c.type in {'COPY_ROTATION', 'COPY_LOCATION'} or c.name.startswith("OM ")
+            if has_om:
+                return c.name.startswith("OM ")
+            return c.type in {'COPY_ROTATION', 'COPY_LOCATION'}
 
         # Check if at least one constraint is currently active (unmuted)
         any_enabled = any(
@@ -712,4 +919,5 @@ class HideSkeleton(bpy.types.Operator):
 
 
 classes = [StartTracking, StopTracking, CombineMotionData, AnimatePose, AnimateHand, BakeMotion,
-           ClearMoCapCache, VideoSelect,  ClearVideoPath, ToggleCopyRotationConstraints, HideSkeleton]
+           ClearMoCapCache, SaveCapture, LoadCapture, VideoSelect,  ClearVideoPath,
+           ToggleCopyRotationConstraints, HideSkeleton]
