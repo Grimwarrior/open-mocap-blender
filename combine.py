@@ -42,7 +42,7 @@
                  in depth wherever L came out a little long.
 
     Data layout (as stored by utils.PoseTracking): per frame a flat list of 40 * [x, y, z],
-    x = (px - w/2) / 100, y = (py - h) / 100, z = mediapipe z * w / 400.
+    x = (px - w/2) / 100, y = (py - h) / 100, z = mediapipe world depth in pixels / 100.
     The combined output stores depth in the z slot, as before.
 """
 

@@ -55,3 +55,13 @@ L_hand_zlist = []
 L_hand_bones_list = []
 L_hand_root = None
 rt_hand_lmlist_L = []
+
+
+# WHOLE HANDS FROM THE BODY VIDEO (RTMW pose tracker only)
+# 21 points per hand in the pose's own coordinates, x/y only (flat list of 21 * [x, y, 0]), one entry
+# per front-video frame in which the hand was seen, with its time. Animate Hand uses these when no
+# hand video was tracked.
+R_body_hand_positionList = []
+L_body_hand_positionList = []
+R_body_hand_times = []
+L_body_hand_times = []

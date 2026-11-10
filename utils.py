@@ -93,7 +93,42 @@ def _draw_landmarks(img, points, connections, line_color, point_color):
         cv2.circle(img, p, 4, point_color, cv2.FILLED)
 
 
+# Pose depth. MediaPipe gives two depths: the image landmarks' z, and world landmarks in metres around
+# the hip centre. Both describe the same motion (correlation 0.99 on test footage); the world one
+# jitters about 12% less and is in true proportion to x/y once scaled to the image, where the image z
+# is about 4x too large (the add-on used to divide it by 400 instead of 100 for that reason).
+# Landmark z is now the world depth in image pixels, so it shares the x/y scale (POSE_DEPTH_SCALE).
+# A frame without world landmarks uses the image z brought to the same size (IMAGE_Z_TO_WORLD,
+# measured 0.26..0.29).
+POSE_DEPTH_SCALE = 100
+IMAGE_Z_TO_WORLD = 0.27
+
+
+def _world_depth(image_points, world_landmarks, visibility):
+    """
+        Depth of each landmark in image pixels from the world landmarks. The pixels-per-metre scale
+        is the one that fits the world x/y onto this frame's image x/y (both about the hip centre).
+        :return: list of 33 depths relative to the hip centre, or None.
+    """
+    P = np.asarray(image_points, dtype=np.float64)[:, :2]
+    W = np.array([[lm.x, lm.y, lm.z] for lm in world_landmarks], dtype=np.float64)
+    if len(P) != len(W) or len(P) < 25:
+        return None
+    w = np.asarray(visibility, dtype=np.float64) + 1e-3
+    P = P - (P[23] + P[24]) / 2
+    Wc = W - (W[23] + W[24]) / 2
+    den = float(np.sum(w[:, None] * Wc[:, :2] ** 2))
+    if den < 1e-9:
+        return None
+    scale = float(np.sum(w[:, None] * P * Wc[:, :2])) / den
+    if not np.isfinite(scale) or scale <= 0:
+        return None
+    return (Wc[:, 2] * scale).tolist()
+
+
 class PoseDetector:
+    hands = {}          # only the RTMW tracker finds whole hands (see RTMWDetector)
+
     def __init__(self, fps=None, detection_con=0.5, track_con=0.5):
         options = mp_vision.PoseLandmarkerOptions(
             base_options=mp_base_options(model_asset_path=PackageInstaller.model_path("pose")),
@@ -112,17 +147,20 @@ class PoseDetector:
             :return: (img, landmarks). landmarks is a list of 33 [x, y, z] pixel
                      coordinates (floats), or an empty list if no person was found.
                      self.visibility then holds the 33 visibility scores (0..1).
-                     z is the image landmarks' own depth. (MediaPipe's world landmarks were tried
-                     instead: scaled to the image they are the same depth, correlation 0.99, at
-                     about a quarter of the size, which normalize_coordinates' scale already does.)
+                     z is the depth from the world landmarks, in pixels (see POSE_DEPTH_SCALE).
         """
         result = self.landmarker.detect_for_video(_to_mp_image(img), self.clock.next())
         if not result.pose_landmarks:
             self.visibility = []
             return img, []
         h, w = img.shape[:2]
-        landmarks = [[lm.x * w, lm.y * h, lm.z * w] for lm in result.pose_landmarks[0]]
+        landmarks = [[lm.x * w, lm.y * h, lm.z * w * IMAGE_Z_TO_WORLD] for lm in result.pose_landmarks[0]]
         self.visibility = [lm.visibility if lm.visibility is not None else 1.0 for lm in result.pose_landmarks[0]]
+        world = getattr(result, "pose_world_landmarks", None)
+        depth = _world_depth(landmarks, world[0], self.visibility) if world else None
+        if depth is not None:
+            for p, z in zip(landmarks, depth):
+                p[2] = z
         if draw:
             _draw_landmarks(img, landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
                             (255, 255, 255), (255, 0, 255))
@@ -145,6 +183,7 @@ _WB_TO_MP = [0, 1, 1, 1, 2, 2, 2, 3, 4, 23 + 54, 23 + 48,        # nose, eyes, e
 # RTMW scores are not 0..1. Calibrated against MediaPipe visibility on test footage:
 # ~2.4 -> <0.3, ~3.8 -> 0.5, ~4.9 -> 0.8, ~5.8 -> ~1.
 _RTMW_SCORE_LOW, _RTMW_SCORE_RANGE = 2.0, 3.5
+BODY_HAND_MIN_VIS = 0.3     # mean visibility of a hand's 21 points below which the hand is not recorded
 
 
 class RTMWDetector:
@@ -164,6 +203,7 @@ class RTMWDetector:
         self.depth = PoseDetector(fps)
         self.previous = None            # hip centre of the tracked person, to stay on the same one
         self.visibility = []
+        self.hands = {}                 # {"Left"/"Right": (21 [x, y] pixel points, 21 scores 0..1)}
 
     def _pick_person(self, keypoints, scores):
         body = keypoints[:, :23]
@@ -178,6 +218,7 @@ class RTMWDetector:
         _img, mp_landmarks = self.depth.find_pose(img, draw=False)
         mp_visibility = self.depth.visibility
         keypoints, scores = self.model(img)
+        self.hands = {}
         if len(keypoints) == 0:
             # RTMW found nobody: fall back to MediaPipe for this frame
             self.visibility = mp_visibility
@@ -191,9 +232,18 @@ class RTMWDetector:
         landmarks = [[float(x), float(y), (mp_landmarks[i][2] if mp_landmarks else 0.0)]
                      for i, (x, y) in enumerate(pts)]
         self.visibility = np.clip((sc - _RTMW_SCORE_LOW) / _RTMW_SCORE_RANGE, 0.0, 1.0).tolist()
+        # Whole hands: 21 points each, in MediaPipe's hand order (wrist, thumb, index ... pinky).
+        # RTMW has no depth, so these are x/y only.
+        for name, first in (("Left", _WB_LHAND), ("Right", _WB_RHAND)):
+            conf = np.clip((scores[k][first:first + 21] - _RTMW_SCORE_LOW) / _RTMW_SCORE_RANGE, 0.0, 1.0)
+            self.hands[name] = (keypoints[k][first:first + 21].astype(float).tolist(), conf.tolist())
         if draw:
             _draw_landmarks(img, landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
                             (255, 255, 255), (0, 200, 0))
+            for name, (points, conf) in self.hands.items():
+                if float(np.mean(conf)) >= BODY_HAND_MIN_VIS:
+                    _draw_landmarks(img, points, mp_vision.HandLandmarksConnections.HAND_CONNECTIONS,
+                                    (200, 200, 200), (0, 200, 255))
         return img, landmarks
 
     def close(self):
@@ -468,7 +518,9 @@ class PoseTracking:
             for lst in (gvar.zlist, gvar.zlist_times, gvar.zlist_vis):
                 lst.clear()
         else:
-            for lst in (gvar.positionList, gvar.position_times, gvar.position_vis):
+            for lst in (gvar.positionList, gvar.position_times, gvar.position_vis,
+                        gvar.R_body_hand_positionList, gvar.L_body_hand_positionList,
+                        gvar.R_body_hand_times, gvar.L_body_hand_times):
                 lst.clear()
             gvar.positionList_raw = None
 
@@ -558,7 +610,7 @@ class PoseTracking:
         extra_points = []
         for a, b in point_pairs:
             centroid = MathUtility.centroid([landmarksList[a], landmarksList[b]])
-            normalized = MathUtility.normalize_coordinates(centroid, height, width, 400)
+            normalized = MathUtility.normalize_coordinates(centroid, height, width, POSE_DEPTH_SCALE)
             extra_points.append(normalized)
             vis.append(min(vis[a], vis[b]))
 
@@ -566,7 +618,7 @@ class PoseTracking:
         if self.mode in ["front_pose", "rt_pose"]:
             listOf32Landmarks = []
             for landmark in landmarksList:
-                normalized = MathUtility.normalize_coordinates(landmark, height, width, 400)
+                normalized = MathUtility.normalize_coordinates(landmark, height, width, POSE_DEPTH_SCALE)
                 listOf32Landmarks.extend(normalized)
 
             for point in extra_points:
@@ -576,10 +628,22 @@ class PoseTracking:
             gvar.position_times.append(frame_time)
             gvar.position_vis.append(vis)
 
+            # Whole hands from the body video (RTMW tracker only), in the pose's own coordinates.
+            # They have no depth: Animate Hand puts each one at the depth of the pose wrist.
+            for name, (points, conf) in self.detector.hands.items():
+                if sum(conf) / len(conf) < BODY_HAND_MIN_VIS:
+                    continue                    # hand hidden in this frame: no entry
+                flat = []
+                for x, y in points:
+                    flat.extend(MathUtility.normalize_coordinates([x, y, 0.0], height, width, POSE_DEPTH_SCALE))
+                side = "R" if name == "Right" else "L"
+                getattr(gvar, f"{side}_body_hand_positionList").append(flat)
+                getattr(gvar, f"{side}_body_hand_times").append(frame_time)
+
         elif self.mode == "side_pose":
             zframe = []
             for landmark in landmarksList:
-                normalized = MathUtility.normalize_coordinates(landmark, height, width, 400)
+                normalized = MathUtility.normalize_coordinates(landmark, height, width, POSE_DEPTH_SCALE)
                 zframe.extend(normalized)
 
             for point in extra_points:

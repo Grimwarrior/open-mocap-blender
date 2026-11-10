@@ -28,6 +28,12 @@ def set_scene_fps(scene, fps):
     scene.render.fps_base = whole / fps if abs(whole - fps) > 1e-3 else 1.0
 
 
+def start_playback(context):
+    """Play the animation (not in background mode, where there is no screen to play it on)."""
+    if not bpy.app.background and context.screen is not None:
+        bpy.ops.screen.animation_play()
+
+
 def frames_from_times(times, count, fps):
     """
         Scene frame of each of `count` tracked frames: its time in the video (video frame 0 = scene
@@ -52,6 +58,43 @@ def match_by_time(times, other_times, fps):
         while j + 1 < len(other_times) and abs(other_times[j + 1] - t) <= abs(other_times[j] - t):
             j += 1
         out.append(j if other_times and abs(other_times[j] - t) <= limit else None)
+    return out
+
+
+def hand_capture():
+    """
+        The hand data to animate: from a hand video if there is any, else the whole hands the RTMW
+        pose tracker found in the body video.
+        :return: (from_body, fps, {"R"/"L": (frames, times)}) or None.
+    """
+    if gvar.R_hand_positionList or gvar.L_hand_positionList:
+        return False, gvar.hand_fps or gvar.fps, {
+            "R": (gvar.R_hand_positionList, gvar.R_hand_times),
+            "L": (gvar.L_hand_positionList, gvar.L_hand_times)}
+    if gvar.R_body_hand_positionList or gvar.L_body_hand_positionList:
+        return True, gvar.front_fps or gvar.fps, {
+            "R": (gvar.R_body_hand_positionList, gvar.R_body_hand_times),
+            "L": (gvar.L_body_hand_positionList, gvar.L_body_hand_times)}
+    return None
+
+
+POSE_WRIST = {"R": 16, "L": 15}
+
+
+def body_hand_frames(side, frames, times, fps):
+    """
+        Body-video hands have no depth of their own: every point of a hand gets the depth of the
+        pose wrist at that moment (after Combine Data: the combined depth), so the hand sits on the
+        pose skeleton's arm. :return: frames with the depth filled in.
+    """
+    z_index = 3 * POSE_WRIST[side] + 2
+    out, depth = [], 0.0
+    for frame, j in zip(frames, match_by_time(times, gvar.position_times[:len(gvar.positionList)], fps)):
+        if j is not None:
+            depth = gvar.positionList[j][z_index]
+        frame = list(frame)
+        frame[2::3] = [depth] * 21
+        out.append(frame)
     return out
 
 
@@ -335,7 +378,7 @@ class AnimatePose(bpy.types.Operator):
                 obj.location = local_pos
                 obj.keyframe_insert(data_path="location", frame=frame_index)
 
-        bpy.ops.screen.animation_play()
+        start_playback(context)
         return {'FINISHED'}
 
 
@@ -440,13 +483,16 @@ class AnimateHand(bpy.types.Operator):
                 self.create_hand(bpy.context, "L")
 
             bpy.app.timers.register(self.animate_realtime, first_interval=0.0)
-            bpy.ops.screen.animation_play()
+            start_playback(context)
 
         else:
-            if not gvar.R_hand_positionList and not gvar.L_hand_positionList:
-                self.report({'ERROR'}, "No tracked hand data. Run Start Hand Tracking first "
-                                       "(the capture cache is emptied when Blender restarts or the add-on reloads)")
+            source = hand_capture()
+            if source is None:
+                self.report({'ERROR'}, "No tracked hand data. Run Start Hand Tracking first, or track a body "
+                                       "video with the RTMW pose tracker (the capture cache is emptied when "
+                                       "Blender restarts or the add-on reloads)")
                 return {'CANCELLED'}
+            from_body, fps, hands = source
 
             # --- Create Right Hand ---
             if not self.hand_exists("R"):
@@ -456,45 +502,36 @@ class AnimateHand(bpy.types.Operator):
             if not self.hand_exists("L"):
                 self.create_hand(bpy.context, "L")
 
-            # --- Determine total frame range ---
             # Each tracked frame is keyed at its own time in the video (a hand that was not found
             # in a frame has no entry there)
-            num_frames_R = len(gvar.R_hand_positionList)
-            num_frames_L = len(gvar.L_hand_positionList)
-            fps = gvar.hand_fps or gvar.fps
-            frames_R = frames_from_times(gvar.R_hand_times, num_frames_R, fps)
-            frames_L = frames_from_times(gvar.L_hand_times, num_frames_L, fps)
+            last = 1
+            for side, (frames, times) in hands.items():
+                objects = getattr(gvar, f"{side}_hand_object_list")
+                root = getattr(gvar, f"{side}_hand_root")
+                if not objects or not frames:
+                    continue
+                if from_body:
+                    frames = body_hand_frames(side, frames, times, fps)
+                numbers = frames_from_times(times, len(frames), fps)
+                last = max(last, numbers[-1])
+                for frame_index, frame in zip(numbers, frames):
+                    for i in range(21):
+                        loc = utils.MathUtility.cv2blender_coordinates([
+                            frame[i*3], frame[i*3+1], frame[i*3+2]
+                        ])
+                        obj = objects[i]
+                        obj.location = Vector(loc) - root.location
+                        obj.keyframe_insert(data_path="location", frame=frame_index)
             context.scene.frame_start = 1
-            context.scene.frame_end = max(frames_R[-1:] + frames_L[-1:] + [1])
+            context.scene.frame_end = last
             set_scene_fps(context.scene, fps)
 
-            # --- Animate Right Hand ---
-            if gvar.R_hand_object_list and num_frames_R > 0:
-                for frame_index, frame in zip(frames_R, gvar.R_hand_positionList):
-                    for i in range(21):
-                        loc = utils.MathUtility.cv2blender_coordinates([
-                            frame[i*3], frame[i*3+1], frame[i*3+2]
-                        ])
-                        obj = gvar.R_hand_object_list[i]
-                        obj.location = Vector(loc) - gvar.R_hand_root.location
-                        obj.keyframe_insert(data_path="location", frame=frame_index)
-
-            # --- Animate Left Hand ---
-            if gvar.L_hand_object_list and num_frames_L > 0:
-                for frame_index, frame in zip(frames_L, gvar.L_hand_positionList):
-                    for i in range(21):
-                        loc = utils.MathUtility.cv2blender_coordinates([
-                            frame[i*3], frame[i*3+1], frame[i*3+2]
-                        ])
-                        obj = gvar.L_hand_object_list[i]
-                        obj.location = Vector(loc) - gvar.L_hand_root.location
-                        obj.keyframe_insert(data_path="location", frame=frame_index)
-
             # --- Playback ---
-            tracked_R = bool(gvar.R_hand_positionList)
-            tracked_L = bool(gvar.L_hand_positionList)
-            self.report({'INFO'}, f"Hand animation complete. (Right: {tracked_R}, Left: {tracked_L})")
-            bpy.ops.screen.animation_play()
+            tracked_R = bool(hands["R"][0])
+            tracked_L = bool(hands["L"][0])
+            where = " from the body video, at the pose wrists' depth" if from_body else ""
+            self.report({'INFO'}, f"Hand animation complete{where}. (Right: {tracked_R}, Left: {tracked_L})")
+            start_playback(context)
         return {'FINISHED'}
     
     def animate_realtime(self):
@@ -683,6 +720,9 @@ class ClearMoCapCache(bpy.types.Operator):
             gvar.positionList_raw = None
             gvar.object_list.clear()
             gvar.bones_list.clear()
+            for lst in (gvar.R_body_hand_positionList, gvar.L_body_hand_positionList,
+                        gvar.R_body_hand_times, gvar.L_body_hand_times):
+                lst.clear()
             self.report({'INFO'}, "Body Motion Capture data cleared.")
         else:
             gvar.R_hand_positionList.clear()
@@ -705,7 +745,8 @@ class ClearMoCapCache(bpy.types.Operator):
 CAPTURE_FORMAT = "open_mocap_capture"
 CAPTURE_LISTS = ("positionList", "zlist", "position_times", "position_vis", "zlist_times", "zlist_vis",
                  "R_hand_positionList", "L_hand_positionList", "R_hand_zlist", "L_hand_zlist",
-                 "R_hand_times", "L_hand_times", "R_hand_ztimes", "L_hand_ztimes")
+                 "R_hand_times", "L_hand_times", "R_hand_ztimes", "L_hand_ztimes",
+                 "R_body_hand_positionList", "L_body_hand_positionList", "R_body_hand_times", "L_body_hand_times")
 CAPTURE_VALUES = ("fps", "front_fps", "side_fps", "hand_fps", "front_video_path", "side_video_path",
                   "hand_front_video_path", "hand_side_video_path")
 
