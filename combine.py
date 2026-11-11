@@ -81,7 +81,12 @@ SCALE_SMOOTH_S = 1.0      # per-frame side scale smoothed over this many seconds
 PERSPECTIVE_SMOOTH_S = 1.0  # smoothing of the front view's perspective scale used for bone lengths
 PERSPECTIVE_HOLD_S = 0.5  # ... its upper envelope of limb lengths is held over this time
 LR_SWITCH_PENALTY = 0.2   # extra cost for changing the left/right labelling, per joint
+LR_SWITCH_PENALTY_QUIET = 0.1  # ... for groups without height evidence (see LR_HEIGHT_GROUPS)
 LR_FIX_GROUPS = ("arms", "legs")  # label groups the left/right fix may swap (not the head)
+LR_HEIGHT_GROUPS = ("arms",)  # groups whose heights are compared between the views. Not the legs: a
+                          # camera sees the foot nearer to it lower in the picture, so two cameras
+                          # disagree about which foot is lower in just the way a label swap would.
+                          # Legs are only un-swapped where both jump to each other's place at once.
 LR_SWAP_BIAS = 0.005      # extra cost of a swapped frame per joint, in body heights
 MIN_SYNC_GAIN = 0.075     # a time shift must raise the sync match by this much over no shift
 MIN_SYNC_MATCH = 0.3      # below this, reject automatic fusion; manual offset remains available
@@ -96,6 +101,9 @@ SMOOTH_PEAKS = True       # final smoothing keeps peaks (False: plain Gaussian, 
 FUSE_HEIGHTS = True       # heights of joints hidden in the front view come from the side view
 FUSE_MAX_HEIGHT_ERR = 2.5  # ... only if the views' heights agree this well (% of body height; two
                           # cameras on one performance: about 1, separate takes: 5 and more)
+FUSE_SYNCED_HEIGHT_ERR = 4.0  # ... or this well together with a timing match of FUSE_SYNCED_MATCH: real
+FUSE_SYNCED_MATCH = 0.9   # cameras stand at different heights and distances, which alone costs about 3%
+                          # (separate takes measured: heights 4.5 to 5.6%, timing match 0.5 to 0.7)
 FUSE_FRONT_VIS = 0.5      # ... front visibility below which that starts (and side visibility above which)
 FUSE_VIS_RANGE = 0.3      # ... and the range over which it blends in
 GAP_FILL_S = 0.1          # occluded joints: side depth borrowed from frames within about this time
@@ -104,6 +112,8 @@ SAME_PLANE_SLOPE = 0.85   # side x follows front x this closely (1 = the same or
 MULTI_MIN_FIT = 0.5       # more views: share of a view's sideways motion its fitted direction must explain
 MULTI_SCALE_RANGE = (0.6, 1.6)  # ... and how far its size may be off the front view's
 MULTI_DEPTH_MIN = 0.5     # ... |sin(angle to the front view)| from which a view measures depth (30 degrees)
+MULTI_SAME_FIT = 0.85     # ... a view fitting its direction this well, timed like the front view and with
+MULTI_SAME_HEIGHT_ERR = 5.0  # heights within this, shows the same performance
 MULTI_ROUNDS = 2          # ... directions are fitted to the depth, the depth to the directions, this often
 MAX_INTERP_GAP_S = 0.12   # longer missing intervals must not look like measured side motion
 
@@ -460,6 +470,9 @@ def _fix_left_right(F, S, visS, scale, valid):
             src = assign[s]
             emit[:, s] = np.sum(np.abs(yS[:, src] - yF[:, joints]) * visS[:, src], axis=1)
         emit[~valid] = 0.0
+        if name not in LR_HEIGHT_GROUPS:
+            emit[:] = 0.0                                   # heights say nothing here: continuity only
+        penalty = LR_SWITCH_PENALTY if name in LR_HEIGHT_GROUPS else LR_SWITCH_PENALTY_QUIET
         emit[:, 1] += LR_SWAP_BIAS * len(joints) * body     # a swap must be clearly better
         cost = emit[0].copy()
         back = np.zeros((n, 2), dtype=int)
@@ -468,7 +481,7 @@ def _fix_left_right(F, S, visS, scale, valid):
             for s in (0, 1):
                 trans = [(np.sum(np.linalg.norm(XS[k, assign[s]] - XS[k - 1, assign[p]], axis=1))
                           if valid[k] and valid[k - 1] else 0.0)
-                         + (LR_SWITCH_PENALTY * len(joints) * scale[k] if s != p else 0.0) for p in (0, 1)]
+                         + (penalty * len(joints) * scale[k] if s != p else 0.0) for p in (0, 1)]
                 options = cost + np.array(trans)
                 back[k, s] = int(np.argmin(options))
                 new[s] = options[back[k, s]] + emit[k, s]
@@ -608,6 +621,13 @@ def view_slope(F, U, w, valid):
     return float(np.sum(ww * x * u) / den) if den > 1e-9 else 0.0
 
 
+def same_performance(height_err, sync_match):
+    """Do two views show one performance (filmed by two cameras), going by how well they agree?"""
+    if height_err < FUSE_MAX_HEIGHT_ERR:
+        return True
+    return sync_match == sync_match and sync_match >= FUSE_SYNCED_MATCH and height_err < FUSE_SYNCED_HEIGHT_ERR
+
+
 def _fill_gaps(rel, w, fps, times=None):
     """
         Side depth (relative to the hips) for joints the side view lost for a moment: interpolated
@@ -706,7 +726,7 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     #     shows in how well the two views' heights agree (FUSE_MAX_HEIGHT_ERR): in separate takes
     #     the heights differ by more than the front view's guess is off.
     report["heights_from_side"] = 0.0
-    if FUSE_HEIGHTS and sync != "WARP" and report["height_err"] < FUSE_MAX_HEIGHT_ERR:
+    if FUSE_HEIGHTS and sync != "WARP" and same_performance(report["height_err"], sync_corr):
         a = (np.clip((FUSE_FRONT_VIS - visF[:, :33]) / FUSE_VIS_RANGE, 0.0, 1.0)
              * np.clip((visS[:, :33] - FUSE_FRONT_VIS) / FUSE_VIS_RANGE, 0.0, 1.0))
         y_side = F[:, [HIP_C], 1] + (S[:, :33, 1] - S[:, [HIP_C], 1]) * scale[:, None]
@@ -907,6 +927,9 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
         notes[i]["reason"] = report_i.get("reason", "")
     if first is None or len(views) < 2:
         if report is not None:
+            if first is not None:
+                notes[first].update(use="depth", angle=float(report.get("side_angle", 90.0)),
+                                    offset_s=float(report.get("offset_s", 0.0)))
             report["views"] = notes
         return frames, report
     base = dict(report)
@@ -969,7 +992,12 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
                 den += weight
                 uses.append("depth")
             # one performance filmed by several cameras: this view also places what the front view hides
-            if sync != "WARP" and view["height_err"] < FUSE_MAX_HEIGHT_ERR:
+            # (A camera on the far side sees every perspective effect the other way round, so its
+            # heights agree a little less; its motion fitting one direction this well shows the same.)
+            same = same_performance(view["height_err"], view["corr"]) or (
+                view["corr"] == view["corr"] and view["corr"] >= FUSE_SYNCED_MATCH
+                and fit >= MULTI_SAME_FIT and view["height_err"] < MULTI_SAME_HEIGHT_ERR)
+            if sync != "WARP" and same:
                 a = (np.clip((FUSE_FRONT_VIS - visF[:, :33]) / FUSE_VIS_RANGE, 0.0, 1.0)
                      * np.clip((view["vis"][:, :33] - FUSE_FRONT_VIS) / FUSE_VIS_RANGE, 0.0, 1.0))
                 y_view = F[:, [HIP_C], 1] + (view["S"][:, :33, 1] - view["S"][:, [HIP_C], 1]) * view["scale"][:, None]
@@ -980,7 +1008,10 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
                 if float(a.mean()) > 0:
                     uses.append("hidden joints")
             note["use"] = " and ".join(uses) if uses else "left out"
-            if not uses:
+            if not uses and sync != "WARP" and same:
+                note["reason"] = ("it looks along the front view's own line, and the front view hides no "
+                                  "joint that this view sees")
+            elif not uses:
                 note["reason"] = ("it looks along the front view's own line and shows another performance, "
                                   "so it adds neither depth nor position")
         if not np.any(den > 0):
