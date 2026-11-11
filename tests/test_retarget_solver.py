@@ -62,6 +62,45 @@ class BendDirection(unittest.TestCase):
         self.assertGreater(float(np.min(way @ np.array([0.0, -1.0, 0.0]))), 0.99)
 
 
+def heading(v):
+    return np.degrees(np.arctan2(v[:, 1], v[:, 0]))
+
+
+class FootYaw(unittest.TestCase):
+    n = 40
+
+    def foot(self, degrees, length=0.2):
+        a = np.radians(degrees)
+        heel = np.zeros((self.n, 3))
+        return heel, heel + np.array([length * np.cos(a), length * np.sin(a), -0.05])
+
+    def knee(self, degrees):
+        a = np.radians(degrees)
+        return np.tile([np.cos(a), np.sin(a), 0.0], (self.n, 1))
+
+    def test_foot_turned_far_from_the_knee_is_brought_back_to_the_limit(self):
+        heel, toe = self.foot(-134.0)
+        out = R.limited_toe(heel, toe, self.knee(-108.0), 10.0, 30.0)
+        self.assertAlmostEqual(float(heading(out - heel)[20]), -118.0, places=3)
+
+    def test_foot_inside_the_limit_is_untouched(self):
+        heel, toe = self.foot(-100.0)
+        out = R.limited_toe(heel, toe, self.knee(-108.0), 10.0, 30.0)
+        np.testing.assert_allclose(out, toe, atol=1e-9)
+
+    def test_turning_keeps_the_foot_length_and_height(self):
+        heel, toe = self.foot(-160.0)
+        out = R.limited_toe(heel, toe, self.knee(-108.0), 10.0, 30.0)
+        self.assertAlmostEqual(float(np.linalg.norm(out[5] - heel[5])), float(np.linalg.norm(toe[5] - heel[5])), places=9)
+        self.assertAlmostEqual(float(out[5, 2]), -0.05, places=9)
+
+    def test_headings_across_the_plus_minus_180_seam(self):
+        heel, toe = self.foot(-170.0)                                           # 10 degrees past +180 ...
+        out = R.limited_toe(heel, toe, self.knee(174.0), 5.0, 30.0)             # ... of a knee at +174
+        diff = (heading(out - heel)[20] - 174.0 + 180) % 360 - 180
+        self.assertAlmostEqual(float(diff), 5.0, places=3)
+
+
 class FootStates(unittest.TestCase):
     def setUp(self):
         self.fps = 30.0

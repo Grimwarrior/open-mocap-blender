@@ -1118,6 +1118,59 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
     return frames, report
 
 
+# -------------------------------------------------------------
+# PERSPECTIVE
+# -------------------------------------------------------------
+# Everything above treats the picture as orthographic: a point's x/y in the video is taken as its x/y in
+# the body, wherever it is in depth. A real camera is a pinhole: a point a distance d nearer than the hips
+# is magnified by Z / (Z - d), which pushes it away from the picture's centre (and from the horizon line
+# in height). With the camera at about hip height the nearer foot lands lower in the picture than the
+# farther one, though both stand on the floor, and a hand reaching to the camera looks wider than it is.
+# Once the depth is known this can be undone. In units where x/y are pixels / 100 and the depths are
+# in the same units, a point with depth d (relative to the hips, positive = away from the camera) lies at
+#     x = u * (1 + d / f),   y = horizon + (v - horizon) * (1 + d / f)
+# with f the focal length in those units. Only f is needed, not the actor's distance: depths are measured
+# in picture units at the hips' own distance, which is what d / Z is made of.
+PERSPECTIVE_FOV = 60.0        # default horizontal field of view of the front camera (degrees)
+PERSPECTIVE_FACTOR_RANGE = (0.6, 1.6)  # the correction never moves a point by more than this
+
+
+def focal_from_fov(width_px, fov_deg):
+    """Focal length in the tracker's units (pixels / 100) of a camera `width_px` wide seeing `fov_deg` across."""
+    return (width_px / 2.0) / np.tan(np.radians(np.clip(fov_deg, 5.0, 170.0)) / 2.0) / 100.0
+
+
+def _unproject_xy(XY, D, focal, horizon):
+    """x/y (N, 40, 2) with the perspective of depths D (N, 40) taken out; centroids stay means."""
+    factor = np.clip(1.0 + (D - D[:, [HIP_C]]) / focal, *PERSPECTIVE_FACTOR_RANGE)
+    out = XY.copy()
+    out[:, :, 0] = XY[:, :, 0] * factor
+    out[:, :, 1] = horizon + (XY[:, :, 1] - horizon) * factor
+    for c, (a, b) in CENTROIDS.items():
+        out[:, c] = (out[:, a] + out[:, b]) / 2
+    return out
+
+
+def correct_perspective(frames, focal, horizon=0.0):
+    """
+        Undo the front camera's perspective on a combined take.
+        :param frames: combined frames (flat 40 * [x, y, depth]); depth positive = away from the camera
+                       (what Combine Data produces when the body comes out right-handed).
+        :param focal: front camera's focal length in tracker units (see focal_from_fov); <= 0 = no change.
+        :param horizon: y of the camera's horizon (tracker units; y is -height/100 from the picture's
+                        bottom, so a level camera has -picture_height / 200).
+        :return: (frames, report dict with the factor range)
+    """
+    P = _as_array(frames)
+    if focal <= 0 or not len(P):
+        return [list(f) for f in frames], {"perspective_factor": (1.0, 1.0)}
+    P = P.copy()
+    P[:, :, :2] = _unproject_xy(P[:, :, :2], P[:, :, 2], focal, horizon)
+    rel = P[:, :, 2] - P[:, [HIP_C], 2]
+    factor = np.clip(1.0 + rel / focal, *PERSPECTIVE_FACTOR_RANGE)
+    return P.reshape(len(P), -1).tolist(), {"perspective_factor": (float(factor.min()), float(factor.max()))}
+
+
 def format_views(r):
     """One line per view of a combine_multi report."""
     lines = []

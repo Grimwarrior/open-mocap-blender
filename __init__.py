@@ -90,6 +90,15 @@ def register():
         name="Keep Bone Lengths", default=0.8, min=0.0, max=1.0, subtype='FACTOR',
         description="How strongly bones that come out too long in depth are shortened to their length "
                     "(bones are never stretched in depth to reach it)")
+    bpy.types.Scene.combine_perspective = bpy.props.BoolProperty(
+        name="Correct Perspective", default=True,
+        description="A camera shows what is nearer bigger and, below its height, lower (the nearer foot looks "
+                    "lower than the farther one). With the depth known this is undone, so both feet stand on "
+                    "the same floor and a limb reaching toward the camera keeps its width")
+    bpy.types.Scene.combine_fov = bpy.props.FloatProperty(
+        name="Field of View", default=60.0, min=10.0, max=120.0, precision=0,   # plain degrees: subtype ANGLE is radians
+        description="Horizontal field of view of the front camera in degrees (phone main camera about 65-70, "
+                    "a 35 mm lens on a full-frame camera about 54, zoomed in 30). Too wide overcorrects")
     bpy.types.Scene.retarget_source = bpy.props.PointerProperty(
         name="Mocap", type=bpy.types.Object,
         description="Mocap rig to retarget from: the empty whose children are the 40 landmark empties "
@@ -166,6 +175,8 @@ def unregister():
     del bpy.types.Scene.combine_method
     del bpy.types.Scene.combine_smoothing
     del bpy.types.Scene.combine_bone_strength
+    del bpy.types.Scene.combine_perspective
+    del bpy.types.Scene.combine_fov
     del bpy.types.Scene.combine_auto_offset
     del bpy.types.Scene.combine_offset
     del bpy.types.Scene.combine_sync

@@ -644,6 +644,7 @@ class PoseTracking:
                 gvar.side_fps = self.video_fps
             else:
                 gvar.front_fps = self.video_fps
+                gvar.front_height, gvar.front_width = img.shape[:2]
         self.frame_index += 1          # every call is one video frame, detected or not
 
         height, width = img.shape[:2]

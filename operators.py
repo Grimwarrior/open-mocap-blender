@@ -306,6 +306,14 @@ class CombineMotionData(bpy.types.Operator):
                             + ("  " + "; ".join(view_lines) if view_lines else ""))
                 return {'CANCELLED'}
             combined_meta = rep['metadata']
+            if scene.combine_perspective:
+                # A camera of unknown make: a horizontal field of view stands in for its focal length
+                width, height = gvar.front_width or 1920, gvar.front_height or 1080
+                combined, prep = combine.correct_perspective(
+                    combined, combine.focal_from_fov(width, scene.combine_fov), horizon=-height / 200.0)
+                lo, hi = prep["perspective_factor"]
+                print(f"[Open Mocap]   perspective corrected ({scene.combine_fov:.0f} deg field of view, "
+                      f"size factor {lo:.2f}..{hi:.2f})")
             if scene.combine_auto_offset and side:
                 scene.combine_offset = rep["offset_s"]   # start manual tweaking from what was found
             if scene.combine_auto_angle and side:
@@ -862,7 +870,7 @@ CAPTURE_LISTS = ("positionList", "zlist", "position_times", "position_vis", "zli
                  "R_hand_positionList", "L_hand_positionList", "R_hand_zlist", "L_hand_zlist",
                  "R_hand_times", "L_hand_times", "R_hand_ztimes", "L_hand_ztimes",
                  "R_body_hand_positionList", "L_body_hand_positionList", "R_body_hand_times", "L_body_hand_times")
-CAPTURE_VALUES = ("fps", "front_fps", "side_fps", "hand_fps", "hand_front_fps", "hand_side_fps", "front_video_path", "side_video_path",
+CAPTURE_VALUES = ("fps", "front_fps", "side_fps", "front_width", "front_height", "hand_fps", "hand_front_fps", "hand_side_fps", "front_video_path", "side_video_path",
                   "hand_front_video_path", "hand_side_video_path")
 
 

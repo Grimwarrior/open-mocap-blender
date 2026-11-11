@@ -602,6 +602,50 @@ def plant_ankle(ankle, heel, toe, states, fps, floor=None, leg_length=0.0):
     return out
 
 
+# Foot yaw. A foot is joined to its shin at the ankle, which turns a person's toes a little in or out
+# but not much: the shin and the foot below it turn about the leg's axis together. The mocap's heel and
+# toe points are noisy in the direction away from the camera, so the foot's heading can come out 25
+# degrees or more away from where the knee points, and the rig's boot then twists against its shin.
+# The foot is turned back about the vertical until its heading is within FOOT_YAW_LIMIT degrees of the
+# knee's (smoothed over FOOT_YAW_SMOOTH_S), which leaves a foot that points where the knee points alone.
+FOOT_YAW_LIMIT = 6.0
+FOOT_YAW_SMOOTH_S = 0.1
+
+
+def knee_bend_directions(empties, frames, fps, mirror):
+    """{side: (N, 3)} the side each knee bends to (unit, across the leg), as leg_directions reads it."""
+    idx = {i for v in LEG_IK_MAP.values() for i in v} | {HIP_C, SHOULDER_C}
+    P = _true(empties, idx, frames, mirror)
+    frame = _body_frame(P[L_HIP] - P[R_HIP], P[SHOULDER_C] - P[HIP_C])
+    sigma = REACH_SMOOTH_S * fps
+    out = {}
+    for side, (h, k, an) in LEG_IK_MAP.items():
+        line = _unit(_gauss_np(P[an] - P[h], sigma))
+        way = bend_direction(_gauss_np(P[k] - P[h], sigma), line,
+                             float(np.median(np.linalg.norm(P[k] - P[h], axis=1))), frame[2], fps,
+                             landmark_confidence(empties, frames, (h, k, an)))
+        out[side] = _unit(way - np.sum(way * line, axis=1, keepdims=True) * line)
+    return out
+
+
+def limited_toe(heel, toe, knee_way, limit_deg=FOOT_YAW_LIMIT, fps=30.0):
+    """
+        The toe point turned about the vertical through the heel until the foot's heading is within
+        `limit_deg` of the knee's. :param heel, toe, knee_way: (N, 3), z up. :return: (N, 3) toe.
+    """
+    v = toe - heel
+    h, k = v[:, :2], knee_way[:, :2]
+    ok = (np.linalg.norm(h, axis=1) > 1e-9) & (np.linalg.norm(k, axis=1) > 1e-9)
+    diff = (np.arctan2(h[:, 1], h[:, 0]) - np.arctan2(k[:, 1], k[:, 0]) + np.pi) % (2 * np.pi) - np.pi
+    limit = np.radians(limit_deg)
+    turn = _gauss_np(np.where(ok, np.clip(diff, -limit, limit) - diff, 0.0), FOOT_YAW_SMOOTH_S * fps)
+    c, s = np.cos(turn), np.sin(turn)
+    out = v.copy()
+    out[:, 0] = c * h[:, 0] - s * h[:, 1]
+    out[:, 1] = s * h[:, 0] + c * h[:, 1]
+    return heel + out
+
+
 def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip_offsets, hips_lift,
                    plant, floor_data=None):
     """
@@ -1305,29 +1349,35 @@ class _MocapSpace:
         return self.proxies[i]
 
 
-def _aim_point(coll, cache, points, a, b):
-    """Helper empty FAR along landmark a -> b (shared by bones using the same segment)."""
-    key = (a, b)
+def _aim_point(coll, cache, points, a, b, target=None):
+    """
+        Helper empty FAR along landmark a -> b (shared by bones using the same segment).
+        :param target: helper to aim at instead of landmark b (kept apart from the plain a -> b).
+    """
+    key = (a, b) if target is None else (a, b, target.name)
     if key not in cache:
-        aim = _new_empty(coll, f"OM_aim_{a}_{b}")
+        aim = _new_empty(coll, f"OM_aim_{a}_{b}" if target is None else f"OM_aim_{a}_{b}_{target.name}")
         c = aim.constraints.new('COPY_LOCATION')
         c.target = points[a]
         c = aim.constraints.new('DAMPED_TRACK')
-        c.target = points[b]
+        c.target = target or points[b]
         c.track_axis = 'TRACK_Y'
-        point = _new_empty(coll, f"OM_aimpoint_{a}_{b}", parent=aim)
+        point = _new_empty(coll, f"OM_aimpoint_{a}_{b}" if target is None else f"OM_aimpoint_{a}_{b}_{target.name}", parent=aim)
         point.location = (0.0, FAR, 0.0)
         cache[key] = point
     return cache[key]
 
 
-def _foot_frame(coll, points, heel, toe, ankle):
-    """Helper empty oriented like the mocap foot: Y along heel -> toe, Z toward the ankle."""
+def _foot_frame(coll, points, heel, toe, ankle, toe_point=None):
+    """
+        Helper empty oriented like the mocap foot: Y along heel -> toe, Z toward the ankle.
+        :param toe_point: helper to aim at instead of the toe landmark (see limited_toe).
+    """
     frame = _new_empty(coll, f"OM_foot_{heel}_{toe}_{ankle}")
     c = frame.constraints.new('COPY_LOCATION')
     c.target = points[heel]
     c = frame.constraints.new('DAMPED_TRACK')
-    c.target = points[toe]
+    c.target = toe_point or points[toe]
     c.track_axis = 'TRACK_Y'
     c = frame.constraints.new('LOCKED_TRACK')
     c.target = points[ankle]
@@ -1336,13 +1386,13 @@ def _foot_frame(coll, points, heel, toe, ankle):
     return frame
 
 
-def _knee_hint(coll, cache, points, near, far, ankle, toe, dist):
+def _knee_hint(coll, cache, points, near, far, ankle, toe, dist, toe_point=None):
     """
         Helper point FAR away from the rig in the direction mocap landmark `near` -> (landmark `far`
         moved `dist` back along ankle -> toe). Like the aim points, only its direction matters, so
         the rig can stand anywhere and at any size.
     """
-    aim = _aim_point(coll, cache, points, ankle, toe).parent      # sits on the ankle, Y along ankle -> toe
+    aim = _aim_point(coll, cache, points, ankle, toe, toe_point).parent      # sits on the ankle, Y along ankle -> toe
     hint = _new_empty(coll, f"OM_knee_{far}_{ankle}_{toe}")
     c = hint.constraints.new('COPY_LOCATION')
     c.target = points[far]
@@ -1596,13 +1646,23 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
         stats[ankle] = mocap_foot_stats(empties, scene.frame_start, scene.frame_end, heel, toe, ankle)
     fwd = rig_forward(rig)
     up = Vector((0.0, 0.0, 1.0))
+    # The foot's yaw is held near the knee's (see limited_toe); the knee hints and the feet aim at that toe
+    toe_points = {}
+    if len(frames) >= 3 and FOOT_YAW_LIMIT is not None:
+        bends = knee_bend_directions(empties, frames, fps, mirror_depth)
+        flip = np.array([1.0, -1.0 if mirror_depth else 1.0, 1.0])
+        for side, (heel, toe, ankle) in ((s, FOOT_MAP[s + "Foot"]) for s in ("Left", "Right")):
+            T = _true(empties, {heel, toe}, frames, mirror_depth)
+            toe_points[toe] = _keyed_point(coll, points.space, f"OM_toe_{side}",
+                                           limited_toe(T[heel], T[toe], bends[side], FOOT_YAW_LIMIT, fps) * flip, frames)
     for short, (near, far, ankle, toe) in KNEE_MAP.items():
         pb = drive_bone(rig, short)
         if pb is None:
             continue
         c = pb.constraints.new('LOCKED_TRACK')
         c.name = PREFIX + "Knee"
-        c.target = _knee_hint(coll, cache, points, near, far, ankle, toe, KNEE_TOE_HINT * stats[ankle][0] * space_scale)
+        c.target = _knee_hint(coll, cache, points, near, far, ankle, toe, KNEE_TOE_HINT * stats[ankle][0] * space_scale,
+                              toe_points.get(toe))
         c.lock_axis = 'LOCK_Y'
         c.track_axis = _twist_axis(rig, pb, -fwd)
     for short, (heel, toe, ankle) in FOOT_MAP.items():
@@ -1616,7 +1676,8 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
         z = -math.sin(p) * fwd + math.cos(p) * up
         frame_rest = Matrix((y.cross(z), y, z)).transposed()
         bone_rest = (mw.to_3x3() @ pb.bone.matrix_local.to_3x3()).normalized()
-        offset = _new_empty(coll, f"OM_footbone_{short}", parent=_foot_frame(coll, points, heel, toe, ankle))
+        offset = _new_empty(coll, f"OM_footbone_{short}",
+                            parent=_foot_frame(coll, points, heel, toe, ankle, toe_points.get(toe)))
         offset.rotation_mode = 'QUATERNION'
         offset.rotation_quaternion = (frame_rest.inverted() @ bone_rest).to_quaternion()
         c = pb.constraints.new('COPY_ROTATION')
