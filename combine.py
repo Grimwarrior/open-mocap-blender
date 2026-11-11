@@ -1162,9 +1162,13 @@ def focal_from_fov(width_px, fov_deg):
     return (width_px / 2.0) / np.tan(np.radians(np.clip(fov_deg, 5.0, 170.0)) / 2.0) / 100.0
 
 
-def _unproject_xy(XY, D, focal, horizon):
-    """x/y (N, 40, 2) with the perspective of depths D (N, 40) taken out; centroids stay means."""
-    factor = np.clip(1.0 + (D - D[:, [HIP_C]]) / focal, *PERSPECTIVE_FACTOR_RANGE)
+def _unproject_xy(XY, D, focal, horizon, reference=None):
+    """
+        x/y (N, 40, 2) with the perspective of depths D (N, 40) taken out; centroids stay means.
+        :param reference: depth the picture is scaled to (None: each frame's hips).
+    """
+    base = D[:, [HIP_C]] if reference is None else reference
+    factor = np.clip(1.0 + (D - base) / focal, *PERSPECTIVE_FACTOR_RANGE)
     out = XY.copy()
     out[:, :, 0] = XY[:, :, 0] * factor
     out[:, :, 1] = horizon + (XY[:, :, 1] - horizon) * factor
@@ -1173,7 +1177,19 @@ def _unproject_xy(XY, D, focal, horizon):
     return out
 
 
-def correct_perspective(frames, focal, horizon=0.0, confidence=None, bone_strength=0.0, fps=30.0):
+# The whole take. Taken out relative to each frame's hips, the perspective leaves every frame at the
+# size and height the camera saw the hips at: an actor stepping away from a camera above the floor
+# shrinks and rises in the picture, and so does the floor under him (Whirlpool Front + LTR + RTL: a
+# standing toe 0.24 units higher, 13% of a leg, where the actor stood 1.4 units further back; height
+# against the hips' depth correlated 0.88). With whole_take every frame is scaled to one reference
+# depth, the hips' median, the hips' own depth from the other views included: x and y about the
+# picture's centre and the horizon, and depths relative to the hips like x and y, so the body keeps
+# one size. The hips' depth itself is left as it was.
+# Synthetic actor (combine benchmark, 6 s walking 1.5 m toward the camera), per frame -> whole take:
+#   camera at 5 m: depth error 3.36 -> 3.13% of body height, x/y error 7.4 -> 5.0%, limb length
+#   variation 11.8 -> 6.2%; at 3.5 m: 4.39 -> 3.69%, 11.8 -> 6.9%, 17.2 -> 7.6%.
+def correct_perspective(frames, focal, horizon=0.0, confidence=None, bone_strength=0.0, fps=30.0,
+                        whole_take=False):
     """
         Undo the front camera's perspective on a combined take.
         :param frames: combined frames (flat 40 * [x, y, depth]); depth positive = away from the camera
@@ -1183,21 +1199,136 @@ def correct_perspective(frames, focal, horizon=0.0, confidence=None, bone_streng
                         bottom, so a level camera has -picture_height / 200).
         :param confidence: (N, 40) depth confidence of the combine (its report's metadata); with
                            bone_strength > 0 the legs are then solved again (PERSPECTIVE_LENGTHEN).
+        :param whole_take: scale every frame to one reference depth (see above); False: each frame
+                           relative to its own hips.
         :return: (frames, report dict with the factor range)
     """
     P = _as_array(frames)
     if focal <= 0 or not len(P):
         return [list(f) for f in frames], {"perspective_factor": (1.0, 1.0)}
     P = P.copy()
-    P[:, :, :2] = _unproject_xy(P[:, :, :2], P[:, :, 2], focal, horizon)
+    reference = float(np.median(P[:, HIP_C, 2])) if whole_take else None
+    P[:, :, :2] = _unproject_xy(P[:, :, :2], P[:, :, 2], focal, horizon, reference)
+    if whole_take:
+        hips = P[:, [HIP_C], 2]
+        grow = np.clip(1.0 + (hips - reference) / focal, *PERSPECTIVE_FACTOR_RANGE)
+        P[:, :, 2] = hips + (P[:, :, 2] - hips) * grow
     if confidence is not None and bone_strength > 0 and PERSPECTIVE_LENGTHEN > 0:
         weight = np.clip(np.asarray(confidence, dtype=np.float64), 0.0, 1.0)
         if weight.shape == P.shape[:2]:
             P[:, :, 2] = _solve_skeleton(P, P[:, :, 2].copy(), weight, bone_strength, fps, PERSPECTIVE_LENGTHEN,
                                          PERSPECTIVE_LENGTHEN_SEGMENTS)
-    rel = P[:, :, 2] - P[:, [HIP_C], 2]
+    rel = P[:, :, 2] - (P[:, [HIP_C], 2] if reference is None else reference)
     factor = np.clip(1.0 + rel / focal, *PERSPECTIVE_FACTOR_RANGE)
     return P.reshape(len(P), -1).tolist(), {"perspective_factor": (float(factor.min()), float(factor.max()))}
+
+
+# The horizon. The correction moves a point toward or away from the horizon line, so it needs that
+# line's height in the picture: where a camera at the actor's hip height, held level, would have it is
+# the picture's middle, but a camera higher or lower, or tilted, has it elsewhere, and the far foot of
+# a wide stance then lands above or below the near one. Where both feet stand (their lowest points,
+# heel or toe, both still for FLOOR_STILL_S) they are on one floor, which gives one equation per frame:
+#     (v1 - v2) + (d1 v1 - d2 v2) / f - horizon (d1 - d2) / f = 0
+# (v the picture heights, d the depths relative to the hips). The floor alone cannot tell the focal
+# length from the horizon (feet are always at about the same height in the picture, so only their
+# product is measured), so the focal length stays what the field of view says and the horizon is
+# solved for. Synthetic actor filmed from 3.5 to 5 m at 1.0 to 1.6 m height: with the right focal
+# length the horizon comes out within 0.07 units of the camera's, and with one 25% off the feet still
+# stand level (gap between the feet where both stand 0.36..0.59 units uncorrected, 0.03..0.35 with
+# the horizon at the picture's middle, 0.023..0.032 fitted). Whirlpool Front + LTR + RTL at 65 deg:
+# gap 0.094 -> 0.003; frame 63's heels from 0.09 apart to 0.01.
+FLOOR_STILL_SPEED = 0.35     # a foot moving slower than this (leg lengths per second) stands
+FLOOR_STILL_S = 0.15         # ... for at least this long
+HORIZON_MIN_FRAMES = 8       # standing samples needed to find the horizon
+HORIZON_MIN_SPREAD = 0.2     # ... and that far apart in depth (leg lengths, root mean square or spread)
+FOOT_POINTS = ((L_ANKLE, 29, L_TOE), (R_ANKLE, 30, R_TOE))
+
+
+def _still(points, fps, leg):
+    """(N,) frames in runs of at least FLOOR_STILL_S where points (N, 3) move slower than FLOOR_STILL_SPEED."""
+    speed = np.linalg.norm(np.gradient(points, axis=0), axis=1) * fps / max(leg, 1e-9)
+    still = speed < FLOOR_STILL_SPEED
+    out = np.zeros(len(points), dtype=bool)
+    i, n = 0, len(points)
+    while i < n:
+        if not still[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and still[j]:
+            j += 1
+        if (j - i) / fps >= FLOOR_STILL_S:
+            out[i:j] = True
+        i = j
+    return out
+
+
+# For a whole-take correction every standing foot counts, in any frame: its lowest point, corrected,
+# is at the floor's one height c, which gives one equation per standing foot and frame in the horizon
+# and c (e = the point's depth less the reference depth):
+#     v + v e / f - horizon e / f - c = 0
+# Per frame -> whole take, height spread of all standing feet: synthetic standing actor 0.18..0.29 ->
+# 0.020..0.025 units (horizon within 0.05 of the camera's); Whirlpool at 65 deg, Front as the front
+# view 0.083 -> 0.043 (a toe the user marked as touching the floor in five frames: 0.24 -> 0.11),
+# Back 0.128 -> 0.041, the profile views (actor moving across the picture) 0.039 / 0.029 -> 0.038 /
+# 0.024. Both feet of one frame then agree a little less (Front 0.003 -> 0.015, Back 0.031 -> 0.052).
+def fit_horizon(frames, focal, fps=30.0, default=0.0, whole_take=False):
+    """
+        The horizon that puts standing feet on one floor (see above): with whole_take every standing
+        foot in every frame on one floor; otherwise both feet where both stand, frame by frame.
+        :param frames: combined frames before the perspective correction (flat 40 * [x, y, depth]).
+        :param focal: the front camera's focal length in tracker units (focal_from_fov).
+        :return: (horizon, report dict: "horizon_samples" used, "horizon_found" whether it was solved
+                 or `default` was kept and why)
+    """
+    P = _as_array(frames)
+    if focal <= 0 or len(P) < 3:
+        return default, {"horizon_found": False, "horizon_samples": 0, "horizon_reason": "no focal length"}
+    n = len(P)
+    leg = float(np.median(np.linalg.norm(P[:, 25, :] - P[:, 23, :], axis=1)
+                          + np.linalg.norm(P[:, 27, :] - P[:, 25, :], axis=1)))
+    stands, low = [], []
+    for ankle, heel, toe in FOOT_POINTS:
+        stands.append(_still(P[:, [ankle, heel, toe]].mean(axis=1), fps, leg))
+        pick = np.where(P[:, heel, 1] >= P[:, toe, 1], heel, toe)          # lower in the picture (y down)
+        low.append(P[np.arange(n), pick])
+    report = {"horizon_samples": 0, "horizon_found": False, "horizon_mode": "take" if whole_take else "frame"}
+    if whole_take:
+        pts = np.concatenate([low[k][stands[k]] for k in range(2)])
+        v, e = pts[:, 1], pts[:, 2] - float(np.median(P[:, HIP_C, 2]))
+        A = np.stack([-e / focal, -np.ones(len(e))], axis=1)                # unknowns: horizon, floor c
+        y = -(v + v * e / focal)
+        spread = float(np.std(e)) if len(e) else 0.0
+        need = "standing feet"
+    else:
+        idx = np.nonzero(stands[0] & stands[1])[0]
+        (a, b), hip = (low[0][idx], low[1][idx]), P[idx, HIP_C, 2]
+        v1, v2, d1, d2 = a[:, 1], b[:, 1], a[:, 2] - hip, b[:, 2] - hip
+        A = ((d1 - d2) / focal)[:, None]                                    # unknown: horizon
+        y = (v1 - v2) + (d1 * v1 - d2 * v2) / focal
+        spread = float(np.sqrt(np.mean((d1 - d2) ** 2))) if len(idx) else 0.0
+        need = "frames with both feet standing"
+    report["horizon_samples"] = int(len(y))
+    if len(y) < HORIZON_MIN_FRAMES:
+        report["horizon_reason"] = f"only {len(y)} {need}"
+        return default, report
+    if spread < HORIZON_MIN_SPREAD * leg:
+        report["horizon_reason"] = ("the feet never stand far enough apart in depth" if not whole_take
+                                    else "the actor never stands at different distances")
+        return default, report
+    keep = np.ones(len(y), dtype=bool)
+    solution = None
+    for _ in range(3):                                                      # drop outliers, solve again
+        solution = np.linalg.lstsq(A[keep], y[keep], rcond=None)[0]
+        res = np.abs(A @ solution - y)
+        new_keep = res <= 4.0 * 1.4826 * (np.median(res[keep]) + 1e-9)
+        if new_keep.sum() < HORIZON_MIN_FRAMES:
+            break
+        keep = new_keep
+    report.update(horizon_found=True, horizon_samples=int(keep.sum()))
+    if whole_take:
+        report["floor"] = float(solution[1])
+    return float(solution[0]), report
 
 
 def format_views(r):

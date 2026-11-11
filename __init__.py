@@ -99,6 +99,17 @@ def register():
         name="Field of View", default=60.0, min=10.0, max=120.0, precision=0,   # plain degrees: subtype ANGLE is radians
         description="Horizontal field of view of the front camera in degrees (phone main camera about 65-70, "
                     "a 35 mm lens on a full-frame camera about 54, zoomed in 30). Too wide overcorrects")
+    bpy.types.Scene.combine_auto_horizon = bpy.props.BoolProperty(
+        name="Find Horizon", default=True,
+        description="Find the camera's horizon (its height and tilt) from the frames where both feet stand: the "
+                    "one that puts them on one floor. Off: a level camera at the actor's hip height (the horizon "
+                    "at the middle of the picture)")
+    bpy.types.Scene.combine_whole_take = bpy.props.BoolProperty(
+        name="Whole Take", default=True,
+        description="Scale every frame to one distance from the camera, so an actor stepping toward or away "
+                    "from it keeps one size and the floor stays at one height. Off: each frame is corrected "
+                    "relative to its own hips, which levels the feet against each other but leaves the body "
+                    "as big and as high as the camera saw it")
     bpy.types.Scene.retarget_source = bpy.props.PointerProperty(
         name="Mocap", type=bpy.types.Object,
         description="Mocap rig to retarget from: the empty whose children are the 40 landmark empties "
@@ -177,6 +188,8 @@ def unregister():
     del bpy.types.Scene.combine_bone_strength
     del bpy.types.Scene.combine_perspective
     del bpy.types.Scene.combine_fov
+    del bpy.types.Scene.combine_auto_horizon
+    del bpy.types.Scene.combine_whole_take
     del bpy.types.Scene.combine_auto_offset
     del bpy.types.Scene.combine_offset
     del bpy.types.Scene.combine_sync

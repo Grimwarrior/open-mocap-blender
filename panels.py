@@ -179,6 +179,10 @@ class PoseTrackingPanel(bpy.types.Panel):
                 sub = row.row(align=True)
                 sub.enabled = scene.combine_perspective
                 sub.prop(scene, "combine_fov", text="FOV")
+                row = box.row(align=True)
+                row.enabled = scene.combine_perspective
+                row.prop(scene, "combine_auto_horizon", toggle=True)
+                row.prop(scene, "combine_whole_take", toggle=True)
             box.operator("object.combine_data", text="Combine Data", icon='PLUS').mode = "pose"
         layout.operator("object.animate_obj", text="Animate", icon='RENDER_ANIMATION')
         layout.operator("object.hide_skeleton", text="Hide/Unhide Empties", icon='HIDE_OFF').collection_name = "PoseEmpties"

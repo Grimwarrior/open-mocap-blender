@@ -309,13 +309,24 @@ class CombineMotionData(bpy.types.Operator):
             if scene.combine_perspective:
                 # A camera of unknown make: a horizontal field of view stands in for its focal length
                 width, height = gvar.front_width or 1920, gvar.front_height or 1080
+                focal = combine.focal_from_fov(width, scene.combine_fov)
+                fps = gvar.front_fps or gvar.fps or 30.0
+                horizon, hrep = -height / 200.0, {}
+                whole = scene.combine_whole_take
+                if scene.combine_auto_horizon:
+                    horizon, hrep = combine.fit_horizon(combined, focal, fps, default=horizon, whole_take=whole)
                 combined, prep = combine.correct_perspective(
-                    combined, combine.focal_from_fov(width, scene.combine_fov), horizon=-height / 200.0,
-                    confidence=[m['depth_confidence'] for m in combined_meta],
-                    bone_strength=scene.combine_bone_strength, fps=gvar.front_fps or gvar.fps or 30.0)
+                    combined, focal, horizon=horizon, confidence=[m['depth_confidence'] for m in combined_meta],
+                    bone_strength=scene.combine_bone_strength, fps=fps, whole_take=whole)
                 lo, hi = prep["perspective_factor"]
-                print(f"[Open Mocap]   perspective corrected ({scene.combine_fov:.0f} deg field of view, "
-                      f"size factor {lo:.2f}..{hi:.2f})")
+                # the horizon as a share of the picture's height above its bottom edge
+                samples = "standing feet" if whole else "frames with both feet standing"
+                where = (f"horizon {-horizon * 100.0 / height:.0%} up the picture, found from "
+                         f"{hrep['horizon_samples']} {samples}" if hrep.get("horizon_found")
+                         else "horizon at the middle of the picture"
+                         + (f" ({hrep['horizon_reason']})" if hrep.get("horizon_reason") else ""))
+                print(f"[Open Mocap]   perspective corrected ({scene.combine_fov:.0f} deg field of view, {where}, "
+                      f"{'whole take at one distance, ' if whole else ''}size factor {lo:.2f}..{hi:.2f})")
             if scene.combine_auto_offset and side:
                 scene.combine_offset = rep["offset_s"]   # start manual tweaking from what was found
             if scene.combine_auto_angle and side:
