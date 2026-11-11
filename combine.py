@@ -101,6 +101,10 @@ FUSE_VIS_RANGE = 0.3      # ... and the range over which it blends in
 GAP_FILL_S = 0.1          # occluded joints: side depth borrowed from frames within about this time
 SAME_PLANE_SLOPE = 0.85   # side x follows front x this closely (1 = the same or the opposite view):
                           # the two views are less than about 30 degrees from one line and hold no depth
+MULTI_MIN_FIT = 0.5       # more views: share of a view's sideways motion its fitted direction must explain
+MULTI_SCALE_RANGE = (0.6, 1.6)  # ... and how far its size may be off the front view's
+MULTI_DEPTH_MIN = 0.5     # ... |sin(angle to the front view)| from which a view measures depth (30 degrees)
+MULTI_ROUNDS = 2          # ... directions are fitted to the depth, the depth to the directions, this often
 MAX_INTERP_GAP_S = 0.12   # longer missing intervals must not look like measured side motion
 
 
@@ -803,6 +807,223 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
                          ('observed' if w[i, j] > 0.5 and exact[i] else 'interpolated') for j in range(N_PTS)]}
         for i in range(len(F))]
     return F_out.reshape(len(F_out), -1).tolist(), report
+
+
+# -------------------------------------------------------------
+# MORE THAN TWO VIEWS
+# -------------------------------------------------------------
+# Every further video is one more look at the same body from its own direction. A camera turned by
+# an angle a from the front one sees x_view = cos(a) * x_front - sin(a) * depth, so each view is one
+# equation in the two unknowns of a joint, and with the front view's own x there are as many
+# equations as views plus one:
+# - a view from the side, or from in front of or behind an actor filmed in profile (sin near 1),
+#   measures depth. Two of them average their noise, and one sees the limbs the other has hidden;
+# - a view from the opposite side or the same side (cos near 1) measures the front view's own x
+#   again. That helps only for joints the front view cannot see, and only if both videos show one
+#   performance: in a second performance the joints are simply somewhere else.
+# The direction of each view is not asked for. It is fitted: a first depth comes from the front view
+# and one side view (combine_improved), each view's x is then explained as a mix of front x and
+# that depth, and the mix is its direction (sign included, so left and right side cameras need not
+# be told apart). A view whose motion no direction explains is left out and named in the report.
+# The depths of all views that measure one are averaged by visibility into one "virtual side
+# view", which goes through combine_improved once more, so gap filling, smoothing, bone lengths and
+# confidence work exactly as for two videos.
+def _align_view(F, tF, S_raw, tS, visS_raw, sync, fps):
+    """Steps 1-3 of combine_improved for one view. :return: (dict, None) or (None, reason)."""
+    offset, corr = find_time_offset(tF, F, tS, S_raw)
+    if corr < MIN_SYNC_MATCH:
+        return None, f"its timing does not match the front video (match {corr:.2f})"
+    tq = tF + offset
+    if sync == "WARP" and len(tF) >= 20 and len(tS) >= 20:
+        tq = time_warp(tF, F, tS, S_raw, offset)
+    support = interpolation_support(tq, tS)
+    valid = (tq >= tS[0]) & (tq <= tS[-1]) & (support > 0)
+    if valid.sum() < 8:
+        return None, "it overlaps the front video too little"
+    S = _interp(tq, tS, S_raw)
+    vis = _interp(tq, tS, visS_raw) * valid[:, None]
+    scale = _scale_per_frame(F, S, valid, fps)
+    S, vis, _swaps = _fix_left_right(F, S, vis, scale, valid)
+    w = _side_weight(vis) * support[:, None]
+    return dict(S=S, vis=vis, valid=valid, scale=scale, w=np.minimum(w, w[:, [HIP_C]]),
+                U=S[:, :, 0] * scale[:, None], offset=float(offset), corr=float(corr),
+                height_err=height_agreement(F, S, scale, vis, valid)), None
+
+
+def fit_view_direction(F, D, view):
+    """
+        The view's direction from its own picture: its x (about the hips, limbs only) as
+        alpha * front x + beta * depth. For a camera turned by a: alpha = cos(a), beta = -sin(a).
+        :return: (alpha, beta, size, share of the view's x this explains); alpha and beta are
+                 scaled to length 1 and `size` is the length they had (1 if the view's scale is right).
+    """
+    joints = np.arange(11, 33)
+    x = F[:, joints, 0] - F[:, [HIP_C], 0]
+    d = D[:, joints] - D[:, [HIP_C]]
+    u = view["U"][:, joints] - view["U"][:, [HIP_C]]
+    ww = view["w"][:, joints] * view["valid"][:, None]
+    sxx, sxd, sdd = np.sum(ww * x * x), np.sum(ww * x * d), np.sum(ww * d * d)
+    sxu, sdu, suu = np.sum(ww * x * u), np.sum(ww * d * u), np.sum(ww * u * u)
+    det = sxx * sdd - sxd * sxd
+    if det < 1e-9 * max(sxx * sdd, 1e-12) or suu < 1e-12:
+        return 0.0, 0.0, 0.0, 0.0
+    alpha = (sxu * sdd - sdu * sxd) / det
+    beta = (sdu * sxx - sxu * sxd) / det
+    left = suu - 2 * (alpha * sxu + beta * sdu) + alpha * alpha * sxx + 2 * alpha * beta * sxd + beta * beta * sdd
+    size = float(np.hypot(alpha, beta))
+    if size < 1e-9:
+        return 0.0, 0.0, 0.0, 0.0
+    return float(alpha / size), float(beta / size), size, float(1.0 - left / suu)
+
+
+def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5, bone_strength=0.8,
+                  offset=None, sync="OFFSET", side_angle=None, front_depth_confidence=None):
+    """
+        Front video plus any number of other views.
+        :param views: [{"frames": flat 40 * [x, y, z] per frame, "times": [...], "vis": [...] or None,
+                        "name": "..."}]. The first is the side view of the two-video combine;
+                      `offset` and `side_angle` are its settings, the others are fitted.
+        :return: (frames as flat lists, report dict) like combine_improved. report["views"] says per
+                 view what it was used for. With one view this is combine_improved.
+    """
+    F = _as_array(front_list)
+    tF = np.asarray(front_times, dtype=np.float64)
+    visF = np.clip(np.asarray(front_vis, dtype=np.float64), 0.0, 1.0) if front_vis is not None else np.ones((len(F), N_PTS))
+    fps = _fps(tF)
+    common = dict(smoothing=smoothing, bone_strength=bone_strength, front_depth_confidence=front_depth_confidence)
+    notes = [dict(name=v.get("name") or f"view {i + 1}", use="left out", reason="") for i, v in enumerate(views)]
+
+    # A first depth from the front view and one other: the side view, or the first further one that works
+    first, frames, report = None, None, None
+    for i, v in enumerate(views):
+        own = dict(offset=offset, side_angle=side_angle) if i == 0 else {}
+        frames_i, report_i = combine_improved(front_list, v["frames"], front_times, v["times"], front_vis, v.get("vis"),
+                                              sync=sync, **common, **own)
+        if report is None:
+            frames, report = frames_i, report_i
+        if report_i.get("combined", True):
+            first, frames, report = i, frames_i, report_i
+            break
+        notes[i]["reason"] = report_i.get("reason", "")
+    if first is None or len(views) < 2:
+        if report is not None:
+            report["views"] = notes
+        return frames, report
+    base = dict(report)
+    # Directions are fitted to, and the hips' depth is taken from, a depth that is not yet smoothed
+    # or held to bone lengths: the result is smoothed once, at the end.
+    plain = dict(common, smoothing=0.0, bone_strength=0.0)
+    own = dict(offset=offset, side_angle=side_angle) if first == 0 else {}
+    D = _as_array(combine_improved(front_list, views[first]["frames"], front_times, views[first]["times"], front_vis,
+                                   views[first].get("vis"), sync=sync, **plain, **own)[0])[:, :, 2]
+
+    aligned = {}
+    for i, v in enumerate(views):
+        S_raw = _as_array(v["frames"])
+        tS = np.asarray(v["times"], dtype=np.float64)
+        visS = (np.clip(np.asarray(v["vis"], dtype=np.float64), 0.0, 1.0) if v.get("vis") is not None
+                else np.ones((len(S_raw), N_PTS)))
+        if (len(S_raw) < 2 or tS.shape != (len(S_raw),) or visS.shape != S_raw.shape[:2]
+                or not np.isfinite(S_raw).all() or not np.isfinite(tS).all() or np.any(np.diff(tS) <= 0)):
+            notes[i]["reason"] = "its tracked data is incomplete"
+            continue
+        if i == first and base.get("sync_corr") != base.get("sync_corr"):      # manual offset
+            tq = tF + base["offset_s"]
+            support = interpolation_support(tq, tS)
+            valid = (tq >= tS[0]) & (tq <= tS[-1]) & (support > 0)
+            S = _interp(tq, tS, S_raw)
+            vis = _interp(tq, tS, visS) * valid[:, None]
+            scale = _scale_per_frame(F, S, valid, fps)
+            S, vis, _sw = _fix_left_right(F, S, vis, scale, valid)
+            w = _side_weight(vis) * support[:, None]
+            aligned[i] = dict(S=S, vis=vis, valid=valid, scale=scale, w=np.minimum(w, w[:, [HIP_C]]),
+                              U=S[:, :, 0] * scale[:, None], offset=float(base["offset_s"]), corr=float("nan"),
+                              height_err=height_agreement(F, S, scale, vis, valid))
+            continue
+        aligned[i], why = _align_view(F, tF, S_raw, tS, visS, sync, fps)
+        if aligned[i] is None:
+            del aligned[i]
+            notes[i]["reason"] = why
+
+    F_used = F
+    for _round in range(MULTI_ROUNDS):
+        num = np.zeros_like(D)
+        den = np.zeros_like(D)
+        F_used = F.copy()
+        x_rel = F[:, :, 0] - F[:, [HIP_C], 0]
+        d_rel = D - D[:, [HIP_C]]
+        for i, view in aligned.items():
+            alpha, beta, size, fit = fit_view_direction(F, D, view)
+            note = notes[i]
+            note.update(angle=float(np.degrees(np.arctan2(-beta, alpha))), fit=fit, offset_s=view["offset"],
+                        match=view["corr"], height_err=view["height_err"], use="left out", reason="")
+            if fit < MULTI_MIN_FIT or not MULTI_SCALE_RANGE[0] <= size <= MULTI_SCALE_RANGE[1]:
+                note["reason"] = (f"its motion does not fit the other views (explains {max(fit, 0.0) * 100:.0f}% "
+                                  "of it): another move, or another actor?")
+                continue
+            u = (view["U"] - view["U"][:, [HIP_C]]) / size
+            uses = []
+            if abs(beta) >= MULTI_DEPTH_MIN:
+                weight = view["w"] * beta * beta
+                num += weight * (u - alpha * x_rel) / beta
+                den += weight
+                uses.append("depth")
+            # one performance filmed by several cameras: this view also places what the front view hides
+            if sync != "WARP" and view["height_err"] < FUSE_MAX_HEIGHT_ERR:
+                a = (np.clip((FUSE_FRONT_VIS - visF[:, :33]) / FUSE_VIS_RANGE, 0.0, 1.0)
+                     * np.clip((view["vis"][:, :33] - FUSE_FRONT_VIS) / FUSE_VIS_RANGE, 0.0, 1.0))
+                y_view = F[:, [HIP_C], 1] + (view["S"][:, :33, 1] - view["S"][:, [HIP_C], 1]) * view["scale"][:, None]
+                F_used[:, :33, 1] += a * (y_view - F_used[:, :33, 1])
+                if abs(alpha) >= MULTI_DEPTH_MIN:
+                    x_view = F[:, [HIP_C], 0] + (u[:, :33] - beta * d_rel[:, :33]) / alpha
+                    F_used[:, :33, 0] += a * alpha * alpha * (x_view - F_used[:, :33, 0])
+                if float(a.mean()) > 0:
+                    uses.append("hidden joints")
+            note["use"] = " and ".join(uses) if uses else "left out"
+            if not uses:
+                note["reason"] = ("it looks along the front view's own line and shows another performance, "
+                                  "so it adds neither depth nor position")
+        if not np.any(den > 0):
+            break
+        for c, (a_, b_) in CENTROIDS.items():
+            F_used[:, c, :2] = (F_used[:, a_, :2] + F_used[:, b_, :2]) / 2
+        fused = np.where(den > 1e-9, num / np.maximum(den, 1e-9), d_rel)
+        depth = D[:, [HIP_C]] + fused
+        # The virtual side view: a camera at a right angle, at the front view's own scale and timing
+        side = np.zeros_like(F)
+        side[:, :, 0] = -depth
+        side[:, :, 1] = F_used[:, :, 1]
+        vis_side = np.clip(den, 0.0, 1.0)
+        vis_side[:, HIP_C] = np.clip(den.max(axis=1), 0.0, 1.0)
+        last = _round == MULTI_ROUNDS - 1
+        result, result_report = combine_improved(
+            F_used.reshape(len(F), -1).tolist(), side.reshape(len(F), -1).tolist(), front_times, front_times,
+            front_vis, vis_side.tolist(), offset=0.0, sync="OFFSET", side_angle=90.0, **(common if last else plain))
+        if not result_report.get("combined", True):
+            break                                           # keep the two-video result
+        D = _as_array(result)[:, :, 2]
+        if last:
+            frames, report = result, result_report
+    # Settings found for the side view stay what the panel shows and what a re-run starts from
+    for key in ("offset_s", "sync_corr", "sync_mode", "warp_range", "coverage", "scale", "side_angle",
+                "lr_switches", "height_err", "sync_trusted", "view_slope"):
+        if key in base:
+            report[key] = base[key]
+    report["views"] = notes
+    report["views_for_depth"] = sum("depth" in n["use"] for n in notes)
+    return frames, report
+
+
+def format_views(r):
+    """One line per view of a combine_multi report."""
+    lines = []
+    for n in r.get("views", []):
+        if n["use"] == "left out":
+            lines.append(f"{n['name']}: left out" + (f", {n['reason']}" if n.get("reason") else ""))
+        else:
+            lines.append(f"{n['name']}: used for {n['use']} ({abs(n['angle']):.0f} deg from the front view, "
+                         f"offset {n['offset_s']:+.2f}s)")
+    return lines
 
 
 def format_report(r):

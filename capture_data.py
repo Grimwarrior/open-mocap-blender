@@ -70,6 +70,33 @@ def validate_pose_capture(data):
             raise ValueError(f'Invalid {key}')
 
 
+def validate_extra_views(views):
+    """Further views of a capture file (absent in older files). :return: the views, checked."""
+    if not isinstance(views, list):
+        raise ValueError('Invalid extra_views')
+    checked = []
+    for view in views:
+        if not isinstance(view, dict):
+            raise ValueError('Invalid extra view')
+        frames, times, vis = view.get('frames', []), view.get('times', []), view.get('vis', [])
+        _rows(frames, 120, 'extra view frames')
+        _times(times, 'extra view times')
+        _rows(vis, 40, 'extra view visibility', confidence=True)
+        if not (len(frames) == len(times) == len(vis)):
+            raise ValueError('An extra view has mismatched frame, time and visibility counts')
+        meta = view.get('meta', [])
+        _metadata(meta if isinstance(meta, list) else None, len(frames), 'extra view metadata')
+        missing = view.get('missing_times', [])
+        _times(missing, 'extra view missing times')
+        fps = view.get('fps', 0)
+        if not _finite(fps) or fps < 0:
+            raise ValueError('Invalid extra view fps')
+        checked.append({'path': str(view.get('path', '')), 'name': str(view.get('name', '') or 'view'),
+                        'frames': frames, 'times': times, 'vis': vis, 'meta': meta,
+                        'missing_times': missing, 'fps': fps})
+    return checked
+
+
 def _finite(value):
     return isinstance(value, (int, float)) and math.isfinite(value)
 

@@ -132,8 +132,14 @@ def film(P, rng, angle=0.0, scale=1.0, noise=0.006, shift=(0.0, 0.0), swap_burst
 
 
 def make_take(seed=0, fps=30.0, duration=6.0, offset=0.4, side_angle=90.0, side_scale=1.3,
-              swap_bursts=3, separate=False, noise=0.006):
-    """:return: dict with the tracker-style inputs of both views and the true motion at the front frames."""
+              swap_bursts=3, separate=False, noise=0.006, extra_angles=()):
+    """
+        :param extra_angles: further cameras (degrees about the actor, 270 = the other side, 180 =
+                             behind), each with its own start time and distance; with `separate`
+                             each films its own performance.
+        :return: dict with the tracker-style inputs of the views and the true motion at the front
+                 frames. "views" lists the side view and the further ones as combine_multi takes them.
+    """
     rng = np.random.default_rng(seed)
     tF = np.arange(0, duration, 1.0 / fps)
     tS = np.arange(0, duration + 1.0, 1.0 / fps)
@@ -144,8 +150,17 @@ def make_take(seed=0, fps=30.0, duration=6.0, offset=0.4, side_angle=90.0, side_
         side_motion = true_motion(tS + offset)
     front, visF = film(truth, rng, 0.0, 1.0, noise)
     side, visS = film(side_motion, rng, side_angle, side_scale, noise, shift=(0.7, 0.3), swap_bursts=swap_bursts)
+    views = [dict(frames=side, times=tS + 0.0, vis=visS, name=f"side {side_angle:.0f}")]
+    for k, angle in enumerate(extra_angles):
+        start = 0.15 * (k + 1) * (-1) ** k
+        if separate:
+            motion = true_motion(tS + start + 0.12 * np.sin(tS * 1.1 + k + 1), variation=0.6 + 0.3 * k)
+        else:
+            motion = true_motion(tS + start)
+        frames, vis = film(motion, rng, angle, 1.15 + 0.1 * k, noise, shift=(-0.4 + 0.3 * k, 0.2), swap_bursts=1)
+        views.append(dict(frames=frames, times=tS + 0.0, vis=vis, name=f"view {angle:.0f}"))
     return dict(front=front, side=side, tF=tF, tS=tS + 0.0, visF=visF, visS=visS, truth=truth, fps=fps,
-                offset=-offset)
+                offset=-offset, views=views)
 
 
 def evaluate(frames, take):

@@ -166,6 +166,12 @@ class StartTracking(bpy.types.Operator):
         elif self.track == "side_pose":
             gvar.pose_tracker = utils.PoseTracking("side_pose")
 
+        elif self.track == "extra_pose":
+            if not gvar.extra_video_path:
+                self.report({'ERROR'}, "Select the video of the further view first")
+                return {'CANCELLED'}
+            gvar.pose_tracker = utils.PoseTracking("extra_pose")
+
         elif self.track == "rt_pose":
             #realtime tracking
             gvar.pose_tracker = utils.PoseTracking("rt_pose")
@@ -265,34 +271,48 @@ class CombineMotionData(bpy.types.Operator):
         front = gvar.positionList_raw if gvar.positionList_raw is not None else gvar.positionList
         metadata = gvar.position_meta_raw if gvar.position_meta_raw is not None else gvar.position_meta
         side = gvar.zlist
-        if not front or not side:
-            self.report({'ERROR'}, "Track both the front and the side video first")
+        # Further views: the side video (if there is one) first, then every other tracked view
+        more = [v for v in gvar.extra_views
+                if len(v["frames"]) >= 10 and len(v["times"]) == len(v["frames"]) and len(v["vis"]) == len(v["frames"])]
+        if not front or not (side or more):
+            self.report({'ERROR'}, "Track the front video and at least one other view first")
             return {'CANCELLED'}
 
         have_meta = (len(gvar.position_times) == len(front) and len(gvar.position_vis) == len(front)
                      and len(gvar.zlist_times) == len(side) and len(gvar.zlist_vis) == len(side))
         method = scene.combine_method
-        if method == 'IMPROVED' and have_meta and len(front) >= 10 and len(side) >= 10:
+        if method != 'IMPROVED' and not side:
+            self.report({'ERROR'}, "The original method needs the side video; further views need the improved method")
+            return {'CANCELLED'}
+        if method == 'IMPROVED' and have_meta and len(front) >= 10 and (len(side) >= 10 or (not side and more)):
+            views = ([{"frames": side, "times": gvar.zlist_times, "vis": gvar.zlist_vis, "name": "Side video"}]
+                     if side else []) + more
             try:
-                combined, rep = combine.combine_improved(
-                    front, side, gvar.position_times, gvar.zlist_times, gvar.position_vis, gvar.zlist_vis,
+                combined, rep = combine.combine_multi(
+                    front, views, gvar.position_times, gvar.position_vis,
                     smoothing=scene.combine_smoothing, bone_strength=scene.combine_bone_strength,
-                    offset=None if scene.combine_auto_offset else scene.combine_offset,
+                    offset=None if (scene.combine_auto_offset or not side) else scene.combine_offset,
                     sync=scene.combine_sync,
-                    side_angle=None if scene.combine_auto_angle else scene.combine_side_angle,
+                    side_angle=None if (scene.combine_auto_angle or not side) else scene.combine_side_angle,
                     front_depth_confidence=capture_data.depth_confidence(metadata, gvar.position_vis) if metadata else None)
             except ValueError as error:
                 self.report({'ERROR'}, str(error))
                 return {'CANCELLED'}
+            view_lines = combine.format_views(rep) if len(views) > 1 else []
+            for line in view_lines:
+                print("[Open Mocap]  ", line)
             if not rep.get('combined', True):
-                self.report({'WARNING'}, 'Combine skipped: ' + combine.format_report(rep))
+                self.report({'WARNING'}, 'Combine skipped: ' + combine.format_report(rep)
+                            + ("  " + "; ".join(view_lines) if view_lines else ""))
                 return {'CANCELLED'}
             combined_meta = rep['metadata']
-            if scene.combine_auto_offset:
+            if scene.combine_auto_offset and side:
                 scene.combine_offset = rep["offset_s"]   # start manual tweaking from what was found
-            if scene.combine_auto_angle:
+            if scene.combine_auto_angle and side:
                 scene.combine_side_angle = rep["side_angle"]
             msg = "Combined: " + combine.format_report(rep)
+            if view_lines:
+                msg += f". {rep.get('views_for_depth', 0)} of {len(views)} views measure depth: " + "; ".join(view_lines)
             level = {'WARNING'} if rep["sync_corr"] < 0.4 else {'INFO'}
             if rep["sync_corr"] < 0.4:
                 msg += ". Low sync match: check that both videos show the same performance"
@@ -811,6 +831,7 @@ class ClearMoCapCache(bpy.types.Operator):
                 lst.clear()
             gvar.positionList_raw = None
             gvar.position_meta_raw = None
+            gvar.extra_views.clear()
             gvar.object_list.clear()
             gvar.bones_list.clear()
             for lst in (gvar.R_body_hand_positionList, gvar.L_body_hand_positionList,
@@ -870,6 +891,8 @@ class SaveCapture(bpy.types.Operator, ExportHelper):
             data[name] = getattr(gvar, name)
         data["positionList_raw"] = gvar.positionList_raw
         data["position_meta_raw"] = gvar.position_meta_raw
+        data["extra_views"] = gvar.extra_views
+        data["extra_video_path"] = gvar.extra_video_path
         try:
             capture_data.validate_pose_capture(data)
             encoded = json.dumps(data, allow_nan=False)
@@ -878,7 +901,8 @@ class SaveCapture(bpy.types.Operator, ExportHelper):
         except (OSError, ValueError) as e:
             self.report({'ERROR'}, f"Could not save the capture: {e}")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Saved {len(gvar.positionList)} front and {len(gvar.zlist)} side pose frames "
+        more = f", {len(gvar.extra_views)} further views" if gvar.extra_views else ""
+        self.report({'INFO'}, f"Saved {len(gvar.positionList)} front and {len(gvar.zlist)} side pose frames{more} "
                               f"to {self.filepath}")
         return {'FINISHED'}
 
@@ -903,6 +927,7 @@ class LoadCapture(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
         try:
             capture_data.validate_pose_capture(data)
+            views = capture_data.validate_extra_views(data.get("extra_views", []))
         except ValueError as error:
             self.report({'ERROR'}, f'Invalid capture: {error}')
             return {'CANCELLED'}
@@ -919,9 +944,12 @@ class LoadCapture(bpy.types.Operator, ImportHelper):
         gvar.positionList_raw = raw if isinstance(raw, list) else None
         raw_meta = data.get('position_meta_raw')
         gvar.position_meta_raw = raw_meta if isinstance(raw_meta, list) else None
+        gvar.extra_views[:] = views
+        gvar.extra_video_path = data.get("extra_video_path", "") if isinstance(data.get("extra_video_path"), str) else ""
         if gvar.fps:
             gvar.delay = 1.0 / gvar.fps
         self.report({'INFO'}, f"Loaded {len(gvar.positionList)} front and {len(gvar.zlist)} side pose frames, "
+                              f"{len(gvar.extra_views)} further views, "
                               f"{len(gvar.R_hand_positionList)} right and {len(gvar.L_hand_positionList)} "
                               "left hand frames")
         return {'FINISHED'}
@@ -958,6 +986,8 @@ class VideoSelect(bpy.types.Operator):
             gvar.front_video_path = self.filepath
         elif self.video == "side_video_pose":
             gvar.side_video_path = self.filepath
+        elif self.video == "extra_video_pose":
+            gvar.extra_video_path = self.filepath
         elif self.video == "front_video_hand":
             gvar.hand_front_video_path = self.filepath
         else:
@@ -986,10 +1016,28 @@ class ClearVideoPath(bpy.types.Operator):
             gvar.front_video_path = ""
         elif self.video == "side_video_pose":
             gvar.side_video_path = ""
+        elif self.video == "extra_video_pose":
+            gvar.extra_video_path = ""
         elif self.video == "front_video_hand":
             gvar.hand_front_video_path = ""
         else:
             gvar.hand_side_video_path = ""
+        return {'FINISHED'}
+
+
+
+class RemoveExtraView(bpy.types.Operator):
+    bl_idname = "object.open_mocap_remove_view"
+    bl_label = "Remove View"
+    bl_description = "Remove this further view's tracked data (the video file is not touched)"
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        if not 0 <= self.index < len(gvar.extra_views):
+            return {'CANCELLED'}
+        view = gvar.extra_views.pop(self.index)
+        self.report({'INFO'}, f"Removed the view {view.get('name', '')}. Run Combine Data again to leave it out.")
         return {'FINISHED'}
 
 
@@ -1063,5 +1111,5 @@ class HideSkeleton(bpy.types.Operator):
 
 
 classes = [StartTracking, StopTracking, CombineMotionData, AnimatePose, AnimateHand, BakeMotion,
-           ClearMoCapCache, SaveCapture, LoadCapture, VideoSelect,  ClearVideoPath,
+           ClearMoCapCache, SaveCapture, LoadCapture, VideoSelect,  ClearVideoPath, RemoveExtraView,
            ToggleCopyRotationConstraints, HideSkeleton]

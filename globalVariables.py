@@ -24,6 +24,11 @@ zlist_meta = []
 position_meta_raw = None
 position_missing_times = [] #explicit failed detections, in video/capture seconds
 zlist_missing_times = []
+# Further views of the same move (any direction), combined together with the front and side video.
+# One dict per tracked video: {"path", "name", "frames" (like zlist), "times", "vis", "meta",
+# "missing_times", "fps"}.
+extra_video_path = ""
+extra_views = []
 root = None #root empty to which the skeleton rig is parented
 pose_tracker = None
 

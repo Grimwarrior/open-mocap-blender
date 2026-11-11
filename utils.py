@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 import bpy
@@ -535,6 +536,8 @@ class VideoPlaneManager:
 # POSE TRACKING UTILITY
 # -------------------------------------------------------------
 class PoseTracking:
+    view = None         # the further view being tracked (mode "extra_pose"), else None
+
     def __init__(self, mode):
         self.detector = None
         self.mode = mode
@@ -551,12 +554,22 @@ class PoseTracking:
             self.path = gvar.front_video_path
         elif self.mode == "side_pose":
             self.path = gvar.side_video_path
+        elif self.mode == "extra_pose":
+            self.path = gvar.extra_video_path
         else:
             self.path = ""
 
         # A new take replaces the earlier one of the same view (appending a second run to the
         # first would double the take and restart its frame times half way)
-        if self.mode == "side_pose":
+        self.view = None
+        if self.mode == "extra_pose":
+            # A further view: tracking a video again replaces that video's view, another video adds one
+            gvar.extra_views[:] = [v for v in gvar.extra_views if v.get("path") != self.path]
+            if self.path:
+                self.view = {"path": self.path, "name": os.path.splitext(os.path.basename(self.path))[0],
+                             "frames": [], "times": [], "vis": [], "meta": [], "missing_times": [], "fps": 0}
+                gvar.extra_views.append(self.view)
+        elif self.mode == "side_pose":
             for lst in (gvar.zlist, gvar.zlist_times, gvar.zlist_vis, gvar.zlist_meta, gvar.zlist_missing_times):
                 lst.clear()
         else:
@@ -625,7 +638,9 @@ class PoseTracking:
             self.detector = create_pose_detector(fps=None if self.mode == "rt_pose" else gvar.fps)
             self.video_fps = gvar.fps or 30
             self.frame_index = -1
-            if self.mode == "side_pose":
+            if self.view is not None:
+                self.view["fps"] = self.video_fps
+            elif self.mode == "side_pose":
                 gvar.side_fps = self.video_fps
             else:
                 gvar.front_fps = self.video_fps
@@ -635,7 +650,10 @@ class PoseTracking:
         img, landmarksList = self.detector.find_pose(img, timestamp=frame_time)
 
         if not landmarksList:
-            missing = gvar.zlist_missing_times if self.mode == 'side_pose' else gvar.position_missing_times
+            if self.view is not None:
+                missing = self.view["missing_times"]
+            else:
+                missing = gvar.zlist_missing_times if self.mode == 'side_pose' else gvar.position_missing_times
             missing.append(frame_time)
             return img
 
@@ -693,7 +711,7 @@ class PoseTracking:
                 getattr(gvar, f"{side}_body_hand_positionList").append(flat)
                 getattr(gvar, f"{side}_body_hand_times").append(frame_time)
 
-        elif self.mode == "side_pose":
+        elif self.mode in ("side_pose", "extra_pose"):
             zframe = []
             for landmark in landmarksList:
                 normalized = MathUtility.normalize_coordinates(landmark, height, width, POSE_DEPTH_SCALE)
@@ -702,10 +720,16 @@ class PoseTracking:
             for point in extra_points:
                 zframe.extend(point)
 
-            gvar.zlist.append(zframe)
-            gvar.zlist_times.append(frame_time)
-            gvar.zlist_vis.append(vis)
-            gvar.zlist_meta.append(meta)
+            if self.view is not None:
+                self.view["frames"].append(zframe)
+                self.view["times"].append(frame_time)
+                self.view["vis"].append(vis)
+                self.view["meta"].append(meta)
+            elif self.mode == "side_pose":
+                gvar.zlist.append(zframe)
+                gvar.zlist_times.append(frame_time)
+                gvar.zlist_vis.append(vis)
+                gvar.zlist_meta.append(meta)
 
         return img
 

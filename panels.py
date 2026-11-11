@@ -141,6 +141,18 @@ class PoseTrackingPanel(bpy.types.Panel):
             layout.operator("object.start_tracking", text="Start Pose Tracking", icon='PLAY').track = "side_pose"
             layout.operator("object.clear_video_path", text="Delete Video", icon='X').video = "side_video_pose"
 
+            # Further views: any other direction, any number. Each is tracked once and kept in the list.
+            layout.separator()
+            layout.label(text="More Views")
+            for index, view in enumerate(gvar.extra_views):
+                row = layout.row(align=True)
+                row.label(text=f"{view.get('name', 'view')}: {len(view.get('frames', []))} frames", icon='CHECKMARK')
+                row.operator("object.open_mocap_remove_view", text="", icon='X').index = index
+            if gvar.extra_video_path:
+                layout.label(text=gvar.extra_video_path, icon='FILE_MOVIE')
+            layout.operator("object.open_mocap_filebrowser", text="Select Another View", icon='FILEBROWSER').video = "extra_video_pose"
+            layout.operator("object.start_tracking", text="Track This View", icon='PLAY').track = "extra_pose"
+
         #Settings
         layout.separator()
         layout.label(text="Settings")

@@ -69,3 +69,18 @@ The bake was also exercised in the user's running Blender 5.1: 65 bones, frames 
 with all 36 OM constraints muted afterward. Nine sampled poses matched the driven source
 to a maximum matrix-component difference of approximately 0.00057. This validates that
 specific bake, not every rig or the broader tracking pipeline. The blend file was not saved.
+
+## More than two views
+
+- `combine.combine_multi` takes the front video and any number of other views. With one view it
+  is `combine_improved`. `tests/test_multi_view.py` checks on the synthetic actor that a second
+  side camera lowers the depth error, that an opposite camera places joints the front view
+  hides, that an opposite view of another performance is left out, that a working view stands
+  in for a useless side video, and that views without depth are refused.
+- Each further view's direction is fitted to a first depth, not entered. A view whose motion no
+  direction explains is left out and named in the report (`report["views"]`).
+- Position (as opposed to depth) is taken from another view only for joints hidden in the front
+  view, and only when the views' heights agree like one performance filmed by several cameras.
+- Further views are tracked into `globalVariables.extra_views` (one entry per video; tracking a
+  video again replaces its entry) and saved in capture files as `extra_views`. The unit tests do
+  not cover the tracking, the panel or the operators.
