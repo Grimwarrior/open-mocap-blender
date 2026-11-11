@@ -413,6 +413,77 @@ def foot_contacts(ankle, leg_length, fps, confidence=None):
     return down
 
 
+# Heel and toe. The ankle alone cannot tell a foot that stands from one that turns on its ball, and
+# holding the ankle of a turning foot drags the whole leg. So the toe (ball of the foot) and the heel
+# are each tested for being down, with two thresholds: a point comes down when it is low and slow
+# (PLANT_POINT_HEIGHT, PLANT_POINT_SPEED) and stays down until it is clearly higher or faster (PLANT_RELEASE
+# times those), so jitter around one threshold cannot flicker the contact on and off. Then:
+# - flat: toe and heel down and the foot not turning (heading changing by less than PLANT_TURN
+#   degrees per second): the ankle is held still;
+# - on the ball: toe down, heel up or the foot turning: the toe is held and the ankle swings
+#   around it as the mocap's does;
+# - on the heel: heel down, toe up: the same about the heel;
+# - in the air: nothing is held.
+FOOT_POINTS = {"Left": (L_ANKLE, L_HEEL, L_TOE), "Right": (R_ANKLE, R_HEEL, R_TOE)}
+PLANT_POINT_HEIGHT = 0.1    # leg lengths above where the point last stood
+PLANT_POINT_SPEED = 0.4     # leg lengths per second
+PLANT_RELEASE = 1.5
+PLANT_FLOOR_WINDOW_S = 0.75  # "last stood": the lowest the point was within this time before and after
+PLANT_TURN = 45.0
+PLANT_TURN_SMOOTH_S = 0.15
+
+
+def point_contacts(point, leg_length, fps, confidence=None):
+    """:return: (N,) bool, True while this point of a foot (N, 3, z up) is down. See "Heel and toe"."""
+    n = len(point)
+    if n < 3 or leg_length <= 1e-9:
+        return np.zeros(n, dtype=bool)
+    a = _gauss_np(point, PLANT_SMOOTH_S * fps)
+    speed = np.linalg.norm(np.gradient(a, axis=0), axis=1) * fps
+    # Height above where this point last stood: the floor under a foot moves in the picture as
+    # the actor moves toward or away from the camera, so one floor height for the take will not do.
+    half = max(1, int(round(PLANT_FLOOR_WINDOW_S * fps)))
+    padded = np.pad(a[:, 2], half, mode="edge")
+    height = a[:, 2] - np.array([padded[i:i + 2 * half + 1].min() for i in range(n)])
+    reliable = np.ones(n, dtype=bool) if confidence is None else np.asarray(confidence) > 0.3
+    enter = (height < PLANT_POINT_HEIGHT * leg_length) & (speed < PLANT_POINT_SPEED * leg_length) & reliable
+    stay = ((height < PLANT_RELEASE * PLANT_POINT_HEIGHT * leg_length)
+            & (speed < PLANT_RELEASE * PLANT_POINT_SPEED * leg_length) & reliable)
+    down = np.zeros(n, dtype=bool)
+    for s, e in _runs(stay):                                # a stretch that stays down counts if it ever came down
+        if enter[s:e + 1].any():
+            down[s:e + 1] = True
+    for s, e in _runs(~down):                               # bridge short breaks
+        if s > 0 and e < n - 1 and e - s + 1 <= round(PLANT_GAP_S * fps):
+            down[s:e + 1] = reliable[s:e + 1]
+    for s, e in _runs(down):                                # drop short contacts
+        if e - s + 1 < max(2, round(PLANT_MIN_S * fps)):
+            down[s:e + 1] = False
+    runs = _runs(down)                                      # found in the same place again shortly after: one contact
+    for (s0, e0), (s1, e1) in zip(runs, runs[1:]):
+        apart = np.linalg.norm(np.median(a[s0:e0 + 1], axis=0) - np.median(a[s1:e1 + 1], axis=0))
+        if s1 - e0 - 1 <= round(PLANT_MERGE_S * fps) and apart < PLANT_MERGE_DIST * leg_length:
+            down[e0:s1 + 1] = reliable[e0:s1 + 1]
+    return down
+
+
+def foot_states(ankle, heel, toe, leg_length, fps, confidence=None):
+    """
+        :return: {"down", "flat", "ball", "heel"}: (N,) bool each. down = any of the other three.
+    """
+    toe_down = point_contacts(toe, leg_length, fps, confidence)
+    heel_down = point_contacts(heel, leg_length, fps, confidence)
+    way = _gauss_np(toe[:, :2] - heel[:, :2], PLANT_TURN_SMOOTH_S * fps)
+    heading = np.unwrap(np.arctan2(way[:, 1], way[:, 0]))
+    turning = np.abs(np.gradient(heading)) * fps > np.radians(PLANT_TURN)
+    flat = toe_down & heel_down & ~turning
+    for s, e in _runs(flat):                                # a flat moment too short to hold is part of the turn
+        if e - s + 1 < max(2, round(PLANT_MIN_S * fps)):
+            flat[s:e + 1] = False
+    ball = toe_down & ~flat
+    return {"down": toe_down | heel_down, "flat": flat, "ball": ball, "heel": heel_down & ~toe_down}
+
+
 FLOOR_SMOOTH_S = 0.3        # smoothing of the floor height and of the apparent leg length ...
 SIZE_SMOOTH_S = 0.5
 
@@ -422,7 +493,7 @@ def mocap_floor(empties, frames, fps, mirror):
         :return: (floor: the ankle height the mocap stands at over the take, {side: down mask},
                  floor per frame (N,), apparent leg length per frame (N,)), in the empties' local units.
     """
-    P = _true(empties, {L_HIP, L_KNEE, L_ANKLE, R_HIP, R_KNEE, R_ANKLE}, frames, mirror)
+    P = _true(empties, {L_HIP, L_KNEE, L_ANKLE, R_HIP, R_KNEE, R_ANKLE, L_HEEL, R_HEEL, L_TOE, R_TOE}, frames, mirror)
     legs = [np.linalg.norm(P[h] - P[k], axis=1) + np.linalg.norm(P[k] - P[a], axis=1)
             for h, k, a in ((L_HIP, L_KNEE, L_ANKLE), (R_HIP, R_KNEE, R_ANKLE))]
     size = (legs[0] + legs[1]) / 2
@@ -431,10 +502,15 @@ def mocap_floor(empties, frames, fps, mirror):
     padded = np.pad(size, half, mode="edge")
     size = np.array([np.median(padded[i:i + 2 * half + 1]) for i in range(len(size))])
     size = np.maximum(_gauss_np(size, SIZE_SMOOTH_S * fps), 0.5 * leg)
-    down = {side: foot_contacts(P[an], leg, fps, landmark_confidence(empties, frames, (an,)))
-            for side, an in (("Left", L_ANKLE), ("Right", R_ANKLE))}
+    states = {side: foot_states(P[an], P[heel], P[toe], leg, fps, landmark_confidence(empties, frames, (an, heel, toe)))
+              for side, (an, heel, toe) in FOOT_POINTS.items()}
+    down = {side: st["down"] for side, st in states.items()}
+    # The floor is where the ankle is while the foot stands flat (on its ball the ankle is higher)
+    level = {side: st["flat"] for side, st in states.items()}
+    if not any(m.any() for m in level.values()):
+        level = down
     z = {side: _gauss_np(P[an][:, 2], PLANT_SMOOTH_S * fps) for side, an in (("Left", L_ANKLE), ("Right", R_ANKLE))}
-    stacked = np.stack([np.where(down[side], z[side], np.inf) for side in ("Left", "Right")], axis=1)
+    stacked = np.stack([np.where(level[side], z[side], np.inf) for side in ("Left", "Right")], axis=1)
     lowest = stacked.min(axis=1)
     seen = np.isfinite(lowest)
     if seen.any():
@@ -475,6 +551,27 @@ def plant_foot(ankle, down, fps, floor=None, leg_length=0.0):
     return out
 
 
+def plant_ankle(ankle, heel, toe, states, fps, floor=None, leg_length=0.0):
+    """
+        The ankle path of a foot whose contacts are held (see "Heel and toe"): where the toe or the
+        heel is down it stays where it was, and the ankle keeps its place relative to it, which is
+        fixed while the foot stands flat and the mocap's own while it turns. Unchanged in the air.
+        :param ankle, heel, toe: (N, 3) paths of the rig-sized foot. :param states: from foot_states.
+    """
+    out = ankle.copy()
+    for anchor, held in ((toe, states["flat"] | states["ball"]), (heel, states["heel"])):
+        if not held.any():
+            continue
+        offset = ankle - anchor
+        steady = states["flat"] & held
+        if steady.any():
+            offset = plant_foot(offset, steady, fps)
+        out += plant_foot(anchor, held, fps) + offset - ankle
+    if states["flat"].any():                               # a flat foot stands on the floor
+        out = plant_foot(out, states["flat"], fps, floor, leg_length)
+    return out
+
+
 def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip_offsets, hips_lift,
                    plant, floor_data=None):
     """
@@ -490,7 +587,7 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
                  empties' local space, hips shift (N, 3) in the same space or None,
                  {side: share of frames the foot is held})
     """
-    idx = {i for v in LEG_IK_MAP.values() for i in v} | {HIP_C, SHOULDER_C}
+    idx = {i for v in LEG_IK_MAP.values() for i in v} | {i for v in FOOT_POINTS.values() for i in v} | {HIP_C, SHOULDER_C}
     P = _true(empties, idx, frames, mirror)
     frame = _body_frame(P[L_HIP] - P[R_HIP], P[SHOULDER_C] - P[HIP_C])
     lengths = {side: ((thigh_len[side] if isinstance(thigh_len, dict) else thigh_len) * ratio,
@@ -503,11 +600,9 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
     shift = np.zeros((n, 3))
     floor = None
     if floor_data is not None:
-        floor, down_masks, floor_now, size = floor_data
+        floor, _down, floor_now, size = floor_data
         shift[:, 2] = floor + (P[HIP_C][:, 2] - floor_now) * mean_leg / size - P[HIP_C][:, 2]
-    else:
-        down_masks = {side: foot_contacts(P[an], sum(lengths[side]), fps, landmark_confidence(empties, frames, (an,)))
-                      for side, (_h, _k, an) in LEG_IK_MAP.items()}
+    mocap_leg = float(np.median(np.linalg.norm(P[L_KNEE] - P[L_HIP], axis=1) + np.linalg.norm(P[L_ANKLE] - P[L_KNEE], axis=1)))
     hips = P[HIP_C] + shift + np.array([0.0, 0.0, hips_lift * ratio])
     sigma = REACH_SMOOTH_S * fps
     joints, ankles, held, share = {}, {}, {}, {}
@@ -519,8 +614,21 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
         own = _gauss_np(np.linalg.norm(P[k] - P[h], axis=1) + np.linalg.norm(P[an] - P[k], axis=1), sigma)
         bend = np.clip(np.linalg.norm(T, axis=1) / np.maximum(own, 1e-9), 0.3, 0.999)
         natural = joints[side] + (bend * (a + b))[:, None] * _unit(T)
-        down = down_masks[side] if plant else np.zeros(n, dtype=bool)
-        ankles[side] = plant_foot(natural, down, fps, floor, a + b) if down.any() else natural
+        _an, heel_i, toe_i = FOOT_POINTS[side]
+        down = np.zeros(n, dtype=bool)
+        ankles[side] = natural
+        if plant and heel_i in P and toe_i in P:
+            states = foot_states(P[an], P[heel_i], P[toe_i], mocap_leg, fps,
+                                 landmark_confidence(empties, frames, (an, heel_i, toe_i)))
+            down = states["down"]
+            if down.any():
+                grow = ((a + b) / np.maximum(own, 1e-9))[:, None]    # the foot at the rig's size, like the leg
+                ankles[side] = plant_ankle(natural, natural + (P[heel_i] - P[an]) * grow,
+                                           natural + (P[toe_i] - P[an]) * grow, states, fps, floor, a + b)
+        elif plant:                                                  # no heel and toe: the ankle alone
+            down = foot_contacts(P[an], mocap_leg, fps, landmark_confidence(empties, frames, (an,)))
+            if down.any():
+                ankles[side] = plant_foot(natural, down, fps, floor, a + b)
         held[side] = down
         share[side] = float(down.mean())
     # hips pulled toward held feet that are out of reach

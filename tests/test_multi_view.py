@@ -70,5 +70,20 @@ class MultiView(unittest.TestCase):
         self.assertEqual(len(report["views"]), 2)
 
 
+class RealCameras(unittest.TestCase):
+    """Cameras with perspective: nearer is bigger and, below the camera, lower in the picture."""
+
+    def test_perspective_is_not_mistaken_for_swapped_legs(self):
+        # Each camera sees the foot nearer to it lower, so two cameras disagree about which foot
+        # is lower exactly as a left/right label swap would. No labels are swapped here.
+        for distance in (5.0, 3.5):
+            take = synthetic_combine.make_take(seed=0, swap_bursts=0, camera_distance=distance, extra_angles=(270.0,))
+            frames, report = combine.combine_multi(take["front"], take["views"], take["tF"], take["visF"])
+            self.assertEqual(report["lr_switches"]["legs"], 0)
+            self.assertEqual(report["lr_switches"]["arms"], 0)
+            self.assertIn("depth", report["views"][1]["use"])
+            self.assertLess(synthetic_combine.evaluate(frames, take)["depth"], 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()

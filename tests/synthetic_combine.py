@@ -97,16 +97,26 @@ def true_motion(t, variation=0.0):
     return P
 
 
-def film(P, rng, angle=0.0, scale=1.0, noise=0.006, shift=(0.0, 0.0), swap_bursts=0, z_quality=0.25):
+def film(P, rng, angle=0.0, scale=1.0, noise=0.006, shift=(0.0, 0.0), swap_bursts=0, z_quality=0.25,
+         distance=None, camera_height=1.2):
     """
-        Orthographic camera turned `angle` degrees about the actor (0 = front, 90 = side).
+        Camera turned `angle` degrees about the actor (0 = front, 90 = side).
+        :param distance: metres from the camera to the middle of the stage: a real camera, in which
+                         whatever is nearer looks bigger and, below the camera's height, lower in
+                         the picture. None: no perspective (everything at one size).
         :return: (frames as flat lists like the tracker stores them, visibility (N, 40))
     """
     a = np.radians(angle)
     n = len(P)
-    X = (np.cos(a) * P[..., 0] - np.sin(a) * P[..., 1]) * UNIT / scale + shift[0]
+    across = np.cos(a) * P[..., 0] - np.sin(a) * P[..., 1]
     depth = np.sin(a) * P[..., 0] + np.cos(a) * P[..., 1]              # away from this camera
-    Y = -P[..., 2] * UNIT / scale + shift[1]
+    height = P[..., 2]
+    if distance:
+        near = distance / np.maximum(distance + depth, 0.5)
+        across = across * near
+        height = camera_height + (height - camera_height) * near
+    X = across * UNIT / scale + shift[0]
+    Y = -height * UNIT / scale + shift[1]
     # joints of the far arm / leg that lie behind the torso are hidden: low visibility, more noise
     vis = np.full((n, 40), 0.95)
     torso_d = depth[:, [33, 34]].mean(axis=1, keepdims=True)
@@ -132,8 +142,10 @@ def film(P, rng, angle=0.0, scale=1.0, noise=0.006, shift=(0.0, 0.0), swap_burst
 
 
 def make_take(seed=0, fps=30.0, duration=6.0, offset=0.4, side_angle=90.0, side_scale=1.3,
-              swap_bursts=3, separate=False, noise=0.006, extra_angles=()):
+              swap_bursts=3, separate=False, noise=0.006, extra_angles=(), camera_distance=None):
     """
+        :param camera_distance: metres from every camera to the stage (real cameras, each at its own
+                                height); None: no perspective.
         :param extra_angles: further cameras (degrees about the actor, 270 = the other side, 180 =
                              behind), each with its own start time and distance; with `separate`
                              each films its own performance.
@@ -148,8 +160,9 @@ def make_take(seed=0, fps=30.0, duration=6.0, offset=0.4, side_angle=90.0, side_
         side_motion = true_motion(tS + offset + 0.15 * np.sin(tS * 1.3), variation=1.0)
     else:
         side_motion = true_motion(tS + offset)
-    front, visF = film(truth, rng, 0.0, 1.0, noise)
-    side, visS = film(side_motion, rng, side_angle, side_scale, noise, shift=(0.7, 0.3), swap_bursts=swap_bursts)
+    front, visF = film(truth, rng, 0.0, 1.0, noise, distance=camera_distance, camera_height=1.3)
+    side, visS = film(side_motion, rng, side_angle, side_scale, noise, shift=(0.7, 0.3), swap_bursts=swap_bursts,
+                      distance=camera_distance and camera_distance * 1.2, camera_height=1.0)
     views = [dict(frames=side, times=tS + 0.0, vis=visS, name=f"side {side_angle:.0f}")]
     for k, angle in enumerate(extra_angles):
         start = 0.15 * (k + 1) * (-1) ** k
@@ -157,7 +170,8 @@ def make_take(seed=0, fps=30.0, duration=6.0, offset=0.4, side_angle=90.0, side_
             motion = true_motion(tS + start + 0.12 * np.sin(tS * 1.1 + k + 1), variation=0.6 + 0.3 * k)
         else:
             motion = true_motion(tS + start)
-        frames, vis = film(motion, rng, angle, 1.15 + 0.1 * k, noise, shift=(-0.4 + 0.3 * k, 0.2), swap_bursts=1)
+        frames, vis = film(motion, rng, angle, 1.15 + 0.1 * k, noise, shift=(-0.4 + 0.3 * k, 0.2), swap_bursts=1,
+                           distance=camera_distance and camera_distance * (0.9 + 0.15 * k), camera_height=1.1 + 0.2 * k)
         views.append(dict(frames=frames, times=tS + 0.0, vis=vis, name=f"view {angle:.0f}"))
     return dict(front=front, side=side, tF=tF, tS=tS + 0.0, visF=visF, visS=visS, truth=truth, fps=fps,
                 offset=-offset, views=views)
@@ -194,6 +208,7 @@ SCENARIOS = {
     "side at 70 deg": dict(side_angle=70.0, swap_bursts=2),
     "noisy tracker": dict(noise=0.012, swap_bursts=4),
     "separate takes": dict(separate=True, swap_bursts=1, offset=0.2),
+    "real cameras": dict(camera_distance=5.0),
 }
 
 
@@ -229,7 +244,7 @@ if __name__ == "__main__":
     show("Improved method", improved)
     failed = []
     for name in SCENARIOS:
-        if name != "separate takes" and improved[name]["depth"] > 0.8 * simple[name]["depth"]:
+        if name not in ("separate takes",) and improved[name]["depth"] > 0.8 * simple[name]["depth"]:
             failed.append(f"{name}: improved depth error {improved[name]['depth']:.2f}% is not clearly below "
                           f"the original's {simple[name]['depth']:.2f}%")
         if improved[name]["strike"] < 70:
