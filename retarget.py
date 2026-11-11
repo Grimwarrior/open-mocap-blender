@@ -145,9 +145,40 @@ def _smooth_directions(v, w, sigma, fallback):
     return out
 
 
+# Which way a knee or elbow points is read from how far the joint sits off the line from hip to
+# ankle (shoulder to wrist). On a limb that is all but straight that is less than the tracker's
+# jitter, and the joint would point anywhere and flip from frame to frame. So each frame counts by
+# how far off the line its joint is (fully from BEND_RELIABLE limb lengths on), the direction is the
+# weighted average over BEND_SMOOTH_S, and through a stretch of straight frames the limb keeps the
+# way it bent before and after. Only a limb that is straight for long falls back on the body's forward.
+BEND_RELIABLE = 0.12
+BEND_SMOOTH_S = 0.1
+
+
+def bend_direction(joint_offset, along, limb_length, hint, fps, confidence=None):
+    """
+        :param joint_offset: (N, 3) knee / elbow relative to the hip / shoulder.
+        :param along: (N, 3) unit vectors hip -> ankle (shoulder -> wrist).
+        :param limb_length: length of the limb's first bone, in the same units.
+        :param hint: (N, 3) direction to bend toward where nothing else is known.
+        :return: (N, 3) unit vectors across `along`: the side the joint bends to.
+    """
+    pole = joint_offset - np.sum(joint_offset * along, axis=1, keepdims=True) * along
+    hint = _unit(hint - np.sum(hint * along, axis=1, keepdims=True) * along)
+    weight = np.clip(np.linalg.norm(pole, axis=1) / max(BEND_RELIABLE * limb_length, 1e-9), 0.0, 1.0) ** 2
+    if confidence is not None:
+        weight = weight * np.asarray(confidence)
+    way = _smooth_directions(_unit(pole), weight + 1e-3, BEND_SMOOTH_S * fps, hint)
+    way = way - np.sum(way * along, axis=1, keepdims=True) * along
+    return _unit(way + 1e-3 * hint)
+
+
 def landmark_confidence(empties, frames, indices):
     """Confidence carried by this animated source, independent of the current capture cache."""
-    root = empties[0].parent
+    try:
+        root = empties[0].parent
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return np.ones(len(frames))  # not a take's landmark empties: nothing is known against them
     raw = root.get('open_mocap_metadata') if root is not None else None
     if not raw:
         return np.ones(len(frames))  # legacy animated sources have no confidence metadata
@@ -305,9 +336,8 @@ def arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, r
         d = np.linalg.norm(T, axis=1)
         t = _unit(T)
         d = np.clip(d, abs(a - b) * 1.02 + 1e-6, (a + b) * 0.999)
-        pole = E - np.sum(E * t, axis=1, keepdims=True) * t
-        hint = body_fwd - np.sum(body_fwd * t, axis=1, keepdims=True) * t
-        p = _unit(pole + 0.05 * a * _unit(hint))             # elbow side; body forward if the arm is straight
+        # elbow side; the body's forward if the arm is straight for long
+        p = bend_direction(E, t, a, body_fwd, fps, landmark_confidence(empties, frames, (s, e, w)))
         cos_a = np.clip((a * a + d * d - b * b) / (2 * a * d), -1.0, 1.0)
         upper = _unit(cos_a[:, None] * t + np.sqrt(1 - cos_a ** 2)[:, None] * p)
         fore = _unit(t * d[:, None] - a * upper)
@@ -655,10 +685,11 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
         T = ankles[side] - joint
         d = np.clip(np.linalg.norm(T, axis=1), abs(a - b) * 1.02 + 1e-6, reach)
         t = _unit(T)
-        K = _gauss_np(P[k] - P[h], sigma)                    # knee side, as the mocap leg bends
-        pole = K - np.sum(K * t, axis=1, keepdims=True) * t
-        hint = frame[2] - np.sum(frame[2] * t, axis=1, keepdims=True) * t
-        p = _unit(pole + 0.05 * a * _unit(hint))             # forward if the leg is straight
+        # knee side, as the mocap leg bends (its own hip-ankle line, like its own bend); forward if unknown
+        own_line = _unit(_gauss_np(P[_an] - P[h], sigma))
+        p = bend_direction(_gauss_np(P[k] - P[h], sigma), own_line, float(np.median(np.linalg.norm(P[k] - P[h], axis=1))),
+                           frame[2], fps, landmark_confidence(empties, frames, (h, k, _an)))
+        p = _unit(p - np.sum(p * t, axis=1, keepdims=True) * t)
         cos_a = np.clip((a * a + d * d - b * b) / (2 * a * d), -1.0, 1.0)
         thigh = _unit(cos_a[:, None] * t + np.sqrt(1 - cos_a ** 2)[:, None] * p)
         knee = joint + a * thigh

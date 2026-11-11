@@ -13,7 +13,8 @@
         air       how far the solved ankle is from the true path while the foot is in the air, cm
                   (holding a foot that should move shows here)
         contact   share of frames whose foot-down / foot-up state is found correctly, %
-        knee      mean error of the knee direction, degrees
+        knee      mean error of the knee direction, degrees (and while the leg is all but straight,
+                  where the tracker's jitter is larger than the bend it has to read the direction from)
         flips     knee direction jumps of more than 45 degrees between frames
 """
 
@@ -93,7 +94,7 @@ def true_motion(t):
     hips[:, 1] += 0.04 * np.sin(0.9 * t + 0.4)
     stance = np.linalg.norm(feet["Left"]["ankle"][:, :2] - feet["Right"]["ankle"][:, :2], axis=1)
     tall = np.sqrt(np.maximum((THIGH + SHIN) ** 2 - (stance / 2) ** 2, 0.2)) + SOLE
-    hips[:, 2] = tall * (0.9 - 0.12 * _ease(t, 2.0, 2.6) + 0.12 * _ease(t, 3.2, 3.6) + 0.097 * _ease(t, 6.5, 7.2))
+    hips[:, 2] = tall * (0.9 - 0.12 * _ease(t, 2.0, 2.6) + 0.12 * _ease(t, 3.2, 3.6) + 0.12 * _ease(t, 6.5, 7.2))
     body_yaw = 0.3 * np.sin(0.7 * t) + 0.5 * turn
     lat = np.stack([np.cos(body_yaw), np.sin(body_yaw), np.zeros(n)], axis=1)
     out["hips"] = hips
@@ -103,7 +104,7 @@ def true_motion(t):
         hip = hips + sign * HIP_HALF * lat
         an = feet[side]["ankle"]
         T = an - hip
-        d = np.clip(np.linalg.norm(T, axis=1), 0.05, (THIGH + SHIN) * 0.9995)
+        d = np.clip(np.linalg.norm(T, axis=1), 0.05, (THIGH + SHIN) * 0.9992)     # at the end: legs all but straight
         tdir = T / np.linalg.norm(T, axis=1, keepdims=True)
         c_, s_ = np.cos(yaw[side] + 0.25 * sign), np.sin(yaw[side] + 0.25 * sign)
         knee_way = np.stack([s_, -c_, np.zeros(n)], axis=1)          # knees point where the feet point, a little out
@@ -192,7 +193,7 @@ def evaluate(solved, truth, fps):
         rows["contact"].append(np.mean(solved["down"][side] == down_true) * 100)
         ang = np.degrees(np.arccos(np.clip(np.sum(so["pole"] * tr["pole"], axis=1), -1, 1)))
         rows["knee"].append(ang.mean())
-        straight = tr["bend"] > 160
+        straight = tr["bend"] > 170
         if straight.any():
             rows["knee_straight"].append(ang[straight].mean())
         step = np.degrees(np.arccos(np.clip(np.sum(so["pole"][1:] * so["pole"][:-1], axis=1), -1, 1)))

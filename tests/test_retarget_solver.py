@@ -31,9 +31,35 @@ class LegSolver(unittest.TestCase):
         self.assertLess(self.held["air"], self.loose["air"] + 2.0)
 
     def test_knees_point_the_right_way(self):
-        self.assertLess(self.held["knee"], 6.0)
-        self.assertLess(self.held["knee_straight"], 8.0)
+        self.assertLess(self.held["knee"], 4.0)
+        self.assertLess(self.held["knee_straight"], 5.0)
         self.assertLess(self.held["flips"], 1.0)
+
+    def test_straight_legs_keep_their_knee_direction_under_jitter(self):
+        noisy = bench.run(noise=0.012)
+        self.assertLess(noisy["knee_straight"], 9.0)             # 15.7 before bend_direction
+        self.assertLess(noisy["flips"], 1.0)
+
+
+class BendDirection(unittest.TestCase):
+    def test_straight_stretch_keeps_the_bend_from_before_and_after(self):
+        n = 90
+        along = np.tile([0.0, 0.0, -1.0], (n, 1))
+        rng = np.random.default_rng(1)
+        offset = np.tile([0.0, -0.12, -0.4], (n, 1))             # bent forward (-y) ...
+        offset[30:60, 1] = 0.0                                   # ... but straight in the middle,
+        offset[30:60, :2] += rng.normal(size=(30, 2)) * 0.01     # where only jitter is left
+        hint = np.tile([1.0, 0.0, 0.0], (n, 1))                  # a hint that points elsewhere
+        way = R.bend_direction(offset, along, 0.45, hint, 30.0)
+        self.assertGreater(float(np.min(way[:, 1] * -1.0)), 0.9)
+
+    def test_always_straight_limb_uses_the_hint(self):
+        n = 60
+        along = np.tile([0.0, 0.0, -1.0], (n, 1))
+        offset = np.tile([0.0, 0.0, -0.4], (n, 1))
+        hint = np.tile([0.0, -1.0, 0.0], (n, 1))
+        way = R.bend_direction(offset, along, 0.45, hint, 30.0)
+        self.assertGreater(float(np.min(way @ np.array([0.0, -1.0, 0.0]))), 0.99)
 
 
 class FootStates(unittest.TestCase):
