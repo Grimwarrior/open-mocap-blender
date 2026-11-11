@@ -400,15 +400,16 @@ class AnimatePose(bpy.types.Operator):
             return {'CANCELLED'}
         gvar.bones_list.clear()
         gvar.object_list.clear()
-        # --- Get or create collection ---
-        pose_empties_collection = utils.BlenderUtility.create_collection(context,"PoseEmpties")
-        root_collection = utils.BlenderUtility.create_collection(context,"RootEmpties")
+        # --- A collection of its own for this take (root and empties, skeleton) ---
+        video = os.path.splitext(os.path.basename(gvar.front_video_path or ""))[0]
+        _take, pose_empties_collection, skeleton_collection = utils.BlenderUtility.create_take_collections(
+            context, f"Mocap {video}" if video else "Mocap")
 
         # --- Create root empty ---
         root = bpy.data.objects.new("RigRoot", None)
         root.empty_display_type = 'SPHERE'
         root.empty_display_size = 1
-        root_collection.objects.link(root)
+        pose_empties_collection.objects.link(root)
         gvar.root = root
 
         # --- Create empties ---
@@ -430,7 +431,7 @@ class AnimatePose(bpy.types.Operator):
         ]
 
         # --- Create skeleton (with default Y tracking) ---
-        bones_created = utils.Skeleton.create_skeleton(context, bone_pairs, "pose")
+        bones_created = utils.Skeleton.create_skeleton(context, bone_pairs, "pose", skeleton_collection)
         # --- Apply configuration-specific adjustments ---
         # --- These adjustments help in smooth motion retargeting for specific bones---
         track_x_pairs = {(7,8), (11,12), (23,24)}
@@ -1110,7 +1111,12 @@ class HideSkeleton(bpy.types.Operator):
     #collection_name = "PoseEmpties", "PoseSkeleton", "RightHandEmpties", "RightHandSkeleton", "LeftHandEmpties", "LeftHandSkeleton" 
 
     def execute(self, context):
-        collection = bpy.data.collections.get(self.collection_name)
+        # The pose buttons act on the newest take's own collections (see create_take_collections);
+        # scenes animated before takes had collections of their own still have the shared ones
+        role = {"PoseEmpties": "Empties", "PoseSkeleton": "Skeleton"}.get(self.collection_name)
+        collection = utils.BlenderUtility.newest_take_part(role) if role else None
+        if collection is None:
+            collection = bpy.data.collections.get(self.collection_name)
         if collection:
             for obj in collection.objects:
                 obj.hide_set(not obj.hide_get())

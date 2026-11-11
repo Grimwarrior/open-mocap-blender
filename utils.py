@@ -411,7 +411,50 @@ class BlenderUtility:
             named_collection = bpy.data.collections.new(collection_name)
             context.scene.collection.children.link(named_collection)
         return named_collection
-    
+
+    # Every Animate run gets a collection of its own ("Mocap <video name>", numbered by Blender when the
+    # name is taken), holding one collection for the root and its landmark empties and one for the
+    # skeleton meshes. TAKE_PROP on the take collection counts the runs, so the newest take is known;
+    # TAKE_ROLE_PROP on the parts says which is which.
+    TAKE_PROP = "open_mocap_take"
+    TAKE_ROLE_PROP = "open_mocap_take_role"
+
+    @staticmethod
+    def create_take_collections(context, name):
+        """
+            A new take collection under the scene with "Empties" and "Skeleton" collections inside.
+            :return: (take, empties, skeleton) collections.
+        """
+        index = 1 + max((c.get(BlenderUtility.TAKE_PROP, 0) for c in bpy.data.collections), default=0)
+        take = bpy.data.collections.new(name)
+        take[BlenderUtility.TAKE_PROP] = index
+        context.scene.collection.children.link(take)
+        parts = []
+        for role in ("Empties", "Skeleton"):
+            part = bpy.data.collections.new(f"{take.name} {role}")
+            part[BlenderUtility.TAKE_ROLE_PROP] = role
+            take.children.link(part)
+            parts.append(part)
+        return take, parts[0], parts[1]
+
+    @staticmethod
+    def newest_take_part(role):
+        """The "Empties" or "Skeleton" collection of the newest take, or None if there is no take."""
+        takes = [c for c in bpy.data.collections if c.get(BlenderUtility.TAKE_PROP)]
+        if not takes:
+            return None
+        take = max(takes, key=lambda c: c[BlenderUtility.TAKE_PROP])
+        return next((c for c in take.children if c.get(BlenderUtility.TAKE_ROLE_PROP) == role), None)
+
+    @staticmethod
+    def move_to_collection(obj, collection):
+        """Link obj to `collection` only (an operator that adds an object links it to the active one)."""
+        if collection not in obj.users_collection:
+            collection.objects.link(obj)
+        for other in list(obj.users_collection):
+            if other != collection:
+                other.objects.unlink(obj)
+
 
 
 # -------------------------------------------------------------
@@ -987,13 +1030,14 @@ class HandTracking:
 # -----------------------------------------------------------------------
 class Skeleton:
     @staticmethod
-    def create_skeleton(context, bone_pairs, mode):
+    def create_skeleton(context, bone_pairs, mode, collection=None):
         """
         Creates bones.
         Bone = Line (with skin modifier) between specified pair of empties 'empty_a' and 'empty_b'.
         Each bone has a DAMPED_TRACK constraint to its target 'empty_b' with default Y-axis tracking. This is head of the bone.
         Each bone is paranted to other empty: 'empty_a'. This is tail of the bone.
         :param bone_pairs: It is a list of tuples (a,b) where a and b are index of 'empty_a' and 'empty_b'.
+        :param collection: Collection for the bones (default: the shared one of the mode).
         :return: A list of (a, b, obj) tuples for further configuration. obj is the bone object.
         """
         bones_created = []
@@ -1004,26 +1048,26 @@ class Skeleton:
                 empty_b = gvar.object_list[b]
                 bone_list = gvar.bones_list
                 # --- Get or create collection ---
-                skeleton_collection = BlenderUtility.create_collection(context,"PoseSkeleton")
+                skeleton_collection = collection or BlenderUtility.create_collection(context,"PoseSkeleton")
             elif mode == "R_hand":
                 empty_a = gvar.R_hand_object_list[a]
                 empty_b = gvar.R_hand_object_list[b]
                 bone_list = gvar.R_hand_bones_list
                 # --- Get or create collection ---
-                skeleton_collection = BlenderUtility.create_collection(context,"RightHandSkeleton")
+                skeleton_collection = collection or BlenderUtility.create_collection(context,"RightHandSkeleton")
             else:
                 empty_a = gvar.L_hand_object_list[a]
                 empty_b = gvar.L_hand_object_list[b]
                 bone_list = gvar.L_hand_bones_list
                 # --- Get or create collection ---
-                skeleton_collection = BlenderUtility.create_collection(context,"LeftHandSkeleton")
+                skeleton_collection = collection or BlenderUtility.create_collection(context,"LeftHandSkeleton")
             loc_a = empty_a.matrix_world.translation
             loc_b = empty_b.matrix_world.translation
 
             # --- Create cube and extrude towards target ---
             bpy.ops.mesh.primitive_cube_add(size=1, location=loc_a)
             obj = context.active_object
-            skeleton_collection.objects.link(obj)
+            BlenderUtility.move_to_collection(obj, skeleton_collection)
             obj.name = f"hand_bone_{a}_{b}"
 
             bpy.ops.object.mode_set(mode='EDIT')
