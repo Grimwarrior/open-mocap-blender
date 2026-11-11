@@ -310,7 +310,9 @@ class CombineMotionData(bpy.types.Operator):
                 # A camera of unknown make: a horizontal field of view stands in for its focal length
                 width, height = gvar.front_width or 1920, gvar.front_height or 1080
                 combined, prep = combine.correct_perspective(
-                    combined, combine.focal_from_fov(width, scene.combine_fov), horizon=-height / 200.0)
+                    combined, combine.focal_from_fov(width, scene.combine_fov), horizon=-height / 200.0,
+                    confidence=[m['depth_confidence'] for m in combined_meta],
+                    bone_strength=scene.combine_bone_strength, fps=gvar.front_fps or gvar.fps or 30.0)
                 lo, hi = prep["perspective_factor"]
                 print(f"[Open Mocap]   perspective corrected ({scene.combine_fov:.0f} deg field of view, "
                       f"size factor {lo:.2f}..{hi:.2f})")

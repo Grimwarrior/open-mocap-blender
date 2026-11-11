@@ -575,8 +575,13 @@ SOLVE_ROUNDS = 3
 SOLVE_SMOOTH = 1.5
 
 
-def _solve_skeleton(F, D, weight, strength, fps=30.0):
-    """Depths with bone lengths kept, all joints solved together (front x/y unchanged)."""
+def _solve_skeleton(F, D, weight, strength, fps=30.0, lengthen=None, lengthen_segments=None):
+    """
+        Depths with bone lengths kept, all joints solved together (front x/y unchanged).
+        :param lengthen: SOLVE_LENGTHEN for this solve (None: the constant).
+        :param lengthen_segments: segments that may be pushed out (None: all).
+    """
+    lengthen = SOLVE_LENGTHEN if lengthen is None else lengthen
     if strength <= 0:
         return D
     persp = front_perspective_scale(F, fps)
@@ -602,7 +607,8 @@ def _solve_skeleton(F, D, weight, strength, fps=30.0):
             too_long = np.abs(rel) > reach
             sure = np.clip((np.abs(lean) - SOLVE_LEAN_MIN * length) / np.maximum((SOLVE_LEAN_FULL - SOLVE_LEAN_MIN) * length, 1e-9),
                            0.0, 1.0)
-            pull = SOLVE_BONE_WEIGHT * strength * np.where(too_long, 1.0, SOLVE_LENGTHEN * sure)
+            push = lengthen if lengthen_segments is None or (p, c) in lengthen_segments else 0.0
+            pull = SOLVE_BONE_WEIGHT * strength * np.where(too_long, 1.0, push * sure)
             step = np.where(too_long, np.sign(rel), np.sign(lean)) * reach
             A[:, ip, ip] += pull
             A[:, ic, ic] += pull
@@ -1133,6 +1139,22 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
 # in picture units at the hips' own distance, which is what d / Z is made of.
 PERSPECTIVE_FOV = 60.0        # default horizontal field of view of the front camera (degrees)
 PERSPECTIVE_FACTOR_RANGE = (0.6, 1.6)  # the correction never moves a point by more than this
+# Leg lengths after the correction. A leg reaching away from the camera looks short twice over: it is
+# foreshortened and, being further away, smaller. The bone-length solve inside the combine sees the
+# picture before this correction, where "too short" is often just "further away", so it never pushes
+# a bone out in depth (SOLVE_LENGTHEN = 0). Once the perspective is out, a leg bone that is still too
+# short while it clearly leans toward or away from the camera is missing depth: the skeleton is solved
+# again, pulling in what is too long as before and pushing the legs out by PERSPECTIVE_LENGTHEN. Legs
+# only: pushing out the arms too lowers the error with distant cameras but raises it with a close one,
+# and shakes more. Re-solving only the legs' own bones was worse (3.5 m: 4.54%) than the whole skeleton.
+# Joint depths move, x and y do not.
+# Whirlpool Front + LTR, frame 63 (one foot well behind the other), legs left/right:
+#   no correction 1.63/1.95, corrected 1.74/1.81, corrected + legs solved 1.83/1.83; take-wide left/right
+#   ratio p10..p90 0.83..1.13 -> 0.91..1.08 -> 0.96..1.04, joint jerk 0.0160 -> 0.0158 -> 0.0162.
+# Synthetic actor, depth error in % of body height, corrected -> + legs solved: camera at 6 m
+#   2.91 -> 2.86, 5 m 3.38 -> 3.36, 3.5 m 4.25 -> 4.39.
+PERSPECTIVE_LENGTHEN = 0.3
+PERSPECTIVE_LENGTHEN_SEGMENTS = {(23, 25), (25, 27), (24, 26), (26, 28)}
 
 
 def focal_from_fov(width_px, fov_deg):
@@ -1151,7 +1173,7 @@ def _unproject_xy(XY, D, focal, horizon):
     return out
 
 
-def correct_perspective(frames, focal, horizon=0.0):
+def correct_perspective(frames, focal, horizon=0.0, confidence=None, bone_strength=0.0, fps=30.0):
     """
         Undo the front camera's perspective on a combined take.
         :param frames: combined frames (flat 40 * [x, y, depth]); depth positive = away from the camera
@@ -1159,6 +1181,8 @@ def correct_perspective(frames, focal, horizon=0.0):
         :param focal: front camera's focal length in tracker units (see focal_from_fov); <= 0 = no change.
         :param horizon: y of the camera's horizon (tracker units; y is -height/100 from the picture's
                         bottom, so a level camera has -picture_height / 200).
+        :param confidence: (N, 40) depth confidence of the combine (its report's metadata); with
+                           bone_strength > 0 the legs are then solved again (PERSPECTIVE_LENGTHEN).
         :return: (frames, report dict with the factor range)
     """
     P = _as_array(frames)
@@ -1166,6 +1190,11 @@ def correct_perspective(frames, focal, horizon=0.0):
         return [list(f) for f in frames], {"perspective_factor": (1.0, 1.0)}
     P = P.copy()
     P[:, :, :2] = _unproject_xy(P[:, :, :2], P[:, :, 2], focal, horizon)
+    if confidence is not None and bone_strength > 0 and PERSPECTIVE_LENGTHEN > 0:
+        weight = np.clip(np.asarray(confidence, dtype=np.float64), 0.0, 1.0)
+        if weight.shape == P.shape[:2]:
+            P[:, :, 2] = _solve_skeleton(P, P[:, :, 2].copy(), weight, bone_strength, fps, PERSPECTIVE_LENGTHEN,
+                                         PERSPECTIVE_LENGTHEN_SEGMENTS)
     rel = P[:, :, 2] - P[:, [HIP_C], 2]
     factor = np.clip(1.0 + rel / focal, *PERSPECTIVE_FACTOR_RANGE)
     return P.reshape(len(P), -1).tolist(), {"perspective_factor": (float(factor.min()), float(factor.max()))}

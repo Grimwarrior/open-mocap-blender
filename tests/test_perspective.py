@@ -54,6 +54,31 @@ class Perspective(unittest.TestCase):
         take, frames = self.combined(5.0)
         self.assertEqual(combine.correct_perspective(frames, 0.0)[0], frames)
 
+    def legs(self, frames):
+        c = np.asarray(frames).reshape(len(frames), 40, 3)
+        b = combine.to_blender(c[:, :, :2], c[:, :, 2])
+        leg = lambda a, k, e: np.linalg.norm(b[:, k] - b[:, a], axis=1) + np.linalg.norm(b[:, e] - b[:, k], axis=1)
+        return leg(23, 25, 27), leg(24, 26, 28)
+
+    def test_legs_are_solved_again_after_the_correction(self):
+        take = synthetic_combine.make_take(seed=1, camera_distance=4.0)
+        frames, rep = combine.combine_improved(take["front"], take["side"], take["tF"], take["tS"],
+                                               take["visF"], take["visS"])
+        conf = [m["depth_confidence"] for m in rep["metadata"]]
+        plain, _ = combine.correct_perspective(frames, 4.0 * UNIT, horizon=-1.3 * UNIT)
+        solved, _ = combine.correct_perspective(frames, 4.0 * UNIT, horizon=-1.3 * UNIT, confidence=conf,
+                                                bone_strength=0.8)
+        spread = lambda f: float(np.std(np.log(np.divide(*self.legs(f)))))
+        self.assertLess(spread(solved), spread(plain))
+        a, b = np.asarray(plain).reshape(-1, 40, 3), np.asarray(solved).reshape(-1, 40, 3)
+        np.testing.assert_allclose(a[:, :, :2], b[:, :, :2])               # only depth is solved
+
+    def test_without_confidence_the_depth_is_unchanged(self):
+        take, frames = self.combined(4.0)
+        fixed, _ = combine.correct_perspective(frames, 4.0 * UNIT, horizon=-1.3 * UNIT, bone_strength=0.8)
+        np.testing.assert_allclose(np.asarray(fixed).reshape(-1, 40, 3)[:, :, 2],
+                                   np.asarray(frames).reshape(-1, 40, 3)[:, :, 2])
+
     def test_focal_from_field_of_view(self):
         # 1920 px wide, 60 degrees across: f = 960 / tan(30 deg) = 1663 px
         self.assertAlmostEqual(combine.focal_from_fov(1920, 60.0), 16.628, places=2)
