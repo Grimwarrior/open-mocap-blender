@@ -101,6 +101,61 @@ class FootYaw(unittest.TestCase):
         self.assertAlmostEqual(float(diff), 5.0, places=3)
 
 
+class SpineAndNeck(unittest.TestCase):
+    n = 5
+
+    def frame(self, lean_deg):
+        """Mocap chest frame of a torso leaning lean_deg forward (forward = -y, left = +x)."""
+        a = np.radians(lean_deg)
+        up = np.tile([0.0, -np.sin(a), np.cos(a)], (self.n, 1))
+        lat = np.tile([1.0, 0.0, 0.0], (self.n, 1))
+        return lat, up, np.cross(lat, up)
+
+    def lean(self, v):
+        return np.degrees(np.arctan2(-v[:, 1], v[:, 2]))
+
+    def test_neutral_neck_gives_the_rest_neck(self):
+        frame = self.frame(10.0)
+        a = np.radians(10.0 + R.NECK_NEUTRAL_DEG)
+        neck = np.tile([0.0, -np.sin(a), np.cos(a)], (self.n, 1))
+        out = R.neck_direction(neck, frame, (0.0, 1.0, 0.0))
+        np.testing.assert_allclose(self.lean(out), 10.0, atol=1e-9)        # rest neck: along the torso
+
+    def test_neck_takes_its_share_of_a_lean_beyond_neutral(self):
+        frame = self.frame(0.0)
+        a = np.radians(R.NECK_NEUTRAL_DEG + 40.0)
+        neck = np.tile([0.0, -np.sin(a), np.cos(a)], (self.n, 1))
+        out = R.neck_direction(neck, frame, (0.0, 1.0, 0.0), share=0.5)
+        np.testing.assert_allclose(self.lean(out), 20.0, atol=1e-9)
+
+    def test_sideways_neck_tilt_turns_the_neck_sideways(self):
+        frame = self.frame(0.0)
+        tilt = np.radians(30.0)
+        neck = np.tile([np.sin(tilt), 0.0, np.cos(tilt)], (self.n, 1))
+        out = R.neck_direction(neck, frame, (0.0, 1.0, 0.0), neutral_deg=0.0, share=0.5)
+        np.testing.assert_allclose(np.degrees(np.arcsin(out[:, 0])), 15.0, atol=1e-6)
+
+    def test_spine_keeps_its_rest_curve_and_the_upright_actor_gives_the_rest_pose(self):
+        n = self.n
+        P = {R.HIP_C: np.zeros((n, 3)), R.SHOULDER_C: np.tile([0.0, 0.0, 1.0], (n, 1)),
+             R.L_HIP: np.tile([0.2, 0.0, 0.0], (n, 1)), R.R_HIP: np.tile([-0.2, 0.0, 0.0], (n, 1)),
+             R.L_SHOULDER: np.tile([0.3, 0.0, 1.0], (n, 1)), R.R_SHOULDER: np.tile([-0.3, 0.0, 1.0], (n, 1)),
+             R.EAR_C: np.tile([0.0, -np.sin(np.radians(R.NECK_NEUTRAL_DEG)) * 0.3,
+                               1.0 + np.cos(np.radians(R.NECK_NEUTRAL_DEG)) * 0.3], (n, 1))}
+        back = np.radians(-7.0)
+        rests = {"Spine": (0.0, np.cos(back), np.sin(back)), "Spine2": (0.0, 1.0, 0.0), "Neck": (0.0, 1.0, 0.0)}
+        saved = R._true, R.landmark_confidence
+        R._true = lambda _e, idx, _f, _m: {i: P[i].copy() for i in idx}
+        R.landmark_confidence = lambda _e, f, _i: np.ones(len(f))
+        try:
+            out = R.spine_directions(None, np.arange(n, dtype=float), 30.0, False, rests)
+        finally:
+            R._true, R.landmark_confidence = saved
+        np.testing.assert_allclose(self.lean(out["Spine"][1]), -7.0, atol=1e-6)    # leans back as at rest
+        np.testing.assert_allclose(self.lean(out["Spine2"][1]), 0.0, atol=1e-6)
+        np.testing.assert_allclose(self.lean(out["Neck"][1]), 0.0, atol=1e-6)      # head over the chest
+
+
 class FootStates(unittest.TestCase):
     def setUp(self):
         self.fps = 30.0

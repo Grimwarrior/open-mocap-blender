@@ -377,6 +377,75 @@ def _from_components(c, frame):
     return c[0] * lat + c[1] * up + c[2] * fwd
 
 
+# Spine and neck. Every spine bone used to aim along the mocap hip -> shoulder line. That straightens
+# the rig's own spine curve and stands its hip -> shoulder line where the actor's is, but a rig's rest
+# pose need not have its shoulders over its hips: Mixamo characters often stand with them several
+# degrees back, while an upright person's are about over the hips. The rig then leaned forward by that
+# much more than the actor. Now each bone keeps its rest direction relative to the rig's upright
+# (lateral, vertical, forward components) and that frame is turned onto the mocap's, vertical onto the
+# hip -> shoulder line: an upright actor gives the rig's rest spine, and a lean adds to it.
+# The neck: in a person standing straight the shoulder -> ear line leans NECK_NEUTRAL_DEG ahead of the
+# torso (15 to 20 degrees in the profile views of the Whirlpool take), while a Mixamo neck stands
+# straight up from the chest, so copying the line pushed the head out front. The neck takes NECK_SHARE
+# of how far that line turns away from its neutral, starting from its rest direction. The head's own
+# orientation still comes from the face (head_directions), so where it looks is unchanged.
+SPINE_KEEP_REST = True
+NECK_NEUTRAL_DEG = 17.0
+NECK_SHARE = 0.5
+NECK_SMOOTH_S = 0.1
+SPINE_LINES = {"Hips": "hips", "Spine": "hips", "Spine1": "shoulders", "Spine2": "shoulders", "Neck": "shoulders"}
+
+
+def _rotate(v, axis, angle):
+    """v (N, 3) turned about unit axes (N, 3) by angles (N,) (Rodrigues)."""
+    c, s = np.cos(angle)[:, None], np.sin(angle)[:, None]
+    return v * c + np.cross(axis, v) * s + axis * np.sum(axis * v, axis=1, keepdims=True) * (1.0 - c)
+
+
+def neck_direction(neck, frame, rest, neutral_deg=NECK_NEUTRAL_DEG, share=NECK_SHARE):
+    """
+        :param neck: (N, 3) mocap shoulder centre -> ear centre. :param frame: mocap chest body frame.
+        :param rest: rig rest neck direction as body frame components.
+        :return: (N, 3) unit neck direction: rest, turned by `share` of the neck line's turn from neutral.
+    """
+    lat, up, fwd = frame
+    a = np.radians(neutral_deg)
+    neutral = np.cos(a) * up + np.sin(a) * fwd
+    neck = _unit(neck)
+    axis = np.cross(neutral, neck)
+    s = np.linalg.norm(axis, axis=1)
+    angle = np.where(s > 1e-9, np.arctan2(s, np.sum(neutral * neck, axis=1)) * share, 0.0)
+    axis = axis / np.maximum(s, 1e-12)[:, None]
+    return _unit(_rotate(_unit(_from_components(rest, frame)), axis, angle))
+
+
+def spine_directions(empties, frames, fps, mirror, rests):
+    """
+        :param rests: {bone short name: its rest direction (Y axis) as components of the rig's upright
+                      body frame}; the "Neck" is turned as neck_direction says.
+        :return: {short: (origin, direction)} as (N, 3) arrays in the empties' local space.
+    """
+    idx = {HIP_C, SHOULDER_C, EAR_C, L_HIP, R_HIP, L_SHOULDER, R_SHOULDER}
+    P = _true(empties, idx, frames, mirror)
+    torso = P[SHOULDER_C] - P[HIP_C]
+    body = {"hips": _body_frame(P[L_HIP] - P[R_HIP], torso),
+            "shoulders": _body_frame(P[L_SHOULDER] - P[R_SHOULDER], torso)}
+    flip = np.array([1.0, -1.0 if mirror else 1.0, 1.0])
+    out = {}
+    for short, comp in rests.items():
+        frame = body[SPINE_LINES.get(short, "hips")]
+        if short == "Neck":
+            confidence = landmark_confidence(empties, frames, (SHOULDER_C, EAR_C))
+            direction = neck_direction(P[EAR_C] - P[SHOULDER_C], frame, comp)
+            direction = _smooth_directions(direction, confidence + 1e-3, NECK_SMOOTH_S * fps, direction)
+            origin = P[SHOULDER_C]
+        else:
+            direction = _unit(_from_components(comp, frame))
+            origin = P[HIP_C]
+        out[short] = (origin * flip, direction * flip)
+    return out
+
+
 # Feet. Copying the direction of thigh and shin leaves the rig's feet wherever its own proportions
 # and the tracker's jitter take them: a standing foot slides and bobs. "Foot Position" instead solves
 # each leg for the rig's own thigh and shin lengths so that the ankle goes where the mocap ankle is,
@@ -1626,6 +1695,22 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
     solved = set(reach_bones) if arm_mode == 'POSITION' else set()
     if solve_legs:
         solved |= {s + n for s in ("Left", "Right") for n in ("UpLeg", "Leg")}
+    # Spine and neck keep the rig's own rest curve (see "Spine and neck")
+    if SPINE_KEEP_REST and len(frames) >= 2 and find_bone(rig, "LeftUpLeg") and find_bone(rig, "RightUpLeg"):
+        rests = {}
+        for short in SPINE_LINES:
+            pb = drive_bone(rig, short)
+            if pb is not None:
+                y_axis = (mw.to_3x3() @ pb.bone.matrix_local.to_3x3()).col[1].normalized()
+                rests[short] = _rig_components(rig, y_axis, "LeftUpLeg", "RightUpLeg")
+        for short, (origin, direction) in spine_directions(empties, frames, fps, mirror_depth, rests).items():
+            pb = drive_bone(rig, short)
+            c = pb.constraints.new('DAMPED_TRACK')
+            c.name = PREFIX + "Aim"
+            c.target = _keyed_far_point(coll, points, f"OM_spine_{short}", origin, direction, frames)
+            c.track_axis = 'TRACK_Y'
+            mapped.append(pb.name)
+            solved.add(short)
     for short, (a, b) in AIM_MAP.items():
         if short in solved:
             continue                                        # see "Arm reach" and "Feet"
