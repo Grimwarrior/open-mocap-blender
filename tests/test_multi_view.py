@@ -85,5 +85,50 @@ class RealCameras(unittest.TestCase):
             self.assertLess(synthetic_combine.evaluate(frames, take)["depth"], 5.0)
 
 
+class SkeletonSolve(unittest.TestCase):
+    """Bone lengths kept by solving all joints together instead of clipping bone by bone."""
+
+    def errors(self, solve, **take_args):
+        saved = combine.SKELETON_SOLVE
+        combine.SKELETON_SOLVE = solve
+        try:
+            rows = []
+            for seed in range(3):
+                take = synthetic_combine.make_take(seed=seed, **take_args)
+                frames, _ = combine.combine_improved(take["front"], take["side"], take["tF"], take["tS"],
+                                                     take["visF"], take["visS"])
+                rows.append(synthetic_combine.evaluate(frames, take))
+            return {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
+        finally:
+            combine.SKELETON_SOLVE = saved
+
+    def test_steadier_than_clipping_and_no_less_accurate(self):
+        for args, slack in ((dict(), 0.95), (dict(noise=0.012, swap_bursts=4), 1.0), (dict(camera_distance=5.0), 1.03)):
+            clip, solve = self.errors(False, **args), self.errors(True, **args)
+            self.assertLess(solve["depth"], slack * clip["depth"], args)
+            self.assertLess(solve["jitter"], 0.9 * clip["jitter"], args)
+            self.assertGreater(solve["strike"], clip["strike"] - 3.0, args)
+
+    def test_strength_zero_changes_nothing(self):
+        take = synthetic_combine.make_take(seed=0)
+        F = combine._as_array(take["front"])
+        D = F[:, :, 2].copy()
+        self.assertIs(combine._solve_skeleton(F, D, np.ones(D.shape), 0.0), D)
+
+    def test_hips_keep_their_depth(self):
+        take = synthetic_combine.make_take(seed=0)
+        saved = combine.SKELETON_SOLVE
+        combine.SKELETON_SOLVE = False
+        try:
+            frames, _ = combine.combine_improved(take["front"], take["side"], take["tF"], take["tS"],
+                                                 take["visF"], take["visS"], bone_strength=0.0)
+        finally:
+            combine.SKELETON_SOLVE = saved
+        P = combine._as_array(frames)
+        D = P[:, :, 2].copy()
+        out = combine._solve_skeleton(P, D, np.ones(D.shape), 1.0)
+        self.assertLess(float(np.abs(out[:, combine.HIP_C] - D[:, combine.HIP_C]).max()), 0.05)
+
+
 if __name__ == "__main__":
     unittest.main()

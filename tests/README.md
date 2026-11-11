@@ -84,3 +84,21 @@ specific bake, not every rig or the broader tracking pipeline. The blend file wa
 - Further views are tracked into `globalVariables.extra_views` (one entry per video; tracking a
   video again replaces its entry) and saved in capture files as `extra_views`. The unit tests do
   not cover the tracking, the panel or the operators.
+
+## Perspective, the leg solver and the skeleton solve
+
+- `synthetic_combine.make_take(camera_distance=...)` films with real cameras: nearer is bigger
+  and, below the camera, lower in the picture. The earlier scenarios have no perspective and
+  could not show errors that come from it (false leg swaps, a floor that moves in the picture).
+- `tests/synthetic_retarget.py` is the same idea for the retarget's leg solver: an actor who
+  steps, lunges, crouches and turns on the ball of one foot, with known contacts and knee
+  directions. Run it directly for the table; `tests/test_retarget_solver.py` holds the limits.
+  It drives `mocap_floor` and `leg_directions` with mocked Blender; it does not build
+  constraints, pose a rig or bake.
+- Foot contacts use heel and toe, each with separate thresholds for coming down and lifting
+  off, relative to where that point last stood. Flat feet are held; a foot on its ball keeps its
+  toe in place. Knee and elbow direction is weighted by how far the joint is off the limb's line
+  and carried through straight stretches (`bend_direction`).
+- `combine._solve_skeleton` replaces bone-by-bone clipping (`SKELETON_SOLVE`): all joint depths
+  are solved together per frame against confidence and bone lengths. Bones that are too short
+  are not pushed out (`SOLVE_LENGTHEN = 0`): that helps without perspective and hurts with a close camera.

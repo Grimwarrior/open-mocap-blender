@@ -548,6 +548,79 @@ def _segment_lengths(F, D, weight, persp):
     return out
 
 
+# Constant bone lengths, solved for the whole skeleton at once. _enforce_bone_lengths below walks
+# out from the hips and moves only the far end of each bone that is too long, so whatever is wrong
+# with a shoulder's depth is paid for by the elbow and then the wrist. Here every joint's depth is
+# an unknown, held to its measured depth by how well it was seen (SOLVE_MIN_TRUST at least) and to
+# its neighbours by the bones between them: one small linear system per frame, re-posed
+# SOLVE_ROUNDS times because the depth step a bone asks for depends on which way it leans.
+# A bone that is too long is pulled in, stiffly (SOLVE_BONE_WEIGHT against a trust of at most 1).
+# A bone that is too short can be pushed out by SOLVE_LENGTHEN of that, and not at all while it
+# leans less than SOLVE_LEAN_MIN of its length toward or away from the camera, where its direction
+# is not known: pushing out either way is what made limbs pop front to back when every bone was
+# set to its exact length. It is off (0). Measured on the synthetic actor: without perspective
+# 0.3 lowers the depth error (1.08 -> 0.93% of body height), but a real camera shows a near limb
+# longer than a far one, "too short" is then often just "further away", and at 3.5 m it raises the
+# error (4.1 -> 4.9%). Pulling in only is as good as or better than bone-by-bone clipping at every
+# camera distance tried but one, and steadier at all of them.
+# The correction, not the depth, is smoothed over SOLVE_SMOOTH frames.
+SKELETON_SOLVE = True
+SOLVE_BONE_WEIGHT = 20.0
+SOLVE_LENGTHEN = 0.0
+SOLVE_LEAN_MIN = 0.1
+SOLVE_LEAN_FULL = 0.3
+SOLVE_MIN_TRUST = 0.05
+SOLVE_ROOT_TRUST = 100.0
+SOLVE_ROUNDS = 3
+SOLVE_SMOOTH = 1.5
+
+
+def _solve_skeleton(F, D, weight, strength, fps=30.0):
+    """Depths with bone lengths kept, all joints solved together (front x/y unchanged)."""
+    if strength <= 0:
+        return D
+    persp = front_perspective_scale(F, fps)
+    lengths = _segment_lengths(F, D, weight, persp)
+    joints = sorted({j for seg in SEGMENTS for j in seg})
+    at = {j: i for i, j in enumerate(joints)}
+    n, m = len(D), len(joints)
+    measured = D[:, joints]
+    trust = np.clip(weight[:, joints], SOLVE_MIN_TRUST, 1.0)
+    trust[:, at[HIP_C]] = SOLVE_ROOT_TRUST                    # the hips' own depth is not this solve's business
+    Z = measured.copy()
+    for _ in range(SOLVE_ROUNDS):
+        A = np.zeros((n, m, m))
+        b = trust * measured
+        A[:, np.arange(m), np.arange(m)] = trust
+        for p, c in SEGMENTS:
+            ip, ic = at[p], at[c]
+            dxy = np.linalg.norm(F[:, c, :2] - F[:, p, :2], axis=1)
+            length = lengths[(p, c)] * persp
+            reach = np.sqrt(np.maximum(0.0, length * length - dxy ** 2))
+            rel = Z[:, ic] - Z[:, ip]
+            lean = _gauss(rel, 1.5)
+            too_long = np.abs(rel) > reach
+            sure = np.clip((np.abs(lean) - SOLVE_LEAN_MIN * length) / np.maximum((SOLVE_LEAN_FULL - SOLVE_LEAN_MIN) * length, 1e-9),
+                           0.0, 1.0)
+            pull = SOLVE_BONE_WEIGHT * strength * np.where(too_long, 1.0, SOLVE_LENGTHEN * sure)
+            step = np.where(too_long, np.sign(rel), np.sign(lean)) * reach
+            A[:, ip, ip] += pull
+            A[:, ic, ic] += pull
+            A[:, ip, ic] -= pull
+            A[:, ic, ip] -= pull
+            b[:, ic] += pull * step
+            b[:, ip] -= pull * step
+        Z = np.linalg.solve(A, b[:, :, None])[:, :, 0]
+    Dn = D.copy()
+    Dn[:, joints] = measured + _gauss(Z - measured, SOLVE_SMOOTH)
+    for anchor, followers in FOLLOWERS.items():
+        for f in followers:
+            Dn[:, f] = D[:, f] - D[:, anchor] + Dn[:, anchor]
+    for c, (a, b_) in CENTROIDS.items():
+        Dn[:, c] = (Dn[:, a] + Dn[:, b_]) / 2
+    return Dn
+
+
 def _enforce_bone_lengths(F, D, weight, strength, fps=30.0):
     """Shorten the depth step of segments that come out too long (front x/y unchanged)."""
     if strength <= 0:
@@ -810,7 +883,7 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     persp = front_perspective_scale(F_out, fps)
     report["perspective_range"] = (float(persp.min()), float(persp.max()))
     report["bone_cv_before"] = bone_length_cv(to_blender(F_out, D), persp=persp)
-    D = _enforce_bone_lengths(F_out, D, w_eff, bone_strength, fps)
+    D = (_solve_skeleton if SKELETON_SOLVE else _enforce_bone_lengths)(F_out, D, w_eff, bone_strength, fps)
     report["bone_cv_after"] = bone_length_cv(to_blender(F_out, D), persp=persp)
     report["facing"] = facing_score(to_blender(F_out, D))
 
