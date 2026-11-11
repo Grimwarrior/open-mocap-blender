@@ -84,7 +84,7 @@ LR_SWITCH_PENALTY = 0.2   # extra cost for changing the left/right labelling, pe
 LR_FIX_GROUPS = ("arms", "legs")  # label groups the left/right fix may swap (not the head)
 LR_SWAP_BIAS = 0.005      # extra cost of a swapped frame per joint, in body heights
 MIN_SYNC_GAIN = 0.075     # a time shift must raise the sync match by this much over no shift
-MIN_SYNC_MATCH = 0.3      # below this, the found offset is not trusted and 0 is used
+MIN_SYNC_MATCH = 0.3      # below this, reject automatic fusion; manual offset remains available
 WARP_BAND_S = 1.0         # time warp: how far (s) the side timing may drift from the constant offset
 WARP_SLOPE_PENALTY = 0.3  # time warp: cost of speeding up / slowing down the side take for a frame
 WARP_SMOOTH_S = 0.15      # time warp: smoothing of the found timing (s)
@@ -99,6 +99,9 @@ FUSE_MAX_HEIGHT_ERR = 2.5  # ... only if the views' heights agree this well (% o
 FUSE_FRONT_VIS = 0.5      # ... front visibility below which that starts (and side visibility above which)
 FUSE_VIS_RANGE = 0.3      # ... and the range over which it blends in
 GAP_FILL_S = 0.1          # occluded joints: side depth borrowed from frames within about this time
+SAME_PLANE_SLOPE = 0.85   # side x follows front x this closely (1 = the same or the opposite view):
+                          # the two views are less than about 30 degrees from one line and hold no depth
+MAX_INTERP_GAP_S = 0.12   # longer missing intervals must not look like measured side motion
 
 
 # -------------------------------------------------------------
@@ -149,6 +152,41 @@ def _interp(tq, ts, values):
     for c in range(flat.shape[1]):
         out[:, c] = np.interp(tq, ts, flat[:, c])
     return out.reshape((len(tq),) + values.shape[1:])
+
+
+def interpolation_support(tq, ts):
+    """Confidence in time interpolation; zero outside coverage and inside long dropouts."""
+    tq, ts = np.asarray(tq), np.asarray(ts)
+    if not len(ts):
+        return np.zeros(len(tq))
+    right = np.clip(np.searchsorted(ts, tq), 0, len(ts) - 1)
+    left = np.maximum(right - 1, 0)
+    distance = np.minimum(np.abs(tq - ts[left]), np.abs(tq - ts[right]))
+    exact = distance < 1e-7
+    cadence = 1.0 / _fps(ts)
+    span = ts[right] - ts[left]
+    inside = (tq >= ts[0]) & (tq <= ts[-1])
+    short = span <= MAX_INTERP_GAP_S
+    # Normal interpolation between adjacent frames is fully supported; missing samples decay.
+    support = np.exp(-np.maximum(0.0, distance - cadence / 2) / max(cadence, 1e-6))
+    return np.where(exact, 1.0, np.where(inside & short, support, 0.0))
+
+
+def _gauss_timed(values, times, sigma, **kwargs):
+    """Filter on a regular time grid without smoothing across long missing intervals."""
+    if sigma <= 0 or len(times) < 3:
+        return values.copy()
+    fps = _fps(times)
+    out = values.copy()
+    breaks = np.flatnonzero(np.diff(times) > max(MAX_INTERP_GAP_S, 1.5 / fps)) + 1
+    for indices in np.split(np.arange(len(times)), breaks):
+        if len(indices) < 3:
+            continue
+        t = times[indices]
+        grid = np.linspace(t[0], t[-1], max(3, int(round((t[-1] - t[0]) * fps)) + 1))
+        filtered = _gauss(_interp(grid, t, values[indices]), sigma, **kwargs)
+        out[indices] = _interp(t, grid, filtered)
+    return out
 
 
 def _zscore(v):
@@ -241,6 +279,7 @@ def _offset_score(tF, sigF, tS, sigS, d, durF, durS):
     """(score, correlation) of the height signals with side time = front time + d."""
     tq = tF + d
     valid = (tq >= tS[0]) & (tq <= tS[-1])
+    valid &= interpolation_support(tq, tS) > 0
     if valid.sum() < 8:
         return -np.inf, 0.0
     sS = _interp(tq[valid], tS, sigS)
@@ -549,21 +588,44 @@ def estimate_view_angle(F, U, w, valid, fps):
     return best, best_cv, cv90
 
 
-def _fill_gaps(rel, w, fps):
+def view_slope(F, U, w, valid):
+    """
+        How much of the side view's x is just the front view's x: the slope of side x on front x
+        (both about the hips, limbs only), which is cos(angle between the views). About 0 for a
+        real side view, +1 for a second video from the same side, -1 for one from the opposite
+        side. Unlike estimate_view_angle this does not need the depth, so it also works where no
+        depth exists.
+    """
+    joints = np.arange(11, 33)
+    x = F[:, joints, 0] - F[:, [HIP_C], 0]
+    u = U[:, joints] - U[:, [HIP_C]]
+    ww = w[:, joints] * valid[:, None]
+    den = float(np.sum(ww * x * x))
+    return float(np.sum(ww * x * u) / den) if den > 1e-9 else 0.0
+
+
+def _fill_gaps(rel, w, fps, times=None):
     """
         Side depth (relative to the hips) for joints the side view lost for a moment: interpolated
         from neighbouring frames where the joint was seen. :return: (filled, confidence 0..1)
     """
     sigma = max(1.0, GAP_FILL_S * fps)
-    num = _gauss(rel * w, sigma)
-    den = _gauss(w, sigma)
+    num = _gauss(rel * w, sigma) if times is None else _gauss_timed(rel * w, times, sigma)
+    den = _gauss(w, sigma) if times is None else _gauss_timed(w, times, sigma)
     filled = num / np.maximum(den, 1e-6)
     conf = np.clip(den / 0.5, 0.0, 1.0)
+    if times is not None:
+        # A wide filter may borrow across a whole missing interval. Only bridge short gaps
+        # bounded by observations of this joint, never extrapolate past the take's coverage.
+        for j in range(w.shape[1]):
+            seen = w[:, j] > 0.5
+            conf[:, j] *= interpolation_support(times, times[seen]) if seen.any() else 0.0
     return filled, conf
 
 
 def combine_improved(front_list, side_list, front_times, side_times, front_vis=None, side_vis=None,
-                     smoothing=1.5, bone_strength=0.8, offset=None, sync="OFFSET", side_angle=None):
+                     smoothing=1.5, bone_strength=0.8, offset=None, sync="OFFSET", side_angle=None,
+                     front_depth_confidence=None):
     """
         :param front_list/side_list: tracked frames (flat 40 * [x, y, z]).
         :param front_times/side_times: time of each tracked frame in its own video (seconds).
@@ -574,7 +636,9 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
         :param sync: 'OFFSET' one time offset (both videos filmed at the same time), 'WARP' time warp
                      on top of the offset (two separate performances of the same move).
         :param side_angle: angle between the views in degrees; None = estimate it.
-        :return: (combined frames as flat lists, report dict)
+        :param front_depth_confidence: separate depth reliability; omitted for legacy captures.
+        :return: (frames as flat lists, report dict). When report['combined'] is False, frames
+                 are the unchanged front take; callers must not commit a new combined capture.
     """
     F = _as_array(front_list)
     S_raw = _as_array(side_list)
@@ -582,16 +646,30 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     tS = np.asarray(side_times, dtype=np.float64)
     visF = np.asarray(front_vis, dtype=np.float64) if front_vis is not None else np.ones((len(F), N_PTS))
     visS_raw = np.asarray(side_vis, dtype=np.float64) if side_vis is not None else np.ones((len(S_raw), N_PTS))
+    depth_conf = np.asarray(front_depth_confidence, dtype=float) if front_depth_confidence is not None else visF.copy()
+    for points, times, visibility in ((F, tF, visF), (S_raw, tS, visS_raw)):
+        if (len(points) < 2 or times.shape != (len(points),) or visibility.shape != points.shape[:2]
+                or not np.isfinite(points).all() or not np.isfinite(times).all()
+                or not np.isfinite(visibility).all() or np.any(np.diff(times) <= 0)):
+            raise ValueError('Combine needs finite landmarks, matching confidence and increasing timestamps')
+    if depth_conf.shape != visF.shape or not np.isfinite(depth_conf).all():
+        raise ValueError('Depth confidence does not match the front capture')
+    depth_conf = np.clip(depth_conf, 0.0, 1.0)
+    visF, visS_raw = np.clip(visF, 0.0, 1.0), np.clip(visS_raw, 0.0, 1.0)
     fps = _fps(tF)
-    report = {}
+    report = {'combined': True}
 
     # 1. Sync: one offset, then optionally a time warp for drifting timing
     if offset is None:
         offset, sync_corr = find_time_offset(tF, F, tS, S_raw)
         report["sync_trusted"] = sync_corr >= MIN_SYNC_MATCH
         if not report["sync_trusted"]:
-            offset = 0.0                      # no clear match: assume the videos start together
+            report.update(combined=False, sync_corr=sync_corr,
+                          reason='Automatic synchronization is unreliable. Set a manual offset or use another take.')
+            return F.reshape(len(F), -1).tolist(), report
     else:
+        if not np.isfinite(offset):
+            raise ValueError('The manual offset must be finite')
         sync_corr = float("nan")
         report["sync_trusted"] = True
     tq = tF + offset
@@ -599,6 +677,11 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     if sync == "WARP" and report["sync_trusted"] and len(tF) >= 20 and len(tS) >= 20:
         tq, report["sync_mode"] = time_warp(tF, F, tS, S_raw, offset), "warp"
     valid = (tq >= tS[0]) & (tq <= tS[-1])
+    support = interpolation_support(tq, tS)
+    valid &= support > 0
+    if valid.sum() < 8:
+        report.update(combined=False, reason='Too little supported overlap between the two takes.')
+        return F.reshape(len(F), -1).tolist(), report
     S = _interp(tq, tS, S_raw)
     visS = _interp(tq, tS, visS_raw) * valid[:, None]
     drift = tq - tF - offset
@@ -631,7 +714,20 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
 
     # 4. View angle, then side x -> depth with the sign that makes the body right-handed
     U = S[:, :, 0] * scale[:, None]
-    w = _side_weight(visS)
+    w = _side_weight(visS) * support[:, None]
+    w = np.minimum(w, w[:, [HIP_C]])  # relative depths also depend on a usable side hip centre
+    # Two videos from the same side, or from opposite sides, show the same plane twice: there is
+    # no depth in them, and any angle fitted to them turns the actor's travel across the picture
+    # into travel in depth. A given angle is the user's decision and is not second-guessed.
+    report["view_slope"] = view_slope(F, U, w, valid)
+    if side_angle is None and abs(report["view_slope"]) > SAME_PLANE_SLOPE:
+        apart = float(np.degrees(np.arccos(np.clip(report["view_slope"], -1.0, 1.0))))
+        which = "the same side" if report["view_slope"] > 0 else "opposite sides"
+        report.update(combined=False, sync_corr=sync_corr, reason=(
+            f"The two videos show the actor from {which} (about {apart:.0f} degrees apart), so they "
+            "hold no depth. Use a second video filmed about 90 degrees from the first: for an actor "
+            "moving across the picture, one where he moves toward or away from the camera."))
+        return F.reshape(len(F), -1).tolist(), report
     if side_angle is None:
         angle, _, _ = estimate_view_angle(F, U, w, valid, fps)
     else:
@@ -649,15 +745,14 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     #    the front view's own depth (calibrated against the side depth) only where neither helps
     root = depth_side[:, HIP_C].copy()
     if valid.any() and not valid.all():
-        idx = np.arange(len(F))
-        root = np.interp(idx, idx[valid], root[valid])
+        root = np.interp(tF, tF[valid], root[valid])
     side_rel = depth_side - root[:, None]
     if GAP_FILL_S > 0:
-        filled, conf = _fill_gaps(side_rel, w, fps)
+        filled, conf = _fill_gaps(side_rel, w, fps, tF)
     else:
         filled, conf = side_rel, np.zeros_like(w)
     zF_rel = F[:, :, 2] - F[:, [HIP_C], 2]
-    good = (w > 0.8) & (visF > 0.5)
+    good = (w > 0.8) & (depth_conf > 0.5)
     k = 4.0
     if good.sum() > 50:
         x, y = zF_rel[good], side_rel[good]
@@ -667,6 +762,14 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
             corr = float(np.corrcoef(x, y)[0, 1]) if x.std() > 1e-9 and y.std() > 1e-9 else 0.0
             k = float(np.clip(k_fit, -8, 8)) if abs(corr) > 0.2 else 4.0 * (1 if k_fit >= 0 else -1)
     fallback = k * zF_rel
+    fallback_conf = depth_conf.copy()
+    for j in range(N_PTS):
+        seen = depth_conf[:, j] > 0
+        missing = ~seen
+        if seen.any() and missing.any():
+            fallback[missing, j] = np.interp(tF[missing], tF[seen], fallback[seen, j])
+            fallback_conf[missing, j] = (np.interp(tF[missing], tF[seen], depth_conf[seen, j])
+                                          * interpolation_support(tF[missing], tF[seen]))
     rest = conf * filled + (1 - conf) * fallback
     D = root[:, None] + w * side_rel + (1 - w) * rest
     report["fallback_share"] = float(np.mean((1 - w[:, :33]) * (1 - conf[:, :33])))
@@ -674,8 +777,8 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     w_eff = w + (1 - w) * conf
 
     # 6. Smoothing
-    D = _gauss(D, smoothing, peaks=SMOOTH_PEAKS)
-    XY = _gauss(F[:, :, :2], smoothing / 2, peaks=SMOOTH_PEAKS)
+    D = _gauss_timed(D, tF, smoothing, peaks=SMOOTH_PEAKS)
+    XY = _gauss_timed(F[:, :, :2], tF, smoothing / 2, peaks=SMOOTH_PEAKS)
     F_out = F.copy()
     F_out[:, :, :2] = XY
 
@@ -688,10 +791,23 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     report["facing"] = facing_score(to_blender(F_out, D))
 
     F_out[:, :, 2] = D
+    output_conf = np.clip(w + (1 - w) * (conf + (1 - conf) * fallback_conf), 0, 1)
+    # Root translation in depth comes from the side camera; body shape can still fall back
+    # to the front tracker, but an unsupported root must not become a confident 3D sample.
+    output_conf *= np.maximum(w[:, [HIP_C]], conf[:, [HIP_C]])
+    nearest = np.clip(np.searchsorted(tS, tq), 0, len(tS) - 1)
+    exact = np.minimum(np.abs(tq - tS[nearest]), np.abs(tq - tS[np.maximum(nearest - 1, 0)])) < 1e-7
+    report['metadata'] = [
+        {'depth_confidence': output_conf[i].tolist(), 'xy_source': 'front_or_fused', 'depth_source': 'combined',
+         'depth_state': ['missing' if output_conf[i, j] <= 0 else
+                         ('observed' if w[i, j] > 0.5 and exact[i] else 'interpolated') for j in range(N_PTS)]}
+        for i in range(len(F))]
     return F_out.reshape(len(F_out), -1).tolist(), report
 
 
 def format_report(r):
+    if not r.get('combined', True):
+        return r['reason']
     sw = r.get("lr_switches", {})
     match = "manual" if r["sync_corr"] != r["sync_corr"] else f"match {r['sync_corr']:.2f}"
     sync = f"side offset {r['offset_s']:+.2f}s ({match})"

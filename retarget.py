@@ -15,14 +15,17 @@
 """
 
 import math
+import json
 import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 from . import globalVariables as gvar
+from . import combine
 
 
 PREFIX = "OM "
 HELPER_COLLECTION = "OpenMocapRetarget"
+HELPER_OWNER = "open_mocap_owner"
 STASH_PROP = "open_mocap_stashed_action"
 FAR = 10000.0
 
@@ -142,6 +145,30 @@ def _smooth_directions(v, w, sigma, fallback):
     return out
 
 
+def landmark_confidence(empties, frames, indices):
+    """Confidence carried by this animated source, independent of the current capture cache."""
+    root = empties[0].parent
+    raw = root.get('open_mocap_metadata') if root is not None else None
+    if not raw:
+        return np.ones(len(frames))  # legacy animated sources have no confidence metadata
+    try:
+        data = json.loads(raw)
+        source_frames = np.asarray(data['frames'], dtype=float)
+        vis = np.asarray(data['visibility'], dtype=float)
+        meta = data.get('metadata', [])
+        if len(source_frames) == 0 or vis.shape != (len(source_frames), 40):
+            return np.ones(len(frames))
+        if len(meta) == len(source_frames):
+            depth = np.asarray([m['depth_confidence'] for m in meta], dtype=float)
+            vis = np.minimum(vis, depth)
+        scores = np.min(vis[:, list(indices)], axis=1)
+        fps = max(float(data['fps']), 1e-6)
+        support = combine.interpolation_support(np.asarray(frames) / fps, source_frames / fps)
+        return np.clip(np.interp(frames, source_frames, scores) * support, 0.0, 1.0)
+    except (KeyError, TypeError, ValueError):
+        return np.zeros(len(frames))  # damaged new metadata is not a reliable measurement
+
+
 def arm_directions(empties, frames, fps):
     """
         Per frame and side, in the landmark empties' local space: elbow bend direction for the upper
@@ -153,9 +180,10 @@ def arm_directions(empties, frames, fps):
     sigma = HAND_SMOOTH_S * fps
     up = P[SHOULDER_C] - P[HIP_C]
     body_fwd = _unit(np.cross(P[L_HIP] - P[R_HIP], up))
-    ones = np.ones(len(frames))
     out = {}
     for side, (s, e, w, i, p) in ARM_MAP.items():
+        limb_conf = landmark_confidence(empties, frames, (s, e, w))
+        hand_conf = landmark_confidence(empties, frames, (w, i, p))
         upper, fore = P[e] - P[s], P[w] - P[e]
         u_dir, f_dir = _unit(upper), _unit(fore)
         # elbow: the forearm's direction away from the upper arm line, plus the body's forward
@@ -163,7 +191,7 @@ def arm_directions(empties, frames, fps):
         bend = np.linalg.norm(curl, axis=1) / np.maximum(np.linalg.norm(fore, axis=1), 1e-9)   # sin(bend)
         hint = _unit(body_fwd - np.sum(body_fwd * u_dir, axis=1, keepdims=True) * u_dir)
         curl = _unit(_unit(curl) * bend[:, None] + ELBOW_FORWARD_HINT * hint)
-        curl = _smooth_directions(curl, ones, sigma, hint)
+        curl = _smooth_directions(curl, limb_conf, sigma, hint)
         # hand direction, bend from the forearm limited
         hand = _unit((P[i] + P[p]) / 2 - P[w])
         cos_b = np.clip(np.sum(hand * f_dir, axis=1), -1.0, 1.0)
@@ -172,13 +200,13 @@ def arm_directions(empties, frames, fps):
             lim = np.radians(WRIST_MAX_BEND)
             perp = _unit(hand - cos_b[:, None] * f_dir)
             hand[over] = (np.cos(lim) * f_dir + np.sin(lim) * perp)[over]
-        hand = _smooth_directions(hand, ones, sigma, f_dir)
+        hand = _smooth_directions(hand, hand_conf, sigma, f_dir)
         # palm side: index -> pinky across the hand, weighted by how long (reliable) it is
         across = P[p] - P[i]
         across = across - np.sum(across * hand, axis=1, keepdims=True) * hand
         rel = np.linalg.norm(across, axis=1) / np.maximum(np.linalg.norm(fore, axis=1), 1e-9)
         weight = np.clip(rel / PALM_RELIABLE, 0.0, 1.0) ** 2
-        palm = _smooth_directions(_unit(across), weight + 1e-3, sigma, curl)
+        palm = _smooth_directions(_unit(across), (weight + 1e-3) * hand_conf, sigma, curl)
         palm = _unit(palm - np.sum(palm * hand, axis=1, keepdims=True) * hand)
         out[side] = (P[w], P[e], curl, hand, palm)
     return out
@@ -209,14 +237,15 @@ def head_directions(empties, frames, fps):
     ratio = np.linalg.norm(up, axis=1) / np.maximum(np.linalg.norm(across, axis=1), 1e-9)
     usual = float(np.median(ratio)) or 1.0
     weight = np.clip(1.0 - np.abs(ratio - usual) / usual, 0.0, 1.0) ** 2
+    confidence = landmark_confidence(empties, frames, idx)
     neck = _unit(P[EAR_C] - P[SHOULDER_C])
-    up = _smooth_directions(_unit(up), weight + 1e-3, HEAD_SMOOTH_S * fps, neck)
+    up = _smooth_directions(_unit(up), (weight + 1e-3) * confidence, HEAD_SMOOTH_S * fps, neck)
     fwd = P[NOSE] - P[EAR_C]
     fwd = fwd - np.sum(fwd * up, axis=1, keepdims=True) * up
     # a nose (nearly) on the ear line gives no direction: such frames borrow from their neighbours
     reach = np.linalg.norm(fwd, axis=1) / np.maximum(np.linalg.norm(across, axis=1), 1e-9)
     w_fwd = np.clip(reach / (float(np.median(reach)) or 1.0), 0.0, 1.0) ** 2
-    fwd = _smooth_directions(_unit(fwd), w_fwd + 1e-3, HEAD_SMOOTH_S * fps, _unit(np.cross(left, up)))
+    fwd = _smooth_directions(_unit(fwd), (w_fwd + 1e-3) * confidence, HEAD_SMOOTH_S * fps, _unit(np.cross(left, up)))
     fwd = _unit(fwd - np.sum(fwd * up, axis=1, keepdims=True) * up)
     return P[EAR_C], up, fwd
 
@@ -240,7 +269,7 @@ def arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, r
                          shoulders=None, grip='NONE'):
     """
         Two-bone solve per frame. :param upper_len, fore_len, rig_torso, rig_shoulder_width: rig
-        lengths (any one unit).
+        lengths (any one unit); upper_len/fore_len accept per-side dictionaries or legacy scalars.
         :param shoulders: {side: (N, 3) upper arm head} from the collar bones; None: half the rig's
                           shoulder width out along the mocap shoulder line.
         :param grip: 'RIGHT' / 'LEFT': both hands hold one thing and that hand leads. The other
@@ -253,7 +282,6 @@ def arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, r
     P = {i: np.array([tuple(local_location(empties[i], f)) for f in frames]) for i in idx}
     mocap_torso = float(np.median(np.linalg.norm(P[SHOULDER_C] - P[HIP_C], axis=1)))
     r = mocap_torso / max(rig_torso, 1e-9)                  # mocap units per rig unit
-    a, b = upper_len * r, fore_len * r
     half = 0.5 * rig_shoulder_width * r
     sigma = REACH_SMOOTH_S * fps
     body_fwd = _unit(np.cross(P[L_HIP] - P[R_HIP], P[SHOULDER_C] - P[HIP_C]))
@@ -266,6 +294,8 @@ def arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, r
         wrists[other] = wrists[lead] + usual * _unit(_gauss_np(rel, GRIP_SMOOTH_S * fps))
     out = {}
     for side, (s, e, w) in ARM_IK_MAP.items():
+        a = (upper_len[side] if isinstance(upper_len, dict) else upper_len) * r
+        b = (fore_len[side] if isinstance(fore_len, dict) else fore_len) * r
         if shoulders is not None and side in shoulders:
             rig_shoulder = shoulders[side]
         else:
@@ -357,7 +387,7 @@ def _runs(mask):
     return [(int(a), int(b)) for a, b in zip(np.where(edges == 1)[0], np.where(edges == -1)[0] - 1)]
 
 
-def foot_contacts(ankle, leg_length, fps):
+def foot_contacts(ankle, leg_length, fps, confidence=None):
     """:return: (N,) bool, True while the foot of this ankle (N, 3, z up) is down."""
     n = len(ankle)
     if n < 3 or leg_length <= 1e-9:
@@ -366,9 +396,11 @@ def foot_contacts(ankle, leg_length, fps):
     speed = np.linalg.norm(np.gradient(a, axis=0), axis=1) * fps
     floor = np.percentile(a[:, 2], 10)
     down = (a[:, 2] < floor + PLANT_HEIGHT * leg_length) & (speed < PLANT_SPEED * leg_length)
+    reliable = np.ones(n, dtype=bool) if confidence is None else np.asarray(confidence) > 0.3
+    down &= reliable
     for s, e in _runs(~down):                               # bridge short breaks
         if s > 0 and e < n - 1 and e - s + 1 <= round(PLANT_GAP_S * fps):
-            down[s:e + 1] = True
+            down[s:e + 1] = reliable[s:e + 1]
     for s, e in _runs(down):                                # drop short contacts
         if e - s + 1 < max(2, round(PLANT_MIN_S * fps)):
             down[s:e + 1] = False
@@ -377,7 +409,7 @@ def foot_contacts(ankle, leg_length, fps):
     for (s0, e0), (s1, e1) in zip(runs, runs[1:]):
         apart = np.linalg.norm(np.median(a[s0:e0 + 1], axis=0) - np.median(a[s1:e1 + 1], axis=0))
         if s1 - e0 - 1 <= round(PLANT_MERGE_S * fps) and apart < PLANT_MERGE_DIST * leg_length:
-            down[e0:s1 + 1] = True
+            down[e0:s1 + 1] = reliable[e0:s1 + 1]
     return down
 
 
@@ -399,7 +431,8 @@ def mocap_floor(empties, frames, fps, mirror):
     padded = np.pad(size, half, mode="edge")
     size = np.array([np.median(padded[i:i + 2 * half + 1]) for i in range(len(size))])
     size = np.maximum(_gauss_np(size, SIZE_SMOOTH_S * fps), 0.5 * leg)
-    down = {side: foot_contacts(P[an], leg, fps) for side, an in (("Left", L_ANKLE), ("Right", R_ANKLE))}
+    down = {side: foot_contacts(P[an], leg, fps, landmark_confidence(empties, frames, (an,)))
+            for side, an in (("Left", L_ANKLE), ("Right", R_ANKLE))}
     z = {side: _gauss_np(P[an][:, 2], PLANT_SMOOTH_S * fps) for side, an in (("Left", L_ANKLE), ("Right", R_ANKLE))}
     stacked = np.stack([np.where(down[side], z[side], np.inf) for side in ("Left", "Right")], axis=1)
     lowest = stacked.min(axis=1)
@@ -446,7 +479,8 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
                    plant, floor_data=None):
     """
         Two-bone solve of both legs per frame.
-        :param ratio: mocap units per rig unit. :param thigh_len, shin_len: rig lengths.
+        :param ratio: mocap units per rig unit. :param thigh_len, shin_len: per-side rig lengths
+                      (dictionaries keyed Left/Right); scalar lengths remain supported.
         :param hip_offsets: {side: rig hip joint relative to the Hips bone, body frame components}.
         :param hips_lift: how far (rig units) the Hips bone sits above the mocap hip centre.
         :param plant: hold the ankles still while the feet are down.
@@ -459,8 +493,10 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
     idx = {i for v in LEG_IK_MAP.values() for i in v} | {HIP_C, SHOULDER_C}
     P = _true(empties, idx, frames, mirror)
     frame = _body_frame(P[L_HIP] - P[R_HIP], P[SHOULDER_C] - P[HIP_C])
-    a, b = thigh_len * ratio, shin_len * ratio
-    reach = (a + b) * 0.999
+    lengths = {side: ((thigh_len[side] if isinstance(thigh_len, dict) else thigh_len) * ratio,
+                      (shin_len[side] if isinstance(shin_len, dict) else shin_len) * ratio)
+               for side in LEG_IK_MAP}
+    mean_leg = float(np.mean([a + b for a, b in lengths.values()]))
     flip = np.array([1.0, -1.0 if mirror else 1.0, 1.0])
     n = len(frames)
     # hips: as many leg lengths above the floor as the mocap's are at that moment
@@ -468,13 +504,15 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
     floor = None
     if floor_data is not None:
         floor, down_masks, floor_now, size = floor_data
-        shift[:, 2] = floor + (P[HIP_C][:, 2] - floor_now) * (a + b) / size - P[HIP_C][:, 2]
+        shift[:, 2] = floor + (P[HIP_C][:, 2] - floor_now) * mean_leg / size - P[HIP_C][:, 2]
     else:
-        down_masks = {"Left": foot_contacts(P[L_ANKLE], a + b, fps), "Right": foot_contacts(P[R_ANKLE], a + b, fps)}
+        down_masks = {side: foot_contacts(P[an], sum(lengths[side]), fps, landmark_confidence(empties, frames, (an,)))
+                      for side, (_h, _k, an) in LEG_IK_MAP.items()}
     hips = P[HIP_C] + shift + np.array([0.0, 0.0, hips_lift * ratio])
     sigma = REACH_SMOOTH_S * fps
     joints, ankles, held, share = {}, {}, {}, {}
     for side, (h, k, an) in LEG_IK_MAP.items():
+        a, b = lengths[side]
         joints[side] = hips + ratio * _from_components(hip_offsets[side], frame)
         # the rig's own ankle path: the mocap leg's direction and bend, at the rig's leg length
         T = _gauss_np(P[an] - P[h], sigma)
@@ -490,11 +528,12 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
         pull = np.zeros((n, 3))
         for _ in range(4):
             for side in LEG_IK_MAP:
+                reach = sum(lengths[side]) * 0.999
                 T = ankles[side] - (joints[side] + pull)
                 d = np.linalg.norm(T, axis=1)
                 over = np.where(held[side], np.maximum(0.0, d - reach * 0.995), 0.0)
                 pull += (over / np.maximum(d, 1e-9))[:, None] * T
-        limit = PLANT_HIP_PULL * (a + b)
+        limit = PLANT_HIP_PULL * mean_leg
         size_ = np.linalg.norm(pull, axis=1, keepdims=True)
         pull = _gauss_np(pull * np.minimum(1.0, limit / np.maximum(size_, 1e-9)), PLANT_PULL_SMOOTH_S * fps)
         shift = shift + pull
@@ -502,6 +541,8 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
             joints[side] = joints[side] + pull
     out = {}
     for side, (h, k, _an) in LEG_IK_MAP.items():
+        a, b = lengths[side]
+        reach = (a + b) * 0.999
         joint = joints[side]
         T = ankles[side] - joint
         d = np.clip(np.linalg.norm(T, axis=1), abs(a - b) * 1.02 + 1e-6, reach)
@@ -562,6 +603,202 @@ def clavicle_directions(empties, frames, fps, mirror, ratio, heads, rests):
 def _keyed_far_point(coll, points, name, origins, dirs, frames):
     """Helper in the mocap space, keyed per frame FAR from `origins` along `dirs` (local space)."""
     return _keyed_point(coll, points.space, name, origins + FAR * dirs, frames)
+
+
+# Fingers. The RTMW pose tracker finds 21 points per hand in the body video (kept with the take by
+# Animate, see HANDS_PROP). They are flat, a few pixels apart, and half hidden on a hand that holds
+# something, so they cannot give finger directions; what they do give is how far each finger is
+# curled. Two readings, per finger and frame:
+# - straightness: knuckle-to-tip distance over the length of the finger's three segments. 1 for a
+#   straight finger whichever way it points, less the more it is bent in the picture;
+# - shortening: the finger's length in the picture against the palm's (wrist to middle knuckle).
+#   A finger curled toward or away from the camera looks short; so does a straight one that points
+#   at the camera, which is why this reading counts for less (FINGER_SHORT_SHARE).
+# The larger one is the curl (0 open .. 1 fist), smoothed over FINGER_SMOOTH_S, and where the hand
+# is not seen for longer than FINGER_HOLD_S the take's usual curl is used. Each finger bone is then
+# bent about the axis that closes it onto the rig's own palm, by its share of FINGER_FLEX.
+HANDS_PROP = "open_mocap_hands"
+FINGER_POINTS = {"Thumb": (1, 2, 3, 4), "Index": (5, 6, 7, 8), "Middle": (9, 10, 11, 12),
+                 "Ring": (13, 14, 15, 16), "Pinky": (17, 18, 19, 20)}
+FINGER_LENGTH = {"Thumb": 0.75, "Index": 0.78, "Middle": 0.85, "Ring": 0.78, "Pinky": 0.62}   # of the palm's
+FINGER_FLEX = {"Thumb": (20.0, 35.0, 50.0), "Index": (70.0, 100.0, 65.0), "Middle": (70.0, 100.0, 65.0),
+               "Ring": (70.0, 100.0, 65.0), "Pinky": (70.0, 100.0, 65.0)}     # degrees at full curl, bones 1..3
+FINGER_SHORT_SHARE = 0.7
+FINGER_SMOOTH_S = 0.2
+FINGER_HOLD_S = 0.3
+FINGER_MIN_FRAMES = 5
+THUMB_PALM_SHARE = 1.2      # how much the thumb closes onto the palm next to toward the index knuckle
+
+
+def _straightness_table():
+    """Straightness of a finger (segments 45/30/25% of its length) for curl 0..1."""
+    c = np.linspace(0.0, 1.0, 101)
+    t1, t2 = np.radians(FINGER_FLEX["Index"][1] * c), np.radians(FINGER_FLEX["Index"][2] * c)
+    return c, np.abs(0.45 + 0.3 * np.exp(1j * t1) + 0.25 * np.exp(1j * (t1 + t2)))
+
+
+def finger_curls(points, hand_frames, frames, fps):
+    """
+        :param points: (M, 21, 2) hand points of the frames `hand_frames` (M,) in which the hand
+                       was seen. :param frames: scene frames to give the curls for.
+        :return: {finger: (N,) curl 0..1} or None if the hand was seen in too few frames.
+    """
+    points, hand_frames = np.asarray(points, dtype=float), np.asarray(hand_frames, dtype=float)
+    if len(points) < FINGER_MIN_FRAMES or points.shape[1:] != (21, 2) or len(hand_frames) != len(points):
+        return None
+    order = np.argsort(hand_frames)
+    points, hand_frames = points[order], hand_frames[order]
+    frames = np.asarray(frames, dtype=float)
+    palm = np.linalg.norm(points[:, 9] - points[:, 0], axis=1)
+    usual_palm = float(np.median(palm))
+    if usual_palm <= 1e-9:
+        return None
+    weight = np.clip(palm / usual_palm, 0.05, 1.0) ** 2        # a hand seen edge-on or tiny counts less
+    table_c, table_r = _straightness_table()
+    nearest = np.abs(frames[:, None] - hand_frames[None, :]).min(axis=1) / fps
+    seen = np.clip(1.0 - (nearest - FINGER_HOLD_S) / FINGER_HOLD_S, 0.0, 1.0)
+    sigma = FINGER_SMOOTH_S * fps
+    out = {}
+    for finger, (a, b, c, e) in FINGER_POINTS.items():
+        chain = (np.linalg.norm(points[:, b] - points[:, a], axis=1) + np.linalg.norm(points[:, c] - points[:, b], axis=1)
+                 + np.linalg.norm(points[:, e] - points[:, c], axis=1))
+        straight = np.linalg.norm(points[:, e] - points[:, a], axis=1) / np.maximum(chain, 1e-9)
+        bent = np.interp(straight, table_r[::-1], table_c[::-1])
+        short = np.clip((1.0 - chain / np.maximum(palm, 1e-9) / FINGER_LENGTH[finger]) / 0.6, 0.0, 1.0)
+        curl = np.maximum(bent, FINGER_SHORT_SHARE * short)
+        usual = float(np.sum(curl * weight) / np.sum(weight))
+        value = np.interp(frames, hand_frames, curl)
+        w = np.interp(frames, hand_frames, weight) * seen
+        value = seen * value + (1.0 - seen) * usual
+        num, den = _gauss_np(value * (w + 0.05), sigma), _gauss_np(w + 0.05, sigma)
+        out[finger] = np.clip(num / np.maximum(den, 1e-9), 0.0, 1.0)
+    return out
+
+
+def hand_points(empties):
+    """
+        Hand points of the take these landmark empties belong to: stored on its root by Animate,
+        or for this session's take still in the capture cache.
+        :return: {"Left"/"Right": (frames (M,), points (M, 21, 2))}, possibly empty.
+    """
+    root = empties[0].parent
+    out = {}
+    raw = root.get(HANDS_PROP) if root is not None else None
+    if raw:
+        try:
+            data = json.loads(raw)
+            for side in ("Left", "Right"):
+                entry = data.get(side)
+                if entry and len(entry["frames"]) == len(entry["points"]):
+                    out[side] = (np.asarray(entry["frames"], dtype=float),
+                                 np.asarray(entry["points"], dtype=float).reshape(-1, 21, 2))
+        except (KeyError, TypeError, ValueError):
+            return {}
+        return out
+    if root is not None and root == gvar.root:               # animated before hands were stored
+        fps = gvar.front_fps or gvar.fps or 30.0
+        for side, key in (("Left", "L"), ("Right", "R")):
+            frames = getattr(gvar, f"{key}_body_hand_positionList")
+            times = getattr(gvar, f"{key}_body_hand_times")
+            if frames and len(frames) == len(times):
+                out[side] = (np.asarray(times, dtype=float) * fps + 1.0,
+                             np.asarray(frames, dtype=float).reshape(-1, 21, 3)[:, :, :2])
+    return out
+
+
+def finger_axes(rig, side):
+    """
+        {(finger, 1..3): (pose bone, flexion axis in the bone's own rest frame)}: turning the bone
+        about that axis closes the finger onto the palm. The palm side comes from the hand's own
+        layout (index knuckle, pinky knuckle, wrist), not from how the rig happens to stand.
+    """
+    mw = rig.matrix_world
+    hand, index1, pinky1 = (find_bone(rig, side + n) for n in ("Hand", "HandIndex1", "HandPinky1"))
+    middle1 = find_bone(rig, side + "HandMiddle1") or index1
+    if not (hand and index1 and pinky1):
+        return {}
+    head = {b.name: mw @ b.bone.head_local for b in (hand, index1, pinky1, middle1)}
+    across = head[pinky1.name] - head[index1.name]
+    along = head[middle1.name] - head[hand.name]
+    palm = across.cross(along)
+    if palm.length < 1e-9:
+        return {}
+    palm = palm.normalized() * (1.0 if side == "Left" else -1.0)
+    out = {}
+    for finger in FINGER_POINTS:
+        for k in (1, 2, 3):
+            pb = find_bone(rig, f"{side}Hand{finger}{k}")
+            if pb is None:
+                continue
+            m = (mw.to_3x3() @ pb.bone.matrix_local.to_3x3()).normalized()
+            y = m.col[1].normalized()
+            close = palm
+            if finger == "Thumb":                             # the thumb closes across the palm, toward the index
+                toward = head[index1.name] - (mw @ pb.bone.head_local)
+                toward = toward - toward.dot(y) * y
+                if toward.length > 1e-9:
+                    close = (THUMB_PALM_SHARE * palm + toward.normalized()).normalized()
+            axis = y.cross(close)
+            if axis.length < 1e-6:
+                continue
+            out[(finger, k)] = (pb, (m.inverted() @ axis.normalized()).normalized())
+    return out
+
+
+def _keyed_rotation(coll, name, quats, frames):
+    """Helper empty whose rotation (quaternions (N, 4), w first) is keyed per frame."""
+    obj = _new_empty(coll, name)
+    obj.rotation_mode = 'QUATERNION'
+    obj.animation_data_create()
+    act = bpy.data.actions.new(PREFIX + name)
+    obj.animation_data.action = act
+    co = np.empty((len(frames), 2))
+    co[:, 0] = frames
+    for k in range(4):
+        try:
+            fc = act.fcurve_ensure_for_datablock(obj, "rotation_quaternion", index=k)
+        except AttributeError:
+            fc = act.fcurves.new("rotation_quaternion", index=k)
+        co[:, 1] = quats[:, k]
+        fc.keyframe_points.add(len(frames))
+        fc.keyframe_points.foreach_set("co", co.ravel())
+        for kp in fc.keyframe_points:
+            kp.interpolation = 'LINEAR'
+        fc.update()
+    return obj
+
+
+def setup_fingers(rig, coll, empties, frames, fps):
+    """
+        Finger bones copy keyed helper rotations (Copy Rotation into the bone's local space).
+        :return: ({side: number of hand frames used}, list of what could not be done)
+    """
+    used, problems = {}, []
+    if is_control_rig(rig):
+        return used, ["fingers (not on a control rig: pose its finger controls by hand)"]
+    hands = hand_points(empties)
+    for side in ("Left", "Right"):
+        if side not in hands:
+            continue
+        hand_frames, points = hands[side]
+        curls = finger_curls(points, hand_frames, frames, fps)
+        axes = finger_axes(rig, side)
+        if curls is None or not axes:
+            if curls is not None:
+                problems.append(f"{side} finger bones")
+            continue
+        for (finger, k), (pb, axis) in axes.items():
+            half = np.radians(FINGER_FLEX[finger][k - 1]) * curls[finger] / 2.0
+            quats = np.concatenate([np.cos(half)[:, None], np.sin(half)[:, None] * np.array(tuple(axis))[None, :]], axis=1)
+            c = pb.constraints.new('COPY_ROTATION')
+            c.name = PREFIX + "Finger"
+            c.target = _keyed_rotation(coll, f"OM_finger_{side}_{finger}{k}", quats, frames)
+            # The helper has no parent, so its world rotation is the keyed one. (An object target's
+            # own "local space" is not that: it leaves the bone unturned.)
+            c.target_space = 'WORLD'
+            c.owner_space = 'LOCAL'
+        used[side] = len(hand_frames)
+    return used, problems
 
 
 def _keyed_point(coll, parent, name, locs, frames):
@@ -878,18 +1115,20 @@ def rig_forward(rig):
 
 def rig_leg_length(rig):
     mw = rig.matrix_world
-    up, knee, foot = (find_bone(rig, n) for n in ("LeftUpLeg", "LeftLeg", "LeftFoot"))
-    if not (up and knee and foot):
-        return 0.0
-    h = [mw @ b.bone.head_local for b in (up, knee, foot)]
-    return (h[0] - h[1]).length + (h[1] - h[2]).length
+    lengths = []
+    for side in ('Left', 'Right'):
+        bones = [find_bone(rig, side + n) for n in ('UpLeg', 'Leg', 'Foot')]
+        if all(bones):
+            h = [mw @ b.bone.head_local for b in bones]
+            lengths.append((h[0] - h[1]).length + (h[1] - h[2]).length)
+    return sum(lengths) / len(lengths) if lengths else 0.0
 
 
-def _helper_collection(context):
-    coll = bpy.data.collections.get(HELPER_COLLECTION)
-    if coll is None:
-        coll = bpy.data.collections.new(HELPER_COLLECTION)
-        context.scene.collection.children.link(coll)
+def _helper_collection(context, rig):
+    # Store an ID reference, not a name: ownership survives renaming the rig.
+    coll = bpy.data.collections.new(f"{HELPER_COLLECTION}_{rig.name}")
+    coll[HELPER_OWNER] = rig
+    context.scene.collection.children.link(coll)
     return coll
 
 
@@ -983,20 +1222,45 @@ def _knee_hint(coll, cache, points, near, far, ankle, toe, dist):
     return point
 
 
+def _helper_dependencies(rig, candidates):
+    """Helpers reachable from this rig, including targets and parents of helper targets."""
+    pending = [getattr(c, 'target', None) for pb in rig.pose.bones for c in pb.constraints
+               if c.name.startswith(PREFIX)]
+    found = set()
+    while pending:
+        obj = pending.pop()
+        if obj is None or obj not in candidates or obj in found:
+            continue
+        found.add(obj)
+        pending.append(obj.parent)
+        pending.extend(getattr(c, 'target', None) for c in obj.constraints)
+    return found
+
+
 def clear_retarget(rig):
-    """Remove retarget constraints from the rig and delete all helper objects."""
-    if rig is not None and rig.type == 'ARMATURE':
-        for pb in rig.pose.bones:
-            for c in [c for c in pb.constraints if c.name.startswith(PREFIX)]:
-                pb.constraints.remove(c)
-    coll = bpy.data.collections.get(HELPER_COLLECTION)
-    if coll:
-        for obj in list(coll.objects):
-            act = obj.animation_data.action if obj.animation_data else None
-            bpy.data.objects.remove(obj, do_unlink=True)
-            if act is not None and act.name.startswith(PREFIX) and act.users == 0:
-                bpy.data.actions.remove(act)
-        bpy.data.collections.remove(coll)
+    """Remove only this rig's helpers; also support the old shared collection safely."""
+    if rig is None or rig.type != 'ARMATURE':
+        return
+    collections = [c for c in bpy.data.collections
+                   if c.get(HELPER_OWNER) is not None or c.name == HELPER_COLLECTION]
+    candidates = {obj for coll in collections for obj in coll.objects}
+    owned = {obj for coll in collections if coll.get(HELPER_OWNER) == rig for obj in coll.objects}
+    remove = owned | _helper_dependencies(rig, candidates)
+    # A duplicated rig can still reference the original helpers. Keep those targets alive.
+    for other in bpy.data.objects:
+        if other != rig and other.type == 'ARMATURE':
+            remove -= _helper_dependencies(other, candidates)
+    for pb in rig.pose.bones:
+        for c in [c for c in pb.constraints if c.name.startswith(PREFIX)]:
+            pb.constraints.remove(c)
+    for obj in remove:
+        act = obj.animation_data.action if obj.animation_data else None
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if act is not None and act.name.startswith(PREFIX) and act.users == 0:
+            bpy.data.actions.remove(act)
+    for coll in collections:
+        if not coll.objects and not coll.children:
+            bpy.data.collections.remove(coll)
 
 
 def _stash_action(rig):
@@ -1065,7 +1329,7 @@ def _restore_legacy_constraints(rig):
 
 def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, arm_mode='POSITION',
                    leg_mode='PLANT', hip_height='FLOOR', shoulders=True, spine_twist=True, grip='NONE',
-                   info=None):
+                   info=None, fingers=True):
     """
         Builds helpers and constraints. :return: (list of mapped bone names, missing names, scale).
         :param arm_mode: 'POSITION' hands placed relative to the shoulder, elbows solved for the rig's
@@ -1077,12 +1341,13 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
                            stand on the floor; 'START' the hips start at their rest position.
         :param shoulders: drive the collar bones. :param spine_twist: spread the twist over the spine.
         :param grip: see arm_reach_directions. :param info: dict that receives numbers for the report.
+        :param fingers: curl the fingers from the take's hand points (see "Fingers").
     """
     info = {} if info is None else info
     clear_retarget(rig)
     _stash_action(rig)
     _mute_legacy_constraints(rig)
-    coll = _helper_collection(context)
+    coll = _helper_collection(context, rig)
     scene = context.scene
     cache = {}
     mapped, missing = [], []
@@ -1149,8 +1414,10 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
         # nothing to hold them against
         plant = leg_mode == 'PLANT' and hips_location is not None
         legs, shift, down = leg_directions(
-            empties, frames, fps, mirror_depth, ratio, (h["LeftLeg"] - h["LeftUpLeg"]).length,
-            (h["LeftFoot"] - h["LeftLeg"]).length, offsets, info.get("hips_lift", 0.0), plant,
+            empties, frames, fps, mirror_depth, ratio,
+            {s: (h[s + 'Leg'] - h[s + 'UpLeg']).length for s in ('Left', 'Right')},
+            {s: (h[s + 'Foot'] - h[s + 'Leg']).length for s in ('Left', 'Right')},
+            offsets, info.get("hips_lift", 0.0), plant,
             floor_data if stand else None)
         info["feet_down"] = down
         if not solve_legs:
@@ -1220,11 +1487,11 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
 
     # --- Arms and hands (keyed, smoothed targets; see ARM_MAP)
     reach = {}
-    ref = {n: find_bone(rig, n) for n in ("LeftArm", "LeftForeArm", "LeftHand", "RightArm", "LeftUpLeg", "RightUpLeg")}
+    ref = {s + n: find_bone(rig, s + n) for s in ('Left', 'Right') for n in ('Arm', 'ForeArm', 'Hand', 'UpLeg')}
     if len(frames) >= 2 and all(ref.values()):
         h = {n: mw @ b.bone.head_local for n, b in ref.items()}
-        upper_len = (h["LeftForeArm"] - h["LeftArm"]).length
-        fore_len = (h["LeftHand"] - h["LeftForeArm"]).length
+        upper_len = {s: (h[s + 'ForeArm'] - h[s + 'Arm']).length for s in ('Left', 'Right')}
+        fore_len = {s: (h[s + 'Hand'] - h[s + 'ForeArm']).length for s in ('Left', 'Right')}
         chest = (h["LeftArm"] + h["RightArm"]) / 2
         rig_torso = (chest - (h["LeftUpLeg"] + h["RightUpLeg"]) / 2).length
         rig_width = (h["LeftArm"] - h["RightArm"]).length
@@ -1296,6 +1563,11 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
                 c.lock_axis = 'LOCK_Y'
                 c.track_axis = _twist_axis(rig, pb, ref_dir)
                 c.influence = influence
+
+    # --- Fingers
+    if fingers and len(frames) >= 2:
+        info["fingers"], problems = setup_fingers(rig, coll, empties, frames, fps)
+        missing.extend(problems)
 
     # --- Head: up axis from the face, turn toward the nose (keyed, smoothed; see head_directions)
     head = drive_bone(rig, "Head")
@@ -1388,6 +1660,10 @@ class RetargetToMixamo(bpy.types.Operator):
     shoulders: bpy.props.BoolProperty(
         name="Collar Bones", default=True,
         description="Lift the collar bones with the mocap shoulders (shrugs, raised arms)")
+    fingers: bpy.props.BoolProperty(
+        name="Fingers", default=True,
+        description="Curl the fingers as the hands in the body video do (needs a take tracked with the "
+                    "RTMW pose tracker and animated with this version)")
     spine_twist: bpy.props.BoolProperty(
         name="Spread Spine Twist", default=True,
         description="Spread the twist between hips and shoulders over the spine bones instead of "
@@ -1419,7 +1695,7 @@ class RetargetToMixamo(bpy.types.Operator):
         mapped, missing, scale = setup_retarget(
             context, rig, empties, self.hips_motion, mirror, self.arm_mode, leg_mode=self.leg_mode,
             hip_height=self.hip_height, shoulders=self.shoulders, spine_twist=self.spine_twist,
-            grip=self.grip, info=info)
+            grip=self.grip, info=info, fingers=self.fingers)
         mapped = list(dict.fromkeys(mapped))
         scene.bake_rig = rig
         scene.bake_frame_start = scene.frame_start
@@ -1431,6 +1707,12 @@ class RetargetToMixamo(bpy.types.Operator):
         down = info.get("feet_down")
         if down and self.leg_mode == 'PLANT' and self.hips_motion:
             msg += f" Feet held: left {down['Left'] * 100:.0f}%, right {down['Right'] * 100:.0f}% of the take."
+        if self.fingers:
+            used = info.get("fingers") or {}
+            if used:
+                msg += " Fingers from " + ", ".join(f"{n} {s.lower()} hand frames" for s, n in used.items()) + "."
+            elif not is_control_rig(rig):
+                msg += " No hand points with this take, fingers left as they are."
         if missing:
             msg += f" Not found: {', '.join(missing)}"
         self.report({'WARNING'} if missing else {'INFO'}, msg)

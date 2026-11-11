@@ -187,6 +187,7 @@ class PoseTrackingPanel(bpy.types.Panel):
                 row = box.row(align=True)
                 row.prop(scene, "retarget_shoulders")
                 row.prop(scene, "retarget_spine_twist")
+                box.prop(scene, "retarget_fingers")
                 box.prop(scene, "retarget_mirror_depth")
                 row = box.row(align=True)
                 op = row.operator("object.open_mocap_retarget_mixamo", text="Retarget to Mixamo", icon="ARMATURE_DATA")
@@ -199,6 +200,7 @@ class PoseTrackingPanel(bpy.types.Panel):
                 op.hip_height = scene.retarget_hip_height
                 op.shoulders = scene.retarget_shoulders
                 op.spine_twist = scene.retarget_spine_twist
+                op.fingers = scene.retarget_fingers
                 op.grip = scene.retarget_grip
                 op = row.operator("object.open_mocap_clear_retarget", text="", icon="X")
                 op.target_rig = scene.bake_rig.name
@@ -207,6 +209,10 @@ class PoseTrackingPanel(bpy.types.Panel):
         layout.prop(scene, "bake_frame_start")
         layout.prop(scene, "bake_frame_end")
         layout.prop(scene, "bake_only_selected")
+        if scene.bake_only_selected and scene.bake_rig:
+            count = sum(bool(getattr(pb, 'select', getattr(pb.bone, 'select', False)))
+                        for pb in scene.bake_rig.pose.bones)
+            layout.label(text=f"Partial bake: {count} selected bones", icon='ERROR')
         layout.prop(scene, "bake_in_place")
         layout.prop(scene, "bake_action_name", text="Action", icon="ACTION")
 
@@ -296,6 +302,10 @@ class HandTrackingPanel(bpy.types.Panel):
         layout.prop(scene, "bake_frame_end")
         op = layout.operator("object.bake_motion", text="Bake Motion", icon="ACTION_TWEAK")
         layout.prop(scene, "bake_only_selected")
+        if scene.bake_only_selected and scene.bake_rig:
+            count = sum(bool(getattr(pb, 'select', getattr(pb.bone, 'select', False)))
+                        for pb in scene.bake_rig.pose.bones)
+            layout.label(text=f"Partial bake: {count} selected bones", icon='ERROR')
 
         if scene.bake_rig:
             op.target_rig = scene.bake_rig.name

@@ -4,6 +4,7 @@ import bpy
 import numpy as np
 from . import globalVariables as gvar
 from . import PackageInstaller
+from .capture_data import CaptureClock
 
 
 
@@ -68,8 +69,10 @@ class _TimestampClock:
         self.last = -1
         self.start = time.monotonic()
 
-    def next(self):
-        if self.fps:
+    def next(self, seconds=None):
+        if seconds is not None:
+            ts = int(round(seconds * 1000.0))
+        elif self.fps:
             ts = int(self.frame * 1000.0 / self.fps)
         else:
             ts = int((time.monotonic() - self.start) * 1000.0)
@@ -77,6 +80,14 @@ class _TimestampClock:
         ts = max(ts, self.last + 1)
         self.last = ts
         return ts
+
+
+def _capture_time(tracker):
+    """Called immediately after acquisition, before detector initialization/inference."""
+    if not hasattr(tracker, 'capture_clock'):
+        tracker.capture_clock = CaptureClock(gvar.fps, tracker.mode.startswith('rt_'))
+    pts = tracker.cap.get(cv2.CAP_PROP_POS_MSEC) if not tracker.mode.startswith('rt_') else None
+    return tracker.capture_clock.next(pts)
 
 
 def _to_mp_image(img_bgr):
@@ -141,23 +152,32 @@ class PoseDetector:
         self.landmarker = mp_vision.PoseLandmarker.create_from_options(options)
         self.clock = _TimestampClock(fps)
         self.visibility = []
+        self.depth_confidence = []
+        self.xy_source = 'mediapipe'
+        self.depth_source = 'missing'
 
-    def find_pose(self, img, draw=True):
+    def find_pose(self, img, draw=True, timestamp=None):
         """
             :return: (img, landmarks). landmarks is a list of 33 [x, y, z] pixel
                      coordinates (floats), or an empty list if no person was found.
                      self.visibility then holds the 33 visibility scores (0..1).
                      z is the depth from the world landmarks, in pixels (see POSE_DEPTH_SCALE).
         """
-        result = self.landmarker.detect_for_video(_to_mp_image(img), self.clock.next())
+        result = self.landmarker.detect_for_video(_to_mp_image(img), self.clock.next(timestamp))
         if not result.pose_landmarks:
             self.visibility = []
+            self.depth_confidence = []
+            self.depth_source = 'missing'
             return img, []
         h, w = img.shape[:2]
         landmarks = [[lm.x * w, lm.y * h, lm.z * w * IMAGE_Z_TO_WORLD] for lm in result.pose_landmarks[0]]
-        self.visibility = [lm.visibility if lm.visibility is not None else 1.0 for lm in result.pose_landmarks[0]]
+        self.visibility = [min(lm.visibility if lm.visibility is not None else 1.0,
+                               lm.presence if lm.presence is not None else 1.0)
+                           for lm in result.pose_landmarks[0]]
         world = getattr(result, "pose_world_landmarks", None)
         depth = _world_depth(landmarks, world[0], self.visibility) if world else None
+        self.depth_source = 'mediapipe_world' if depth is not None else 'mediapipe_image'
+        self.depth_confidence = [v * (1.0 if depth is not None else 0.5) for v in self.visibility]
         if depth is not None:
             for p, z in zip(landmarks, depth):
                 p[2] = z
@@ -204,6 +224,9 @@ class RTMWDetector:
         self.previous = None            # hip centre of the tracked person, to stay on the same one
         self.visibility = []
         self.hands = {}                 # {"Left"/"Right": (21 [x, y] pixel points, 21 scores 0..1)}
+        self.depth_confidence = []
+        self.xy_source = 'rtmw'
+        self.depth_source = 'missing'
 
     def _pick_person(self, keypoints, scores):
         body = keypoints[:, :23]
@@ -213,15 +236,18 @@ class RTMWDetector:
         size = np.ptp(body[:, :, 0], axis=1) * np.ptp(body[:, :, 1], axis=1)
         return int(np.argmax(size * scores[:, :23].mean(axis=1)))
 
-    def find_pose(self, img, draw=True):
+    def find_pose(self, img, draw=True, timestamp=None):
         """:return: (img, 33 [x, y, z] pixel landmarks or []), self.visibility like PoseDetector."""
-        _img, mp_landmarks = self.depth.find_pose(img, draw=False)
+        _img, mp_landmarks = self.depth.find_pose(img, draw=False, timestamp=timestamp)
         mp_visibility = self.depth.visibility
         keypoints, scores = self.model(img)
         self.hands = {}
         if len(keypoints) == 0:
             # RTMW found nobody: fall back to MediaPipe for this frame
             self.visibility = mp_visibility
+            self.depth_confidence = list(self.depth.depth_confidence)
+            self.xy_source = 'mediapipe'
+            self.depth_source = self.depth.depth_source
             if draw and mp_landmarks:
                 _draw_landmarks(img, mp_landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
                                 (255, 255, 255), (255, 0, 255))
@@ -232,6 +258,22 @@ class RTMWDetector:
         landmarks = [[float(x), float(y), (mp_landmarks[i][2] if mp_landmarks else 0.0)]
                      for i, (x, y) in enumerate(pts)]
         self.visibility = np.clip((sc - _RTMW_SCORE_LOW) / _RTMW_SCORE_RANGE, 0.0, 1.0).tolist()
+        self.xy_source = 'rtmw'
+        # Independent models can select different actors. Only borrow depth when their torsos agree.
+        matched = False
+        if mp_landmarks:
+            torso = np.array([11, 12, 23, 24])
+            mp_xy = np.asarray(mp_landmarks)[:, :2]
+            size = max(float(np.linalg.norm(pts[torso[:2]].mean(axis=0) - pts[torso[2:]].mean(axis=0))), 1.0)
+            reliable = np.minimum(np.asarray(self.visibility)[torso], np.asarray(mp_visibility)[torso]) > 0.3
+            matched = reliable.sum() >= 3 and float(np.median(
+                np.linalg.norm(pts[torso][reliable] - mp_xy[torso][reliable], axis=1))) < 0.35 * size
+        self.depth_source = self.depth.depth_source if matched else 'missing'
+        self.depth_confidence = ([min(a, b) for a, b in zip(self.visibility, self.depth.depth_confidence)]
+                                 if matched else [0.0] * 33)
+        if not matched:
+            for point in landmarks:
+                point[2] = 0.0
         # Whole hands: 21 points each, in MediaPipe's hand order (wrist, thumb, index ... pinky).
         # RTMW has no depth, so these are x/y only.
         for name, first in (("Left", _WB_LHAND), ("Right", _WB_RHAND)):
@@ -281,11 +323,11 @@ class HandDetector:
         self.landmarker = mp_vision.HandLandmarker.create_from_options(options)
         self.clock = _TimestampClock(fps)
 
-    def find_hands(self, img, draw=True):
+    def find_hands(self, img, draw=True, timestamp=None):
         """
             :return: (hands, img). Each hand is {"type": "Right"/"Left", "lmList": 21 [x, y, z]}.
         """
-        result = self.landmarker.detect_for_video(_to_mp_image(img), self.clock.next())
+        result = self.landmarker.detect_for_video(_to_mp_image(img), self.clock.next(timestamp))
         h, w = img.shape[:2]
         hands = []
         for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
@@ -515,14 +557,16 @@ class PoseTracking:
         # A new take replaces the earlier one of the same view (appending a second run to the
         # first would double the take and restart its frame times half way)
         if self.mode == "side_pose":
-            for lst in (gvar.zlist, gvar.zlist_times, gvar.zlist_vis):
+            for lst in (gvar.zlist, gvar.zlist_times, gvar.zlist_vis, gvar.zlist_meta, gvar.zlist_missing_times):
                 lst.clear()
         else:
             for lst in (gvar.positionList, gvar.position_times, gvar.position_vis,
+                        gvar.position_meta, gvar.position_missing_times,
                         gvar.R_body_hand_positionList, gvar.L_body_hand_positionList,
                         gvar.R_body_hand_times, gvar.L_body_hand_times):
                 lst.clear()
             gvar.positionList_raw = None
+            gvar.position_meta_raw = None
 
         # --- Handle realtime webcam tracking ---
         if self.mode == "rt_pose":
@@ -576,6 +620,7 @@ class PoseTracking:
             print("MediaPipe is not installed. Install via the Addon Preferences first. Skipping pose detection.")
             return img
 
+        frame_time = _capture_time(self)
         if self.detector is None:
             self.detector = create_pose_detector(fps=None if self.mode == "rt_pose" else gvar.fps)
             self.video_fps = gvar.fps or 30
@@ -587,14 +632,16 @@ class PoseTracking:
         self.frame_index += 1          # every call is one video frame, detected or not
 
         height, width = img.shape[:2]
-        img, landmarksList = self.detector.find_pose(img)
+        img, landmarksList = self.detector.find_pose(img, timestamp=frame_time)
 
         if not landmarksList:
+            missing = gvar.zlist_missing_times if self.mode == 'side_pose' else gvar.position_missing_times
+            missing.append(frame_time)
             return img
 
         # Per-landmark visibility (33 + the 7 centroids below, which take the lower of their pair)
         vis = list(self.detector.visibility)
-        frame_time = self.frame_index / self.video_fps
+        depth_conf = list(self.detector.depth_confidence)
 
         # --- Calculate custom points (centroids) ---
         point_pairs = [
@@ -613,6 +660,11 @@ class PoseTracking:
             normalized = MathUtility.normalize_coordinates(centroid, height, width, POSE_DEPTH_SCALE)
             extra_points.append(normalized)
             vis.append(min(vis[a], vis[b]))
+            depth_conf.append(min(depth_conf[a], depth_conf[b]))
+
+        meta = {'depth_confidence': depth_conf, 'xy_source': self.detector.xy_source,
+                'depth_source': self.detector.depth_source,
+                'depth_state': ['observed' if c > 0 else 'missing' for c in depth_conf]}
 
         # --- Handle mode: front, side, or realtime ---
         if self.mode in ["front_pose", "rt_pose"]:
@@ -627,6 +679,7 @@ class PoseTracking:
             gvar.positionList.append(listOf32Landmarks)
             gvar.position_times.append(frame_time)
             gvar.position_vis.append(vis)
+            gvar.position_meta.append(meta)
 
             # Whole hands from the body video (RTMW tracker only), in the pose's own coordinates.
             # They have no depth: Animate Hand puts each one at the depth of the pose wrist.
@@ -652,6 +705,7 @@ class PoseTracking:
             gvar.zlist.append(zframe)
             gvar.zlist_times.append(frame_time)
             gvar.zlist_vis.append(vis)
+            gvar.zlist_meta.append(meta)
 
         return img
 
@@ -744,6 +798,8 @@ class HandTracking:
             if not self.cap.isOpened():
                 print("Camera failed to open.")
                 return
+            for lst in (gvar.R_hand_positionList, gvar.L_hand_positionList, gvar.R_hand_times, gvar.L_hand_times):
+                lst.clear()
             gvar.fps = self.cap.get(cv2.CAP_PROP_FPS)
             if not gvar.fps or gvar.fps <= 0:
                 gvar.fps = 30
@@ -791,6 +847,7 @@ class HandTracking:
             print("MediaPipe is not installed. Install via the Addon Preferences first. Skipping hand detection.")
             return img
 
+        frame_time = _capture_time(self)
         if self.detector is None:
             self.detector = HandDetector(max_hands=self.num_hands,
                                          fps=None if self.mode == "rt_hand" else gvar.fps,
@@ -798,11 +855,14 @@ class HandTracking:
             self.video_fps = gvar.fps or 30
             self.frame_index = -1
             gvar.hand_fps = self.video_fps
+            if self.mode == 'side_hand':
+                gvar.hand_side_fps = self.video_fps
+            else:
+                gvar.hand_front_fps = self.video_fps
         self.frame_index += 1          # every call is one video frame, detected or not
-        frame_time = self.frame_index / self.video_fps
 
         height, width = img.shape[:2]
-        hands, img = self.detector.find_hands(img)
+        hands, img = self.detector.find_hands(img, timestamp=frame_time)
         if not hands:
             return img
 
@@ -837,8 +897,7 @@ class HandTracking:
                     rt_hand_lmlist.append(normalized)
                     flat_list.extend(normalized)
                 position_list.append(flat_list)
-                if self.mode == "front_hand":
-                    times.append(frame_time)
+                times.append(frame_time)
 
             elif self.mode == "side_hand":
                 zframe = []

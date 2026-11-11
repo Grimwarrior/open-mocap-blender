@@ -118,6 +118,10 @@ def register():
     bpy.types.Scene.retarget_shoulders = bpy.props.BoolProperty(
         name="Collar Bones", default=True,
         description="Lift the collar bones with the mocap shoulders (shrugs, raised arms)")
+    bpy.types.Scene.retarget_fingers = bpy.props.BoolProperty(
+        name="Fingers", default=True,
+        description="Curl the fingers as the hands in the body video do (needs a take tracked with the "
+                    "RTMW pose tracker and animated with this version)")
     bpy.types.Scene.retarget_spine_twist = bpy.props.BoolProperty(
         name="Spread Spine Twist", default=True,
         description="Spread the twist between hips and shoulders over the spine bones instead of "
@@ -175,6 +179,7 @@ def unregister():
     del bpy.types.Scene.retarget_hip_height
     del bpy.types.Scene.retarget_shoulders
     del bpy.types.Scene.retarget_spine_twist
+    del bpy.types.Scene.retarget_fingers
     del bpy.types.Scene.retarget_grip
     del bpy.types.Scene.bake_in_place
 

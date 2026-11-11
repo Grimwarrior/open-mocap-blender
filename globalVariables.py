@@ -19,6 +19,11 @@ zlist_vis = [] #40 visibility scores per side frame
 front_fps = 0
 side_fps = 0
 positionList_raw = None #front data before Combine Data, so it can be re-combined with other settings
+position_meta = [] #per-frame depth confidence and measurement sources
+zlist_meta = []
+position_meta_raw = None
+position_missing_times = [] #explicit failed detections, in video/capture seconds
+zlist_missing_times = []
 root = None #root empty to which the skeleton rig is parented
 pose_tracker = None
 
@@ -32,6 +37,8 @@ hand_front_video_path = ""
 hand_side_video_path = "" 
 hand_tracker = None
 hand_fps = 0
+hand_front_fps = 0
+hand_side_fps = 0
 # Time (seconds, in its video) of each tracked frame of the lists below. A hand that is not found in a
 # frame gets no entry, so without these the frames after a miss would play too early.
 R_hand_times = [] #front view, right hand
