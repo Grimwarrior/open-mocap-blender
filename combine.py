@@ -10,7 +10,9 @@
 
     1. Sync      Both cameras see the same vertical motion. The side take is shifted in time
                  (with each video's own fps) until left/right-independent height signals
-                 (hips, shoulders, nose, averaged wrists/elbows/knees/ankles) match best.
+                 (hips, shoulders, nose, averaged wrists/elbows/knees/ankles) match best. Only
+                 what the heights do within about a second counts, in the actor's apparent size,
+                 so an actor walking toward one camera and away from another still matches.
                  A shift is only used when it matches clearly better than none (MIN_SYNC_GAIN):
                  with two separate performances the match is weak and a few frames of shift can
                  follow the noise. Time Warp (for two separate performances of the same move, e.g.
@@ -65,6 +67,8 @@ LR_GROUPS = {
 
 # Left/right independent height signals for syncing: lists of landmarks that are averaged
 SYNC_SIGNALS = [[33], [34], [0], [15, 16], [13, 14], [25, 26], [27, 28]]
+SYNC_TREND_S = 1.0        # timing signals count only what the heights do above their trend over this time
+                          # (0.75 s and 1.5 s matched the separate katana takes worse: Front/Back 0.47 at 1.5 s)
 
 # Bone tree from the hip centre outwards (parent, child); followers move with an anchor
 SEGMENTS = [(33, 23), (33, 24), (23, 25), (25, 27), (27, 29), (27, 31), (24, 26), (26, 28), (28, 30), (28, 32),
@@ -88,7 +92,9 @@ LR_HEIGHT_GROUPS = ("arms",)  # groups whose heights are compared between the vi
                           # disagree about which foot is lower in just the way a label swap would.
                           # Legs are only un-swapped where both jump to each other's place at once.
 LR_SWAP_BIAS = 0.005      # extra cost of a swapped frame per joint, in body heights
-MIN_SYNC_GAIN = 0.075     # a time shift must raise the sync match by this much over no shift
+MIN_SYNC_GAIN = 0.13      # a time shift must raise the sync match by this much over no shift. Measured:
+                          # separate katana takes gain at most 0.115 (Front/LeftToRight, 3 frames: noise),
+                          # the real 4 to 11 frame shifts between the Whirlpool cameras 0.144 to 0.84
 MIN_SYNC_MATCH = 0.3      # below this, reject automatic fusion; manual offset remains available
 WARP_BAND_S = 1.0         # time warp: how far (s) the side timing may drift from the constant offset
 WARP_SLOPE_PENALTY = 0.3  # time warp: cost of speeding up / slowing down the side take for a frame
@@ -101,9 +107,12 @@ SMOOTH_PEAKS = True       # final smoothing keeps peaks (False: plain Gaussian, 
 FUSE_HEIGHTS = True       # heights of joints hidden in the front view come from the side view
 FUSE_MAX_HEIGHT_ERR = 2.5  # ... only if the views' heights agree this well (% of body height; two
                           # cameras on one performance: about 1, separate takes: 5 and more)
-FUSE_SYNCED_HEIGHT_ERR = 4.0  # ... or this well together with a timing match of FUSE_SYNCED_MATCH: real
+FUSE_SYNCED_HEIGHT_ERR = 4.0  # ... or this well together with a motion match of FUSE_SYNCED_MATCH: real
 FUSE_SYNCED_MATCH = 0.9   # cameras stand at different heights and distances, which alone costs about 3%
-                          # (separate takes measured: heights 4.5 to 5.6%, timing match 0.5 to 0.7)
+                          # (separate takes measured: heights 4.5 to 5.6%, motion match 0.5 to 0.75; one
+                          # performance: 0.94 to 0.97). The motion match compares raw picture heights
+                          # (motion_match); the size-free timing match is 0.64 to 0.88 for separate takes,
+                          # too close to the 0.94 to 0.98 of one performance to tell them apart by.
 FUSE_FRONT_VIS = 0.5      # ... front visibility below which that starts (and side visibility above which)
 FUSE_VIS_RANGE = 0.3      # ... and the range over which it blends in
 GAP_FILL_S = 0.1          # occluded joints: side depth borrowed from frames within about this time
@@ -208,9 +217,22 @@ def _zscore(v):
     return (v - v.mean()) / s if s > 1e-9 else v * 0.0
 
 
-def _signals(P):
-    """(N, G) left/right independent height signals."""
-    return np.stack([P[:, idx, 1].mean(axis=1) for idx in SYNC_SIGNALS], axis=1)
+def _signals(P, fps=30.0, size_free=True):
+    """
+        (N, G) left/right independent height signals.
+        size_free=True (timing): each height above its own trend over SYNC_TREND_S, divided by the
+        actor's apparent size. As an actor walks toward a camera the feet slide down the picture
+        and the head up while the body grows, and walking away does the opposite; raw heights
+        follow that walk more than the move, so a camera in front and one behind measured as
+        opposites (katana Front/Back: match -0.05 raw, 0.72 size-free).
+        size_free=False: raw picture heights, for motion_match.
+    """
+    raw = np.stack([P[:, idx, 1].mean(axis=1) for idx in SYNC_SIGNALS], axis=1)
+    if not size_free:
+        return raw
+    size = front_perspective_scale(P, fps)
+    size = np.where(np.isfinite(size) & (size > 1e-6), size, 1.0)
+    return (raw - _gauss(raw, SYNC_TREND_S * fps, trend=True)) / size[:, None]
 
 
 def _fill_nan(v):
@@ -308,7 +330,7 @@ def find_time_offset(tF, F, tS, S):
         :return: (offset, correlation): side time = front time + offset (seconds), and the mean
                  correlation of the height signals at that offset.
     """
-    sigF, sigS = _signals(F), _signals(S)
+    sigF, sigS = _signals(F, _fps(tF)), _signals(S, _fps(tS))
     durF, durS = tF[-1] - tF[0], tS[-1] - tS[0]
     min_overlap = 0.5 * min(durF, durS)
     lo = tS[0] - tF[-1] + min_overlap
@@ -332,9 +354,19 @@ def find_time_offset(tF, F, tS, S):
     return float(fine[k]), float(res[k][1])
 
 
-def _warp_features(P):
+def motion_match(tF, F, tS, S, offset):
+    """
+        Correlation of the raw picture heights (not size-free) with side time = front time + offset:
+        about 0.95 for one performance filmed by two cameras, 0.5 to 0.75 for separate takes.
+        Tells the two apart for same_performance; the timing match of find_time_offset does not.
+    """
+    sigF, sigS = _signals(F, size_free=False), _signals(S, size_free=False)
+    return float(_offset_score(tF, sigF, tS, sigS, offset, tF[-1] - tF[0], tS[-1] - tS[0])[1])
+
+
+def _warp_features(P, fps=30.0):
     """Per-frame features for time warping: z-scored height signals and their velocities."""
-    sig = _signals(P)
+    sig = _signals(P, fps)
     sig = (sig - sig.mean(axis=0)) / np.maximum(sig.std(axis=0), 1e-9)
     vel = np.gradient(_gauss(sig, 1.5), axis=0)
     vel = vel / np.maximum(vel.std(axis=0), 1e-9)
@@ -353,8 +385,8 @@ def time_warp(tF, F, tS, S, offset):
     # (padded columns are "no side video" and cost a neutral amount).
     tg = np.arange(tS[0] - band, tS[-1] + band + 0.5 / fpsF, 1.0 / fpsF)
     inside = (tg >= tS[0]) & (tg <= tS[-1])
-    fF = _warp_features(F)
-    fS = _warp_features(S)
+    fF = _warp_features(F, fpsF)
+    fS = _warp_features(S, _fps(tS))
     fG = _interp(np.clip(tg, tS[0], tS[-1]), tS, fS)
     n, m = len(tF), len(tg)
     # Only a band of columns around the constant offset is stored per row: row i covers the
@@ -700,11 +732,14 @@ def view_slope(F, U, w, valid):
     return float(np.sum(ww * x * u) / den) if den > 1e-9 else 0.0
 
 
-def same_performance(height_err, sync_match):
-    """Do two views show one performance (filmed by two cameras), going by how well they agree?"""
+def same_performance(height_err, motion):
+    """
+        Do two views show one performance (filmed by two cameras), going by how well they agree?
+        :param motion: motion_match of the two views (NaN for a manual offset).
+    """
     if height_err < FUSE_MAX_HEIGHT_ERR:
         return True
-    return sync_match == sync_match and sync_match >= FUSE_SYNCED_MATCH and height_err < FUSE_SYNCED_HEIGHT_ERR
+    return motion == motion and motion >= FUSE_SYNCED_MATCH and height_err < FUSE_SYNCED_HEIGHT_ERR
 
 
 def _fill_gaps(rel, w, fps, times=None):
@@ -765,6 +800,7 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     # 1. Sync: one offset, then optionally a time warp for drifting timing
     if offset is None:
         offset, sync_corr = find_time_offset(tF, F, tS, S_raw)
+        motion_corr = motion_match(tF, F, tS, S_raw, offset)
         report["sync_trusted"] = sync_corr >= MIN_SYNC_MATCH
         if not report["sync_trusted"]:
             report.update(combined=False, sync_corr=sync_corr,
@@ -773,7 +809,7 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     else:
         if not np.isfinite(offset):
             raise ValueError('The manual offset must be finite')
-        sync_corr = float("nan")
+        sync_corr = motion_corr = float("nan")
         report["sync_trusted"] = True
     tq = tF + offset
     report["sync_mode"] = "offset"
@@ -788,7 +824,7 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     S = _interp(tq, tS, S_raw)
     visS = _interp(tq, tS, visS_raw) * valid[:, None]
     drift = tq - tF - offset
-    report.update(offset_s=offset, sync_corr=sync_corr, coverage=float(valid.mean()),
+    report.update(offset_s=offset, sync_corr=sync_corr, motion_corr=motion_corr, coverage=float(valid.mean()),
                   warp_range=(float(drift.min()), float(drift.max())))
 
     # 2. Scale
@@ -805,7 +841,7 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     #     shows in how well the two views' heights agree (FUSE_MAX_HEIGHT_ERR): in separate takes
     #     the heights differ by more than the front view's guess is off.
     report["heights_from_side"] = 0.0
-    if FUSE_HEIGHTS and sync != "WARP" and same_performance(report["height_err"], sync_corr):
+    if FUSE_HEIGHTS and sync != "WARP" and same_performance(report["height_err"], motion_corr):
         a = (np.clip((FUSE_FRONT_VIS - visF[:, :33]) / FUSE_VIS_RANGE, 0.0, 1.0)
              * np.clip((visS[:, :33] - FUSE_FRONT_VIS) / FUSE_VIS_RANGE, 0.0, 1.0))
         y_side = F[:, [HIP_C], 1] + (S[:, :33, 1] - S[:, [HIP_C], 1]) * scale[:, None]
@@ -946,6 +982,7 @@ def _align_view(F, tF, S_raw, tS, visS_raw, sync, fps):
     w = _side_weight(vis) * support[:, None]
     return dict(S=S, vis=vis, valid=valid, scale=scale, w=np.minimum(w, w[:, [HIP_C]]),
                 U=S[:, :, 0] * scale[:, None], offset=float(offset), corr=float(corr),
+                motion=motion_match(tF, F, tS, S_raw, offset),
                 height_err=height_agreement(F, S, scale, vis, valid)), None
 
 
@@ -1040,6 +1077,7 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
             w = _side_weight(vis) * support[:, None]
             aligned[i] = dict(S=S, vis=vis, valid=valid, scale=scale, w=np.minimum(w, w[:, [HIP_C]]),
                               U=S[:, :, 0] * scale[:, None], offset=float(base["offset_s"]), corr=float("nan"),
+                              motion=float("nan"),
                               height_err=height_agreement(F, S, scale, vis, valid))
             continue
         aligned[i], why = _align_view(F, tF, S_raw, tS, visS, sync, fps)
@@ -1073,8 +1111,8 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
             # one performance filmed by several cameras: this view also places what the front view hides
             # (A camera on the far side sees every perspective effect the other way round, so its
             # heights agree a little less; its motion fitting one direction this well shows the same.)
-            same = same_performance(view["height_err"], view["corr"]) or (
-                view["corr"] == view["corr"] and view["corr"] >= FUSE_SYNCED_MATCH
+            same = same_performance(view["height_err"], view["motion"]) or (
+                view["motion"] == view["motion"] and view["motion"] >= FUSE_SYNCED_MATCH
                 and fit >= MULTI_SAME_FIT and view["height_err"] < MULTI_SAME_HEIGHT_ERR)
             if sync != "WARP" and same:
                 a = (np.clip((FUSE_FRONT_VIS - visF[:, :33]) / FUSE_VIS_RANGE, 0.0, 1.0)
@@ -1115,7 +1153,7 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
         if last:
             frames, report = result, result_report
     # Settings found for the side view stay what the panel shows and what a re-run starts from
-    for key in ("offset_s", "sync_corr", "sync_mode", "warp_range", "coverage", "scale", "side_angle",
+    for key in ("offset_s", "sync_corr", "motion_corr", "sync_mode", "warp_range", "coverage", "scale", "side_angle",
                 "lr_switches", "height_err", "sync_trusted", "view_slope"):
         if key in base:
             report[key] = base[key]
@@ -1151,8 +1189,8 @@ PERSPECTIVE_FACTOR_RANGE = (0.6, 1.6)  # the correction never moves a point by m
 # Whirlpool Front + LTR, frame 63 (one foot well behind the other), legs left/right:
 #   no correction 1.63/1.95, corrected 1.74/1.81, corrected + legs solved 1.83/1.83; take-wide left/right
 #   ratio p10..p90 0.83..1.13 -> 0.91..1.08 -> 0.96..1.04, joint jerk 0.0160 -> 0.0158 -> 0.0162.
-# Synthetic actor, depth error in % of body height, corrected -> + legs solved: camera at 6 m
-#   2.91 -> 2.86, 5 m 3.38 -> 3.36, 3.5 m 4.25 -> 4.39.
+# Synthetic actor, depth error in % of body height, corrected -> + legs solved (mean of 3 takes): camera
+#   at 6 m 1.93 -> 1.85, 5 m 2.26 -> 2.21, 4 m 2.81 -> 2.76, 3.5 m 3.25 -> 3.34.
 PERSPECTIVE_LENGTHEN = 0.3
 PERSPECTIVE_LENGTHEN_SEGMENTS = {(23, 25), (25, 27), (24, 26), (26, 28)}
 
