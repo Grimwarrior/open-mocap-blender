@@ -41,6 +41,33 @@ class LegSolver(unittest.TestCase):
         self.assertLess(noisy["flips"], 1.0)
 
 
+class HipJoints(unittest.TestCase):
+    """Legs solved from hip joints read off the posed rig, and held feet kept on the floor."""
+
+    @classmethod
+    def setUpClass(cls):
+        truth = bench.true_motion(np.arange(0, 6.0, 1 / 30.0))
+        cls.P = bench.tracked(truth, np.random.default_rng(0))
+
+    def test_measured_hip_joints_are_used_as_given(self):
+        n = len(self.P)
+        tilt = np.radians(20.0)                                  # the pelvis rolled about the forward axis
+        left = np.tile([bench.HIP_HALF * np.cos(tilt), 0.0, bench.HIP_HALF * np.sin(tilt)], (n, 1))
+        solved = bench.solve(self.P, 30.0, hip_offsets={"Left": left, "Right": -left})
+        apart = solved["Left"]["joint"] - solved["Right"]["joint"]
+        self.assertLess(np.abs(apart - 2 * left).max(), 1e-6)
+        for side in ("Left", "Right"):                           # and the feet are still held from there
+            ankle, down = solved[side]["ankle"], solved["down"][side]
+            self.assertTrue(np.isfinite(ankle).all())
+            self.assertGreater(down.mean(), 0.2)
+
+    def test_held_feet_do_not_sink_under_the_floor(self):
+        solved = bench.solve(self.P, 30.0)
+        for side in ("Left", "Right"):
+            low = solved["floor"] - solved[side]["ankle"][solved["down"][side], 2]
+            self.assertLess(low.max(), 0.003)
+
+
 class BendDirection(unittest.TestCase):
     def test_straight_stretch_keeps_the_bend_from_before_and_after(self):
         n = 90
@@ -60,6 +87,39 @@ class BendDirection(unittest.TestCase):
         hint = np.tile([0.0, -1.0, 0.0], (n, 1))
         way = R.bend_direction(offset, along, 0.45, hint, 30.0)
         self.assertGreater(float(np.min(way @ np.array([0.0, -1.0, 0.0]))), 0.99)
+
+    def test_frames_without_depth_still_turn_the_knee(self):
+        # The first 30 frames have no depth from other views (confidence 0 -> floor), while the
+        # knee turns from -y to +x; the held direction of frame 30 must not be copied back over them
+        n = 60
+        along = np.tile([0.0, 0.0, -1.0], (n, 1))
+        turn = np.radians(np.clip(np.arange(n) * 3.0, 0.0, 90.0))
+        offset = np.stack([0.15 * np.sin(turn), -0.15 * np.cos(turn), np.full(n, -0.4)], axis=1)
+        hint = np.tile([0.0, -1.0, 0.0], (n, 1))
+        conf = np.where(np.arange(n) < 30, R.DIRECTION_DEPTH_FLOOR, 1.0)
+        way = R.bend_direction(offset, along, 0.45, hint, 30.0, conf)
+        true = R._unit(offset - offset * np.array([0.0, 0.0, 1.0]))
+        held = R.bend_direction(offset, along, 0.45, hint, 30.0, np.where(np.arange(n) < 30, 0.0, 1.0))
+        err = lambda w: np.degrees(np.arccos(np.clip(np.sum(w[:30] * true[:30], axis=1), -1, 1)))
+        self.assertLess(float(err(way).max()), 10.0)
+        self.assertGreater(float(err(held).max()), 45.0)
+
+    def test_depth_floor_counts_visible_frames_without_depth(self):
+        import json
+        meta = {"frames": [1.0, 2.0, 3.0], "fps": 30.0, "visibility": [[1.0] * 40, [1.0] * 40, [0.1] * 40],
+                "metadata": [{"depth_confidence": [0.0] * 40}, {"depth_confidence": [1.0] * 40},
+                             {"depth_confidence": [0.0] * 40}]}
+
+        class Root:
+            def get(self, key, default=None):
+                return json.dumps(meta) if key == "open_mocap_metadata" else default
+
+        class Empty:
+            parent = Root()
+
+        frames = np.array([1.0, 2.0, 3.0])
+        np.testing.assert_allclose(R.landmark_confidence([Empty()], frames, (25,)), [0.0, 1.0, 0.0])
+        np.testing.assert_allclose(R.landmark_confidence([Empty()], frames, (25,), 0.3), [0.3, 1.0, 0.1])
 
 
 def heading(v):
@@ -146,7 +206,7 @@ class SpineAndNeck(unittest.TestCase):
         rests = {"Spine": (0.0, np.cos(back), np.sin(back)), "Spine2": (0.0, 1.0, 0.0), "Neck": (0.0, 1.0, 0.0)}
         saved = R._true, R.landmark_confidence
         R._true = lambda _e, idx, _f, _m: {i: P[i].copy() for i in idx}
-        R.landmark_confidence = lambda _e, f, _i: np.ones(len(f))
+        R.landmark_confidence = lambda _e, f, _i, *_floor: np.ones(len(f))
         try:
             out = R.spine_directions(None, np.arange(n, dtype=float), 30.0, False, rests)
         finally:
@@ -154,6 +214,99 @@ class SpineAndNeck(unittest.TestCase):
         np.testing.assert_allclose(self.lean(out["Spine"][1]), -7.0, atol=1e-6)    # leans back as at rest
         np.testing.assert_allclose(self.lean(out["Spine2"][1]), 0.0, atol=1e-6)
         np.testing.assert_allclose(self.lean(out["Neck"][1]), 0.0, atol=1e-6)      # head over the chest
+
+
+# SOMA's rest skeleton as GEM-X gives it (metres, Y up, facing +Z, left +X): a gently curved spine
+SOMA_REST = {"Hips": (0.0, 0.0, 0.0), "Spine1": (0.0, 0.051, 0.001), "Spine2": (0.0, 0.124, -0.001),
+             "Chest": (0.0, 0.195, -0.007), "Neck1": (0.0, 0.45, -0.012), "Head": (0.0, 0.578, 0.028),
+             "LeftLeg": (0.114, -0.082, 0.023), "RightLeg": (-0.114, -0.082, 0.022),
+             "LeftArm": (0.158, 0.418, -0.01), "RightArm": (-0.158, 0.418, -0.01)}
+RIG_RESTS = {"Hips": (0.0, 1.0, 0.0), "Spine": (0.0, np.cos(np.radians(-7)), np.sin(np.radians(-7))),
+             "Spine1": (0.0, 1.0, 0.0), "Spine2": (0.0, 1.0, 0.05), "Neck": (0.0, 1.0, 0.1)}
+
+
+class GemxSpine(unittest.TestCase):
+    n = 3
+
+    def take(self, yaw_deg, bend=None):
+        """The rest skeleton stood in the take's Z-up space turned by yaw (facing -Y at 0), as (N, 3)
+        chain, hip and shoulder lines; bend = (segment's top joint, degrees forward) bends the chain
+        above that joint about the left-right axis."""
+        rest = {k: np.array(v) for k, v in SOMA_REST.items()}
+        to_take = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])  # Y up -> Z up, +Z face -> -Y
+        y = np.radians(yaw_deg)
+        turn = np.array([[np.cos(y), -np.sin(y), 0.0], [np.sin(y), np.cos(y), 0.0], [0.0, 0.0, 1.0]])
+        M = turn @ to_take
+        pos = {k: M @ v for k, v in rest.items()}
+        if bend:
+            pivot_name, deg = bend
+            names = list(R.SPINE_SEGMENTS)
+            order = ["Hips", "Spine1", "Spine2", "Chest", "Neck1", "Head"]
+            pivot = pos[pivot_name]
+            a = np.radians(deg)
+            lat = M @ np.array([1.0, 0.0, 0.0])
+            K = np.array([[0, -lat[2], lat[1]], [lat[2], 0, -lat[0]], [-lat[1], lat[0], 0]])
+            rot = np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * K @ K
+            for k in order[order.index(pivot_name) + 1:] + ["LeftArm", "RightArm"]:
+                pos[k] = pivot + rot @ (pos[k] - pivot)
+        chain = {k: np.tile(pos[k], (self.n, 1)) for k in ("Hips", "Spine1", "Spine2", "Chest", "Neck1", "Head")}
+        hips = np.tile(pos["LeftLeg"] - pos["RightLeg"], (self.n, 1))
+        shoulders = np.tile(pos["LeftArm"] - pos["RightArm"], (self.n, 1))
+        return chain, hips, shoulders, rest, M
+
+    def rig_rest(self, M, short):
+        """The rig bone's rest direction on a body frame from the actor's own hip line, as the
+        retarget builds it (SOMA's rest hips are not quite level in depth)."""
+        line = M @ (np.array(SOMA_REST["LeftLeg"]) - np.array(SOMA_REST["RightLeg"]))
+        lat, up, fwd = R._body_frame(line[None], np.array([[0.0, 0.0, 1.0]]))
+        return R._unit(R._from_components(RIG_RESTS[short], (lat, up, fwd)))[0]
+
+    def test_actor_standing_as_at_rest_gives_the_rig_rest_spine(self):
+        for yaw in (0.0, 70.0, -150.0):
+            chain, hips, shoulders, rest, M = self.take(yaw)
+            out = R.spine_segment_directions(chain, hips, shoulders, rest, np.array([0.0, 1.0, 0.0]), RIG_RESTS)
+            self.assertEqual(set(out), set(RIG_RESTS))
+            for short, d in out.items():
+                np.testing.assert_allclose(d, np.tile(self.rig_rest(M, short), (self.n, 1)), atol=1e-9)
+
+    def test_a_bent_upper_back_bends_only_the_bones_above_it(self):
+        chain, hips, shoulders, rest, M = self.take(30.0, bend=("Chest", 25.0))
+        out = R.spine_segment_directions(chain, hips, shoulders, rest, np.array([0.0, 1.0, 0.0]), RIG_RESTS)
+        angle = lambda short: float(np.degrees(np.arccos(np.clip(out[short][0] @ self.rig_rest(M, short), -1, 1))))
+        for short in ("Hips", "Spine", "Spine1"):
+            self.assertLess(angle(short), 1e-6)                # below the bend: rest as before
+        for short in ("Spine2", "Neck"):
+            self.assertAlmostEqual(angle(short), 25.0, places=4)
+
+
+class Head(unittest.TestCase):
+    def test_hidden_face_turns_with_the_body(self):
+        # The actor turns 267 deg, facing the chest's forward all along; the face is unseen while
+        # the body turns 195 deg of it. Filled in the world, the head took the short way round.
+        n = 90
+        turn = np.radians(np.arange(n) * 3.0)
+        fwd = np.stack([np.sin(turn), -np.cos(turn), np.zeros(n)], axis=1)
+        lat = np.stack([np.cos(turn), np.sin(turn), np.zeros(n)], axis=1)
+        up = np.tile([0.0, 0.0, 1.0], (n, 1))
+        head = np.tile([0.0, 0.0, 1.6], (n, 1))
+        P = {R.HIP_C: np.tile([0.0, 0.0, 1.0], (n, 1)), R.SHOULDER_C: np.tile([0.0, 0.0, 1.45], (n, 1)),
+             R.L_SHOULDER: np.tile([0.0, 0.0, 1.45], (n, 1)) + 0.2 * lat,
+             R.R_SHOULDER: np.tile([0.0, 0.0, 1.45], (n, 1)) - 0.2 * lat,
+             R.EAR_C: head, R.L_EAR: head + 0.08 * lat, R.R_EAR: head - 0.08 * lat, R.NOSE: head + 0.1 * fwd,
+             R.EYE_L: head + 0.03 * lat + 0.08 * fwd + 0.03 * up, R.EYE_R: head - 0.03 * lat + 0.08 * fwd + 0.03 * up,
+             R.MOUTH_L: head + 0.02 * lat + 0.08 * fwd - 0.05 * up, R.MOUTH_R: head - 0.02 * lat + 0.08 * fwd - 0.05 * up}
+        hidden = (np.arange(n) >= 15) & (np.arange(n) <= 80)
+        frames = np.arange(n, dtype=float)
+        saved = R.local_location, R.landmark_confidence
+        R.local_location = lambda e, f: P[e][int(f)]
+        R.landmark_confidence = lambda _e, f, _i, *_floor: np.where(hidden, 0.0, 1.0)
+        try:
+            _, h_up, h_fwd = R.head_directions(list(range(40)), frames, 30.0)
+        finally:
+            R.local_location, R.landmark_confidence = saved
+        off = np.degrees(np.arccos(np.clip(np.sum(h_fwd * fwd, axis=1), -1.0, 1.0)))
+        self.assertLess(float(off.max()), 10.0)
+        np.testing.assert_allclose(h_up, up, atol=1e-6)
 
 
 class FootStates(unittest.TestCase):

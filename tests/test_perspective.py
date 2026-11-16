@@ -181,5 +181,74 @@ class WholeTake(unittest.TestCase):
         self.assertEqual(horizon, -5.4)
         self.assertFalse(report["horizon_found"])
 
+
+def size_trend(frames, take):
+    """How much the actor's picture size changes per metre the hips move away (0 = one size)."""
+    C = np.asarray(frames).reshape(len(frames), 40, 3)[:, :33, :2]
+    T = take["truth"][:len(C)]
+    true_xy = np.stack([T[:, :33, 0], -T[:, :33, 2]], axis=2)
+    a, b = C - C.mean(axis=1, keepdims=True), true_xy - true_xy.mean(axis=1, keepdims=True)
+    scale = (a * b).sum(axis=(1, 2)) / (b * b).sum(axis=(1, 2))
+    return float(np.polyfit(T[:, combine.HIP_C, 1], scale / np.median(scale), 1)[0])
+
+
+class FieldOfView(unittest.TestCase):
+    def test_found_focal_is_the_lens_and_keeps_the_walking_actor_one_size(self):
+        for distance in (3.5, 5.0):
+            take = synthetic_combine.make_take(seed=0, camera_distance=distance)
+            frames, _ = combine.combine_improved(take["front"], take["side"], take["tF"], take["tS"],
+                                                 take["visF"], take["visS"])
+            focal, report = combine.fit_focal(frames, 17.0)
+            self.assertTrue(report["focal_found"])
+            self.assertAlmostEqual(focal / (distance * UNIT), 1.0, delta=0.1)
+            fitted = combine.correct_perspective(frames, focal, -1.3 * UNIT, whole_take=True)[0]
+            self.assertLess(abs(size_trend(fitted, take)), 0.03)
+
+    def test_hip_travel_at_one_scale_follows_the_true_distance(self):
+        # Side x is turned into depth at each frame's own size, which grows as the actor nears the
+        # front camera: the hips' travel runs long and bends; at one scale it is nearly straight
+        take = synthetic_combine.make_take(seed=0, camera_distance=3.5)
+        frames, _ = combine.combine_improved(take["front"], take["side"], take["tF"], take["tS"],
+                                             take["visF"], take["visS"])
+        P = np.asarray(frames).reshape(len(frames), 40, 3)
+        true = take["truth"][:len(P), combine.HIP_C, 1] * UNIT
+        per_frame = np.polyfit(true, P[:, combine.HIP_C, 2], 2)
+        one_scale = np.polyfit(true, combine.take_depth(P), 2)
+        self.assertLess(abs(one_scale[0]), 0.4 * abs(per_frame[0]))       # bend
+        self.assertLess(abs(one_scale[1] - 1.0), 0.5 * abs(per_frame[1] - 1.0))   # stretch
+
+    def test_whole_take_scale_reaches_past_the_joint_limit(self):
+        # An actor 2.5 x nearer than the take's median distance: the body may shrink to 0.4, while
+        # each joint about the hips keeps PERSPECTIVE_FACTOR_RANGE
+        frames = np.zeros((3, 40, 3))
+        frames[:, :, 0] = np.linspace(-3, 3, 40)
+        frames[:, :, 2] = [[-10.2], [0.0], [0.0]]                         # first frame's hips 0.6 f nearer
+        fixed, report = combine.correct_perspective(frames.reshape(3, -1).tolist(), 17.0, whole_take=True)
+        self.assertLess(report["perspective_factor"][0], combine.PERSPECTIVE_FACTOR_RANGE[0])
+        x = np.asarray(fixed).reshape(3, 40, 3)[0, :33, 0]
+        np.testing.assert_allclose(x, frames[0, :33, 0] * 0.4)
+
+    def test_actor_at_one_size_keeps_the_default(self):
+        take = synthetic_combine.make_take(seed=0)                        # no perspective: size never changes
+        frames, _ = combine.combine_improved(take["front"], take["side"], take["tF"], take["tS"],
+                                             take["visF"], take["visS"])
+        focal, report = combine.fit_focal(frames, 17.0)
+        self.assertEqual(focal, 17.0)
+        self.assertFalse(report["focal_found"])
+        self.assertIn("focal_reason", report)
+
+    def test_fit_outside_the_limits_keeps_the_default(self):
+        take = synthetic_combine.make_take(seed=0, camera_distance=3.5)
+        frames, _ = combine.combine_improved(take["front"], take["side"], take["tF"], take["tS"],
+                                             take["visF"], take["visS"])
+        focal, report = combine.fit_focal(frames, 17.0, limits=(1.0, 2.0))
+        self.assertEqual(focal, 17.0)
+        self.assertFalse(report["focal_found"])
+
+    def test_field_of_view_and_focal_length_round_trip(self):
+        for fov in (30.0, 50.0, 65.0, 90.0):
+            self.assertAlmostEqual(combine.fov_from_focal(1920, combine.focal_from_fov(1920, fov)), fov)
+
+
 if __name__ == "__main__":
     unittest.main()

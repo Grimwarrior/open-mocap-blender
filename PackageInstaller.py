@@ -25,6 +25,7 @@ import importlib
 import importlib.util
 import importlib.metadata
 import urllib.request
+import hashlib
 import zipfile
 
 import bpy
@@ -72,6 +73,20 @@ RTMW_MODELS = {
              "https://download.openmmlab.com/mmpose/v1/projects/rtmw/onnx_sdk/"
              "rtmw-dw-x-l_simcc-cocktail14_270e-384x288_20231122.zip"),
 }
+# Experimental RTMW3D tracker: OpenMMLab RTMW3D-x (Apache-2.0) as a plain .onnx file, the copy
+# rtmlib itself downloads (OpenMMLab only publishes the PyTorch checkpoint). Uses RTMW's person
+# detector. See rtmw3d.py for how it was measured.
+RTMW3D_MODEL = ("rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626",
+                "https://huggingface.co/Soykaf/RTMW3D-x/resolve/main/onnx/"
+                "rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx")
+RTMW3D_TRACKERS = ('RTMW3D', 'RTMW3D_MP')     # RTMW3D alone, and with MediaPipe's depth mixed in
+RTMW_TRACKERS = ('RTMW',) + RTMW3D_TRACKERS   # trackers that need rtmlib and ONNX Runtime
+# Optional Depth Lifter (lifter.py): MotionAGFormer-B (TaatiTeam/MotionAGFormer, Apache-2.0) exported
+# to ONNX for the add-on (the project only publishes PyTorch checkpoints). Checked by SHA-256.
+LIFTER_MODEL = ("motionagformer-b-h36m.onnx",
+                "https://github.com/Grimwarrior/open-mocap-blender/releases/download/lifter-v1/"
+                "motionagformer-b-h36m.onnx",
+                "937c8701697fc60b491984dfbbc15a4a5d52d4e27abff74d05b767d19a48e971")
 
 # Packages Blender already ships. If pip ever wants to install these into our folder,
 # they would shadow Blender's own copy, so we warn about it.
@@ -129,6 +144,18 @@ def rtmw_model_path(kind):
         if "end2end.onnx" in files:
             return os.path.join(root, "end2end.onnx")
     return None
+
+
+def rtmw3d_model_path():
+    """:return: Path of the RTMW3D .onnx file, or None if missing."""
+    path = os.path.join(models_dir(), "rtmw3d", RTMW3D_MODEL[0], "end2end.onnx")
+    return path if os.path.isfile(path) else None
+
+
+def lifter_model_path():
+    """:return: Path of the Depth Lifter .onnx file, or None if missing."""
+    path = os.path.join(models_dir(), "lifter", LIFTER_MODEL[0])
+    return path if os.path.isfile(path) else None
 
 
 def add_lib_to_path():
@@ -204,8 +231,59 @@ def _pref(name, default):
 
 
 def pose_tracker():
-    """:return: 'MEDIAPIPE' or 'RTMW', from the add-on preferences."""
+    """:return: 'MEDIAPIPE', 'RTMW', 'RTMW3D' or 'RTMW3D_MP', from the add-on preferences."""
     return _pref("pose_tracker", 'MEDIAPIPE')
+
+
+def rtmw3d_depth_share():
+    """:return: RTMW3D's share of the depth next to MediaPipe's (tracker 'RTMW3D_MP'), 0..1."""
+    return float(_pref("rtmw3d_depth_share", 0.1))
+
+
+def depth_lifter():
+    """:return: True if the Depth Lifter is switched on in the add-on preferences."""
+    return bool(_pref("depth_lifter", False))
+
+
+def lifter_share():
+    """:return: the lifted depth's share in the mix with the tracker's depth, 0..1."""
+    return float(_pref("lifter_share", 0.5))
+
+
+def gemx_python():
+    """:return: the Python executable of GEM-X's own environment (add-on preferences), or ""."""
+    return bpy.path.abspath(_pref("gemx_python", "") or "")
+
+
+def gemx_repo():
+    """:return: the GEM-X repository folder (add-on preferences), or ""."""
+    return bpy.path.abspath(_pref("gemx_repo", "") or "")
+
+
+GEMX_FILES = (("weights", "body_s240000.ckpt"), ("weights", "vitpose.pth"),
+              ("weights", "motion_native77_e774_s292175.ckpt"), ("weights", "motion_stats_raw.npz"),
+              ("weights", "yolox_humanart.onnx"), ("assets", "soma", "SOMA_neutral.npz"))
+
+
+def gemx_missing():
+    """:return: list of what Track with GEM-X still needs (empty: ready)."""
+    missing = []
+    python, repo = gemx_python(), gemx_repo()
+    if not python or not os.path.isfile(python):
+        missing.append("GEM-X Python")
+    if not repo or not os.path.isdir(os.path.join(repo, "gem")):
+        missing.append("GEM-X folder")
+    else:
+        missing += [os.path.join(*f) for f in GEMX_FILES if not os.path.isfile(os.path.join(repo, *f))]
+    return missing
+
+
+def lifter_missing():
+    """:return: list of missing Depth Lifter pieces (ONNX Runtime and the model)."""
+    missing = [] if is_installed("onnxruntime") else [ORT_PACKAGE]
+    if lifter_model_path() is None:
+        missing.append("Depth Lifter model")
+    return missing
 
 
 def rtmw_device():
@@ -213,17 +291,24 @@ def rtmw_device():
     return 'dml' if _pref("rtmw_device", 'GPU') == 'GPU' and sys.platform == "win32" else 'cpu'
 
 
-def rtmw_missing():
-    """:return: list of missing RTMW pieces (packages and models)."""
+def rtmw_missing(tracker='RTMW'):
+    """:return: list of missing pieces (packages and models) of an RTMW / RTMW3D tracker."""
     missing = []
     if not is_installed("rtmlib"):
         missing.append("rtmlib")
     if not is_installed("onnxruntime"):
         missing.append(ORT_PACKAGE)
-    for kind in RTMW_MODELS:
+    for kind in _rtmw_kinds(tracker):
         if rtmw_model_path(kind) is None:
             missing.append(f"RTMW {kind} model")
+    if tracker in RTMW3D_TRACKERS and rtmw3d_model_path() is None:
+        missing.append("RTMW3D model")
     return missing
+
+
+def _rtmw_kinds(tracker):
+    """RTMW models a tracker needs: RTMW3D only borrows the person detector."""
+    return ("det",) if tracker in RTMW3D_TRACKERS else tuple(RTMW_MODELS)
 
 
 def requirement(ch):
@@ -254,11 +339,14 @@ def mediapipe_loaded():
     return "mediapipe" in sys.modules
 
 
-def check_required_packages(ch=None, tracker=None, model=None):
+def check_required_packages(ch=None, tracker=None, model=None, lifter=None):
     """Return a list of missing requirements (packages and model files)."""
     ch = ch or channel()
     tracker = tracker or pose_tracker()
-    missing = rtmw_missing() if tracker == 'RTMW' else []
+    lifter = depth_lifter() if lifter is None else lifter
+    missing = rtmw_missing(tracker) if tracker in RTMW_TRACKERS else []
+    if lifter:
+        missing += [m for m in lifter_missing() if m not in missing]
     if not mediapipe_ok(ch):
         found = installed_mediapipe_version()
         want = MEDIAPIPE_REQUIREMENT if ch == 'STABLE' else "mediapipe (latest)"
@@ -326,10 +414,11 @@ def _download_models():
         os.replace(tmp, target)
 
 
-def _download_rtmw_models():
+def _download_rtmw_models(kinds=tuple(RTMW_MODELS)):
     base = os.path.join(models_dir(), "rtmw")
     os.makedirs(base, exist_ok=True)
-    for kind, (name, url) in RTMW_MODELS.items():
+    for kind in kinds:
+        name, url = RTMW_MODELS[kind]
         if rtmw_model_path(kind) is not None:
             continue
         _set_status(f"Downloading RTMW {kind} model ({name})...")
@@ -350,7 +439,54 @@ def _download_rtmw_models():
         os.remove(archive)
 
 
-def _install_rtmw():
+def _download_rtmw3d_model():
+    if rtmw3d_model_path() is not None:
+        return
+    name, url = RTMW3D_MODEL
+    target = os.path.join(models_dir(), "rtmw3d", name)
+    os.makedirs(target, exist_ok=True)
+    _set_status(f"Downloading RTMW3D model ({name}, about 370 MB)...")
+    part = os.path.join(target, "end2end.onnx.part")
+    with urllib.request.urlopen(url, timeout=120) as response, open(part, "wb") as out:
+        shutil.copyfileobj(response, out)
+    os.replace(part, os.path.join(target, "end2end.onnx"))
+
+
+def _download_lifter_model():
+    if lifter_model_path() is not None:
+        return
+    name, url, sha256 = LIFTER_MODEL
+    target = os.path.join(models_dir(), "lifter")
+    os.makedirs(target, exist_ok=True)
+    _set_status(f"Downloading Depth Lifter model ({name}, about 48 MB)...")
+    part = os.path.join(target, name + ".part")
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=120) as response, open(part, "wb") as out:
+        while True:
+            chunk = response.read(1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+            out.write(chunk)
+    if digest.hexdigest() != sha256:
+        os.remove(part)
+        raise RuntimeError(f"The Depth Lifter model from {url} is not the expected file (SHA-256 differs)")
+    os.replace(part, os.path.join(target, name))
+
+
+def _install_lifter():
+    if not is_installed("onnxruntime"):
+        _set_status("Resolving ONNX Runtime...")
+        pins = _resolve_missing_requirements(ORT_PACKAGE)
+        _set_status(f"Installing ONNX Runtime ({len(pins)} packages) into {lib_dir()} ...")
+        os.makedirs(lib_dir(), exist_ok=True)
+        _pip("install", "--no-deps", "--upgrade", "--target", lib_dir(), *pins)
+        _remove_stale_metadata(pins)
+        importlib.invalidate_caches()
+    _download_lifter_model()
+
+
+def _install_rtmw(tracker='RTMW'):
     if not (is_installed("rtmlib") and is_installed("onnxruntime")):
         _set_status("Resolving RTMW packages...")
         # rtmlib itself without dependencies (see RTMLIB_REQUIREMENT); its runtime needs are ONNX
@@ -363,13 +499,16 @@ def _install_rtmw():
         _pip("install", "--no-deps", "--upgrade", "--target", lib_dir(), *pins)
         _remove_stale_metadata(pins)
         importlib.invalidate_caches()
-    _download_rtmw_models()
+    _download_rtmw_models(_rtmw_kinds(tracker))
+    if tracker in RTMW3D_TRACKERS:
+        _download_rtmw3d_model()
 
 
-def install_packages(ch='STABLE', update=False, tracker='MEDIAPIPE'):
+def install_packages(ch='STABLE', update=False, tracker='MEDIAPIPE', lifter=False):
     """
         :param update: for 'LATEST', reinstall even if a newer-than-stable MediaPipe is present.
-        :param tracker: 'RTMW' also installs rtmlib, ONNX Runtime and the RTMW models.
+        :param tracker: 'RTMW' / 'RTMW3D' / 'RTMW3D_MP' also install rtmlib, ONNX Runtime and that tracker's models.
+        :param lifter: also install ONNX Runtime and the Depth Lifter model.
     """
     _set_status("Installing dependencies...", busy=True)
     try:
@@ -380,8 +519,10 @@ def install_packages(ch='STABLE', update=False, tracker='MEDIAPIPE'):
             target = next((p.split("==")[1] for p in pins if p.lower().startswith("mediapipe==")), current)
             if update and target == current and mediapipe_ok(ch):
                 _download_models()
-                if tracker == 'RTMW':
-                    _install_rtmw()
+                if tracker in RTMW_TRACKERS:
+                    _install_rtmw(tracker)
+                if lifter:
+                    _install_lifter()
                 _set_status(f"MediaPipe {current} is already the latest version.", busy=False)
                 return
             if mediapipe_loaded() and current and target != current:
@@ -395,14 +536,17 @@ def install_packages(ch='STABLE', update=False, tracker='MEDIAPIPE'):
                 _remove_stale_metadata(pins)
                 importlib.invalidate_caches()
         _download_models()
-        if tracker == 'RTMW':
-            _install_rtmw()
+        if tracker in RTMW_TRACKERS:
+            _install_rtmw(tracker)
+        if lifter:
+            _install_lifter()
         add_lib_to_path()
-        missing = check_required_packages(ch, tracker)
+        missing = check_required_packages(ch, tracker, lifter=lifter)
         if missing:
             _set_status(f"Install finished but still missing: {', '.join(missing)}", busy=False)
         else:
-            extra = " and RTMW" if tracker == 'RTMW' else ""
+            extra = f" and {tracker}" if tracker in RTMW_TRACKERS else ""
+            extra += " and the Depth Lifter" if lifter else ""
             _set_status(f"All dependencies are installed (MediaPipe {installed_mediapipe_version()}{extra}).",
                         busy=False)
     except Exception as e:  # noqa: BLE001 - report anything to the user
@@ -452,7 +596,7 @@ class InstallAddonDependenciesOperator(bpy.types.Operator):
     def execute(self, context):
         self.report({'INFO'}, "Installing dependencies... Check Blender console for progress.")
         status["busy"] = True
-        threading.Thread(target=install_packages, args=(channel(), self.update, pose_tracker()),
+        threading.Thread(target=install_packages, args=(channel(), self.update, pose_tracker(), depth_lifter()),
                          daemon=True).start()
         bpy.app.timers.register(_redraw_preferences, first_interval=0.5)
         return {'FINISHED'}

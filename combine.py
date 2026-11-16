@@ -963,6 +963,21 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
 # The depths of all views that measure one are averaged by visibility into one "virtual side
 # view", which goes through combine_improved once more, so gap filling, smoothing, bone lengths and
 # confidence work exactly as for two videos.
+def _align_view_at(F, tF, S_raw, tS, visS_raw, offset, fps):
+    """A view on the front frames at a given time offset (no time warp): like _align_view."""
+    tq = tF + offset
+    support = interpolation_support(tq, tS)
+    valid = (tq >= tS[0]) & (tq <= tS[-1]) & (support > 0)
+    S = _interp(tq, tS, S_raw)
+    vis = _interp(tq, tS, visS_raw) * valid[:, None]
+    scale = _scale_per_frame(F, S, valid, fps)
+    S, vis, _sw = _fix_left_right(F, S, vis, scale, valid)
+    w = _side_weight(vis) * support[:, None]
+    return dict(S=S, vis=vis, valid=valid, scale=scale, w=np.minimum(w, w[:, [HIP_C]]),
+                U=S[:, :, 0] * scale[:, None], offset=float(offset), corr=float("nan"), motion=float("nan"),
+                height_err=height_agreement(F, S, scale, vis, valid))
+
+
 def _align_view(F, tF, S_raw, tS, visS_raw, sync, fps):
     """Steps 1-3 of combine_improved for one view. :return: (dict, None) or (None, reason)."""
     offset, corr = find_time_offset(tF, F, tS, S_raw)
@@ -1067,18 +1082,7 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
             notes[i]["reason"] = "its tracked data is incomplete"
             continue
         if i == first and base.get("sync_corr") != base.get("sync_corr"):      # manual offset
-            tq = tF + base["offset_s"]
-            support = interpolation_support(tq, tS)
-            valid = (tq >= tS[0]) & (tq <= tS[-1]) & (support > 0)
-            S = _interp(tq, tS, S_raw)
-            vis = _interp(tq, tS, visS) * valid[:, None]
-            scale = _scale_per_frame(F, S, valid, fps)
-            S, vis, _sw = _fix_left_right(F, S, vis, scale, valid)
-            w = _side_weight(vis) * support[:, None]
-            aligned[i] = dict(S=S, vis=vis, valid=valid, scale=scale, w=np.minimum(w, w[:, [HIP_C]]),
-                              U=S[:, :, 0] * scale[:, None], offset=float(base["offset_s"]), corr=float("nan"),
-                              motion=float("nan"),
-                              height_err=height_agreement(F, S, scale, vis, valid))
+            aligned[i] = _align_view_at(F, tF, S_raw, tS, visS, float(base["offset_s"]), fps)
             continue
         aligned[i], why = _align_view(F, tF, S_raw, tS, visS, sync, fps)
         if aligned[i] is None:
@@ -1163,6 +1167,195 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
 
 
 # -------------------------------------------------------------
+# SWORD
+# -------------------------------------------------------------
+# sword.py finds the blade's direction in each video's picture. One picture direction says which
+# plane through the camera the blade lies in; two cameras that look from different directions
+# cut those planes in one line, the blade's direction in 3D. In the front view's frame the blade s
+# lies in its plane when fx * s_y - fy * s_x = 0; a further view at the fitted direction (alpha, beta)
+# (see fit_view_direction: its x = alpha * x + beta * depth, its y = y) sees (alpha s_x + beta s_z, s_y),
+# which lies along its picture direction (ux, uy) when ux * s_y - uy * (alpha s_x + beta s_z) = 0.
+# Each frame's s is the direction that breaks these conditions least, weighted by each view's
+# confidence (a further view by |beta| too: one along the front view's line sees no depth), and
+# pointing where the front picture's blade points. Without a usable further view the blade lies in
+# the front picture's plane. Directions are smoothed over time by confidence, so frames where the
+# blade is blurred away take theirs from their neighbours.
+# Katana take (separate performances): rightToleft alone and LeftToRight alone, filmed from opposite
+# sides, give 3D blades 22 degrees apart in the median frame and agree on its depth sign in 75%; the
+# fused blade runs within a median 32 degrees of the line between the two tracked wrists.
+SWORD_FRONT_WEIGHT = 2.0      # the front picture's condition counts this much more than a further view's
+SWORD_SMOOTH_S = 0.05         # smoothing of the blade direction (s)
+SWORD_FILL_S = 0.25           # ... frames with almost no confident neighbour within that take from this far
+
+
+def _sword_rows(view_sword, tq, tS):
+    """A view's blade direction and confidence at the front frames' times (side time tq)."""
+    vs = np.asarray(view_sword, dtype=np.float64)
+    support = interpolation_support(tq, tS)
+    valid = (tq >= tS[0]) & (tq <= tS[-1]) & (support > 0)
+    u = _interp(tq, tS, vs[:, :2] * vs[:, 2:3])            # confidence-weighted, so a flip fades through zero
+    norm = np.linalg.norm(u, axis=1)
+    conf = _interp(tq, tS, vs[:, 2]) * valid * support * np.clip(norm / np.maximum(_interp(tq, tS, vs[:, 2]), 1e-9), 0, 1)
+    return u / np.maximum(norm, 1e-9)[:, None], conf
+
+
+def sword_axis(front_list, front_times, front_sword, views, combined, report, front_vis=None):
+    """
+        :param front_sword: [dx, dy, confidence] per front frame (sword.track_frames).
+        :param views: as for combine_multi, each optionally with "sword" like front_sword.
+        :param combined: the combined frames; report: combine_multi's report (offsets per view).
+        :return: (list of [x, y, depth, confidence] per front frame, a unit vector in the combine's
+                 coordinates, report dict with the views used).
+    """
+    F = _as_array(front_list)
+    tF = np.asarray(front_times, dtype=np.float64)
+    D = _as_array(combined)[:, :, 2]
+    n = len(F)
+    fs = np.asarray(front_sword, dtype=np.float64).reshape(n, -1)[:, :3]
+    f_dir, f_conf = fs[:, :2] / np.maximum(np.linalg.norm(fs[:, :2], axis=1), 1e-9)[:, None], np.clip(fs[:, 2], 0, 1)
+    fps = _fps(tF)
+    notes = report.get("views") or []
+    A = np.zeros((n, 3, 3))
+    rows = np.stack([-f_dir[:, 1], f_dir[:, 0], np.zeros(n)], axis=1) * (SWORD_FRONT_WEIGHT * f_conf)[:, None]
+    A += rows[:, :, None] * rows[:, None, :]
+    depth_weight = np.zeros(n)
+    used = []
+    for i, v in enumerate(views):
+        note = notes[i] if i < len(notes) else {}
+        if not v.get("sword") or "offset_s" not in note or len(v["sword"]) != len(v["frames"]):
+            continue
+        S_raw = _as_array(v["frames"])
+        tS = np.asarray(v["times"], dtype=np.float64)
+        visS = (np.clip(np.asarray(v["vis"], dtype=np.float64), 0.0, 1.0) if v.get("vis") is not None
+                else np.ones((len(S_raw), N_PTS)))
+        aligned = _align_view_at(F, tF, S_raw, tS, visS, float(note["offset_s"]), fps)
+        alpha, beta, _size, fit = fit_view_direction(F, D, aligned)
+        if fit < MULTI_MIN_FIT or abs(beta) < 1e-3:
+            continue
+        u, conf = _sword_rows(v["sword"], tF + float(note["offset_s"]), tS)
+        w = conf * abs(beta)
+        r = np.stack([-u[:, 1] * alpha, u[:, 0], -u[:, 1] * beta], axis=1) * w[:, None]
+        A += r[:, :, None] * r[:, None, :]
+        depth_weight += w
+        used.append(dict(name=note.get("name", v.get("name", "view")), angle=float(np.degrees(np.arctan2(-beta, alpha))),
+                         seen=float(np.mean(conf > 0.5))))
+    s = np.zeros((n, 3))
+    conf = np.zeros(n)
+    for k in range(n):
+        vals, vecs = np.linalg.eigh(A[k])
+        if depth_weight[k] > 1e-3 and f_conf[k] > 1e-3:
+            v = vecs[:, 0]
+            # the smallest condition must be clearly smaller than the next: else the views do not pin it down
+            gap = (vals[1] - vals[0]) / max(vals[2], 1e-12)
+            conf[k] = f_conf[k] * min(1.0, depth_weight[k]) * float(np.clip(gap / 0.1, 0.0, 1.0))
+        else:
+            v = np.array([f_dir[k, 0], f_dir[k, 1], 0.0])
+            conf[k] = 0.5 * f_conf[k]
+        if v[0] * f_dir[k, 0] + v[1] * f_dir[k, 1] < 0:
+            v = -v
+        s[k] = v / max(np.linalg.norm(v), 1e-9)
+    # smoothing over time by confidence; frames without confident neighbours take from further away
+    out = s.copy()
+    for sigma_s in (SWORD_FILL_S, SWORD_SMOOTH_S):
+        w = conf + 1e-4
+        num = _gauss_timed(s * w[:, None], tF, sigma_s * fps)
+        den = _gauss_timed(w[:, None], tF, sigma_s * fps)
+        est = num / np.maximum(den, 1e-12)
+        keep = (den[:, 0] > 0.05) if sigma_s == SWORD_SMOOTH_S else np.ones(n, dtype=bool)
+        out[keep] = est[keep]
+    out /= np.maximum(np.linalg.norm(out, axis=1), 1e-9)[:, None]
+    result = [[float(a), float(b), float(c), float(q)] for (a, b, c), q in zip(out, conf)]
+    return result, dict(views=used, seen=float(np.mean(f_conf > 0.5)), with_depth=float(np.mean(conf > 0.25)))
+
+
+# -------------------------------------------------------------
+# TWO HANDS ON ONE HANDLE
+# -------------------------------------------------------------
+# A two-handed sword is held with both hands on its handle, a hand's width apart. The trackers lose
+# the hand that is behind the body or the other arm and guess it somewhere near the hip (katana take,
+# frame 50: the left wrist hidden in the front video, both wrists hidden in the side one, and put at
+# the hip, 0.72 shoulder widths from the right one; on a katana handle the wrists are about 0.4 apart,
+# which is also the take's own spacing where both are seen: 25th percentile 0.39). Per frame
+# each wrist says where the handle is; the two are averaged by how reliable each wrist is, and the
+# hands are put on the handle at the take's own spacing, along the tracked blade (or, without one,
+# along the smoothed line from one wrist to the other). Each hand's knuckle points move with their
+# wrist, and the elbow is solved again for the arm's usual upper arm and forearm lengths, bent the
+# way it was.
+GRIP_SPACING_RANGE = (0.2, 0.6)    # handle spacing between the wrists, in shoulder widths
+GRIP_AXIS_SMOOTH_S = 0.25          # smoothing of the wrist-to-wrist line where there is no tracked blade
+HAND_POINTS = {15: (17, 19, 21), 16: (18, 20, 22)}
+
+
+def _reach_elbow(shoulder, wrist, elbow, upper, fore):
+    """Elbow for fixed upper arm / forearm lengths, in the plane of the old elbow (N, 3 each)."""
+    t = wrist - shoulder
+    d = np.linalg.norm(t, axis=1)
+    u = t / np.maximum(d, 1e-9)[:, None]
+    d = np.clip(d, abs(upper - fore) * 1.02 + 1e-6, (upper + fore) * 0.999)
+    bend = elbow - shoulder
+    bend = bend - np.sum(bend * u, axis=1, keepdims=True) * u
+    n = np.linalg.norm(bend, axis=1)
+    fallback = np.cross(u, np.array([0.0, 0.0, 1.0]))
+    bend = np.where(n[:, None] > 1e-6, bend / np.maximum(n, 1e-9)[:, None],
+                    fallback / np.maximum(np.linalg.norm(fallback, axis=1), 1e-9)[:, None])
+    cos_a = np.clip((upper * upper + d * d - fore * fore) / (2 * upper * d), -1.0, 1.0)
+    return shoulder + upper * (cos_a[:, None] * u + np.sqrt(1 - cos_a ** 2)[:, None] * bend)
+
+
+def two_hand_grip(frames, reliability, axis=None, fps=30.0):
+    """
+        :param frames: combined frames (flat 40 * [x, y, depth]). :param reliability: (N, 40) how far
+                       each point can be trusted (front visibility and depth confidence).
+        :param axis: sword_axis rows ([x, y, depth, confidence] per frame) or None.
+        :return: (frames with both hands on one handle, report dict).
+    """
+    P = _as_array(frames).copy()
+    n = len(P)
+    rel = np.clip(np.asarray(reliability, dtype=np.float64).reshape(n, N_PTS), 0.0, 1.0)
+    rL, rR = rel[:, 15], rel[:, 16]
+    wL, wR = rL ** 2 + 1e-4, rR ** 2 + 1e-4           # a hidden hand's guess must not pull the handle
+    L, R = P[:, 15].copy(), P[:, 16].copy()
+    shoulder_w = float(np.median(np.linalg.norm(P[:, 11] - P[:, 12], axis=1)))
+    gap = np.linalg.norm(R - L, axis=1)
+    both = (rL > 0.6) & (rR > 0.6)
+    spacing = float(np.percentile(gap[both], 25)) if both.sum() >= 5 else 0.25 * shoulder_w
+    spacing = float(np.clip(spacing, GRIP_SPACING_RANGE[0] * shoulder_w, GRIP_SPACING_RANGE[1] * shoulder_w))
+    # the handle's direction: the blade where it was seen, else the smoothed line between the wrists
+    line = _gauss((R - L) * np.minimum(rL, rR)[:, None], GRIP_AXIS_SMOOTH_S * fps)
+    line /= np.maximum(np.linalg.norm(line, axis=1), 1e-9)[:, None]
+    a = line
+    if axis is not None and len(axis) == n:
+        A = np.asarray(axis, dtype=np.float64)
+        blade, c = A[:, :3] / np.maximum(np.linalg.norm(A[:, :3], axis=1), 1e-9)[:, None], np.clip(A[:, 3:4], 0, 1)
+        # the right hand on the blade's side of the left (or behind it), as the take mostly has it
+        way = 1.0 if np.median(np.sum((R - L)[both] * blade[both], axis=1)) >= 0 else -1.0
+        a = (1 - c) * line + c * way * blade
+        a /= np.maximum(np.linalg.norm(a, axis=1), 1e-9)[:, None]
+    centre = (wL[:, None] * (L + 0.5 * spacing * a) + wR[:, None] * (R - 0.5 * spacing * a)) / (wL + wR)[:, None]
+    newL, newR = centre - 0.5 * spacing * a, centre + 0.5 * spacing * a
+    upper, fore = {}, {}
+    for side, (s, e, w) in {"L": (11, 13, 15), "R": (12, 14, 16)}.items():
+        ok = rel[:, [s, e, w]].min(axis=1) > 0.5
+        pick = ok if ok.sum() >= 5 else np.ones(n, dtype=bool)
+        upper[side] = float(np.median(np.linalg.norm(P[pick, e] - P[pick, s], axis=1)))
+        fore[side] = float(np.median(np.linalg.norm(P[pick, w] - P[pick, e], axis=1)))
+    moved = np.zeros(n)
+    for side, w, new in (("L", 15, newL), ("R", 16, newR)):
+        s, e = (11, 13) if side == "L" else (12, 14)
+        delta = new - P[:, w]
+        moved = np.maximum(moved, np.linalg.norm(delta, axis=1))
+        P[:, w] = new
+        for j in HAND_POINTS[w]:
+            P[:, j] += delta
+        P[:, e] = _reach_elbow(P[:, s], new, P[:, e], upper[side], fore[side])
+    for c, (i, j) in CENTROIDS.items():
+        P[:, c] = (P[:, i] + P[:, j]) / 2
+    report = dict(spacing=spacing / max(shoulder_w, 1e-9), gap_before=float(np.median(gap)) / max(shoulder_w, 1e-9),
+                  moved=float(np.mean(moved > 0.15 * shoulder_w)))
+    return P.reshape(n, -1).tolist(), report
+
+
+# -------------------------------------------------------------
 # PERSPECTIVE
 # -------------------------------------------------------------
 # Everything above treats the picture as orthographic: a point's x/y in the video is taken as its x/y in
@@ -1176,7 +1369,8 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
 # with f the focal length in those units. Only f is needed, not the actor's distance: depths are measured
 # in picture units at the hips' own distance, which is what d / Z is made of.
 PERSPECTIVE_FOV = 60.0        # default horizontal field of view of the front camera (degrees)
-PERSPECTIVE_FACTOR_RANGE = (0.6, 1.6)  # the correction never moves a point by more than this
+PERSPECTIVE_FACTOR_RANGE = (0.6, 1.6)  # a joint is never moved by more than this about its hips
+PERSPECTIVE_TAKE_RANGE = (0.4, 2.5)    # whole take: the body's size factor from the hips' distance (see there)
 # Leg lengths after the correction. A leg reaching away from the camera looks short twice over: it is
 # foreshortened and, being further away, smaller. The bone-length solve inside the combine sees the
 # picture before this correction, where "too short" is often just "further away", so it never pushes
@@ -1200,19 +1394,123 @@ def focal_from_fov(width_px, fov_deg):
     return (width_px / 2.0) / np.tan(np.radians(np.clip(fov_deg, 5.0, 170.0)) / 2.0) / 100.0
 
 
-def _unproject_xy(XY, D, focal, horizon, reference=None):
+def fov_from_focal(width_px, focal):
+    """Horizontal field of view in degrees of a camera `width_px` wide with focal length `focal` (tracker units)."""
+    return float(np.degrees(2.0 * np.arctan((width_px / 2.0) / 100.0 / max(focal, 1e-9))))
+
+
+# The field of view. How much a camera's picture shrinks per unit of distance is its focal length: an
+# actor whose hips are d further away than the reference looks smaller by 1 / (1 + d / f). The front
+# video's size of the actor (front_perspective_scale: its limbs nearest the picture plane, so the
+# depth cannot feed back into it) against the hips' depth at one scale (take_depth) is then a line,
+#     1 / size = a + b * d,   f = a / b,
+# the focal length that keeps the actor one size through the take. It measures what the combine
+# needs rather than the lens: when the other views put the hips too far (a side take of another
+# performance), the focal length comes out longer by as much and the actor still keeps its size.
+# The actor has to change distance for it: the fit is used only if size and depth agree
+# (FOV_MIN_CORR) and the size changes by FOV_MIN_CHANGE over the take.
+# Synthetic actor walking 1.5 m toward the camera at 3.5 / 5 / 6 m: focal found 1.02 / 1.04 / 1.04 x
+# the lens's, size against true distance -0.01 per metre, bone length variation 3.6 / 2.9 / 2.8%
+# (hips' depth per frame instead, lens: 10.8 / 4.5 / 3.5%, the actor growing 0.20 / 0.06 / 0.04 per m).
+# HEAVY back-to-front take (RTMW + lifter, side view a separate performance), whole take: 65 deg as set
+# shrank the body 20% first to last, bone variation 15.0%; now 44 deg is found: -6%, 12.6%.
+# Front-to-back (the actor starts 2.4 x bigger, head cut off): 65 deg 22.5%, now 53 deg found 15.3%.
+# Katana / Whirlpool four-view takes: 50 / 67 deg found, bone variation within 0.1% of before; a take
+# standing in place keeps the setting.
+FOV_MIN_CORR = 0.6
+FOV_MIN_CHANGE = 0.08
+FOV_RANGE = (20.0, 100.0)    # degrees; a fit outside is not trusted
+
+
+def fit_focal(frames, default, fps=30.0, limits=None):
+    """
+        The front camera's focal length that keeps the actor one size as the hips move in depth (see above).
+        :param frames: combined frames before the perspective correction (flat 40 * [x, y, depth]).
+        :param default: focal length kept when the take cannot tell (tracker units).
+        :param limits: (shortest, longest) focal length to accept; None = any.
+        :return: (focal, report dict: "focal_found", "focal_corr" of size against depth,
+                 "focal_size_change" over the take, "focal_reason" when `default` was kept)
+    """
+    P = _as_array(frames)
+    report = {"focal_found": False}
+    if len(P) < 3 * max(1, int(fps)):
+        report["focal_reason"] = "take shorter than 3 s"
+        return default, report
+    inv = 1.0 / np.maximum(front_perspective_scale(P, fps), 1e-6)
+    hips = _gauss(take_depth(P, fps), max(1.0, PERSPECTIVE_SMOOTH_S * fps), trend=True)
+    d = hips - float(np.median(hips))
+    corr = float(np.corrcoef(inv, d)[0, 1]) if np.std(d) > 1e-9 and np.std(inv) > 1e-9 else 0.0
+    report["focal_corr"] = corr
+    keep = np.ones(len(d), dtype=bool)
+    a = b = 0.0
+    for _ in range(3):                                                    # drop outliers, solve again
+        A = np.stack([np.ones(int(keep.sum())), d[keep]], axis=1)
+        a, b = np.linalg.lstsq(A, inv[keep], rcond=None)[0]
+        res = np.abs(a + b * d - inv)
+        new_keep = res <= 4.0 * 1.4826 * (np.median(res[keep]) + 1e-9)
+        if new_keep.sum() < 0.5 * len(d):
+            break
+        keep = new_keep
+    lo, hi = np.percentile(d, [5, 95])
+    change = float(abs(b) * (hi - lo) / max(abs(a), 1e-9))
+    report["focal_size_change"] = change
+    if corr < FOV_MIN_CORR or b <= 0 or a <= 0:
+        report["focal_reason"] = (f"size and depth do not agree (correlation {corr:.2f})" if corr < FOV_MIN_CORR
+                                  else "the actor grows walking away")
+        return default, report
+    if change < FOV_MIN_CHANGE:
+        report["focal_reason"] = f"the actor's size changes only {change:.0%} over the take"
+        return default, report
+    focal = float(a / b)
+    if limits is not None and not (limits[0] <= focal <= limits[1]):
+        report["focal_reason"] = "the fit is outside the accepted field of view"
+        return default, report
+    report["focal_found"] = True
+    return focal, report
+
+
+def _unproject_xy(XY, D, focal, horizon, reference=None, hips_take=None):
     """
         x/y (N, 40, 2) with the perspective of depths D (N, 40) taken out; centroids stay means.
         :param reference: depth the picture is scaled to (None: each frame's hips).
+        :param hips_take: (N,) the hips' depth at one scale (take_depth) for the whole take's scale.
     """
-    base = D[:, [HIP_C]] if reference is None else reference
-    factor = np.clip(1.0 + (D - base) / focal, *PERSPECTIVE_FACTOR_RANGE)
+    hips = D[:, [HIP_C]]
+    take = (np.ones_like(hips) if reference is None
+            else _take_scale(hips if hips_take is None else np.asarray(hips_take)[:, None], reference, focal))
+    # 1 + (D - reference) / f = take * (1 + (D - hips) / (f * take)): the hips' distance, then each
+    # joint's about the hips, each held to its own range
+    factor = take * np.clip(1.0 + (D - hips) / (focal * take), *PERSPECTIVE_FACTOR_RANGE)
     out = XY.copy()
     out[:, :, 0] = XY[:, :, 0] * factor
     out[:, :, 1] = horizon + (XY[:, :, 1] - horizon) * factor
     for c, (a, b) in CENTROIDS.items():
         out[:, c] = (out[:, a] + out[:, b]) / 2
-    return out
+    return out, factor
+
+
+def _take_scale(hips, reference, focal):
+    """Size factor of the whole body for hips at depth `hips` against the reference (PERSPECTIVE_TAKE_RANGE)."""
+    return np.clip(1.0 + (hips - reference) / focal, *PERSPECTIVE_TAKE_RANGE)
+
+
+# The hips' travel in depth at one scale. The combine turns side x into depth in the front picture's
+# units of each frame (step 2 at the top): side x times the front/side size ratio, which grows as
+# the actor nears the front camera. Depths within a frame need just that, but the hips' own distance,
+# measured from the side picture's centre line, then runs long where the actor is near and short
+# where he is far. Divided by the front view's size it is at the take's median size again.
+# Synthetic actor walking 1.5 m toward the camera, hip depth against the true one: slope 1.89 -> 1.32
+# (3.5 m) and 1.50 -> 1.20 (5 m), bend (quadratic term) -0.25 -> -0.07 and -0.14 -> -0.05; a slope
+# alone the focal length fit (fit_focal) absorbs, a bend it cannot.
+TAKE_DEPTH_AT_ONE_SCALE = True
+
+
+def take_depth(P, fps=30.0):
+    """(N,) depth of the hips with the front view's per-frame size divided out (see above)."""
+    hips = np.asarray(P[:, HIP_C, 2], dtype=np.float64)
+    if not TAKE_DEPTH_AT_ONE_SCALE:
+        return hips
+    return hips / np.maximum(front_perspective_scale(P, fps), 1e-6)
 
 
 # The whole take. Taken out relative to each frame's hips, the perspective leaves every frame at the
@@ -1222,7 +1520,12 @@ def _unproject_xy(XY, D, focal, horizon, reference=None):
 # against the hips' depth correlated 0.88). With whole_take every frame is scaled to one reference
 # depth, the hips' median, the hips' own depth from the other views included: x and y about the
 # picture's centre and the horizon, and depths relative to the hips like x and y, so the body keeps
-# one size. The hips' depth itself is left as it was.
+# one size. The hips' depth itself is left as it was. The body's size factor (from the hips' depth at
+# one scale, take_depth) has its own limit, PERSPECTIVE_TAKE_RANGE: each joint about the hips keeps
+# PERSPECTIVE_FACTOR_RANGE, but an actor walking from near the camera to the back of a room needs
+# more. HEAVY front-to-back (2.4 x bigger at the start), bone length variation with the body held to
+# 0.6..1.6 / 0.4..2.5 / 0.25..4.0: 19.9 / 15.3 / 17.9%; the widest shrank the first frames, where the
+# actor's head is cut off, to 0.69 of his size. Other takes never reach 0.6..1.6.
 # Synthetic actor (combine benchmark, 6 s walking 1.5 m toward the camera), per frame -> whole take:
 #   camera at 5 m: depth error 3.36 -> 3.13% of body height, x/y error 7.4 -> 5.0%, limb length
 #   variation 11.8 -> 6.2%; at 3.5 m: 4.39 -> 3.69%, 11.8 -> 6.9%, 17.2 -> 7.6%.
@@ -1245,19 +1548,17 @@ def correct_perspective(frames, focal, horizon=0.0, confidence=None, bone_streng
     if focal <= 0 or not len(P):
         return [list(f) for f in frames], {"perspective_factor": (1.0, 1.0)}
     P = P.copy()
-    reference = float(np.median(P[:, HIP_C, 2])) if whole_take else None
-    P[:, :, :2] = _unproject_xy(P[:, :, :2], P[:, :, 2], focal, horizon, reference)
+    hips_take = take_depth(P, fps) if whole_take else None
+    reference = float(np.median(hips_take)) if whole_take else None
+    P[:, :, :2], factor = _unproject_xy(P[:, :, :2], P[:, :, 2], focal, horizon, reference, hips_take)
     if whole_take:
         hips = P[:, [HIP_C], 2]
-        grow = np.clip(1.0 + (hips - reference) / focal, *PERSPECTIVE_FACTOR_RANGE)
-        P[:, :, 2] = hips + (P[:, :, 2] - hips) * grow
+        P[:, :, 2] = hips + (P[:, :, 2] - hips) * _take_scale(hips_take[:, None], reference, focal)
     if confidence is not None and bone_strength > 0 and PERSPECTIVE_LENGTHEN > 0:
         weight = np.clip(np.asarray(confidence, dtype=np.float64), 0.0, 1.0)
         if weight.shape == P.shape[:2]:
             P[:, :, 2] = _solve_skeleton(P, P[:, :, 2].copy(), weight, bone_strength, fps, PERSPECTIVE_LENGTHEN,
                                          PERSPECTIVE_LENGTHEN_SEGMENTS)
-    rel = P[:, :, 2] - (P[:, [HIP_C], 2] if reference is None else reference)
-    factor = np.clip(1.0 + rel / focal, *PERSPECTIVE_FACTOR_RANGE)
     return P.reshape(len(P), -1).tolist(), {"perspective_factor": (float(factor.min()), float(factor.max()))}
 
 
@@ -1332,8 +1633,10 @@ def fit_horizon(frames, focal, fps=30.0, default=0.0, whole_take=False):
         low.append(P[np.arange(n), pick])
     report = {"horizon_samples": 0, "horizon_found": False, "horizon_mode": "take" if whole_take else "frame"}
     if whole_take:
+        hips_take = take_depth(P, fps)
+        shift = hips_take - P[:, HIP_C, 2] - float(np.median(hips_take))  # foot depth -> against the reference
         pts = np.concatenate([low[k][stands[k]] for k in range(2)])
-        v, e = pts[:, 1], pts[:, 2] - float(np.median(P[:, HIP_C, 2]))
+        v, e = pts[:, 1], pts[:, 2] + np.concatenate([shift[stands[k]] for k in range(2)])
         A = np.stack([-e / focal, -np.ones(len(e))], axis=1)                # unknowns: horizon, floor c
         y = -(v + v * e / focal)
         spread = float(np.std(e)) if len(e) else 0.0

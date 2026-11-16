@@ -65,6 +65,14 @@ def validate_pose_capture(data):
         if data.get('position_times') and len(raw) != len(data['position_times']):
             raise ValueError('Raw pose frames do not match the timestamps')
     _metadata(data.get('position_meta_raw') or [], len(raw or []), 'position_meta_raw')
+    # Sword directions (absent in older files): one row per tracked frame of their view
+    for key, width, count in (('sword_front', 3, len(data.get('position_times', []))),
+                              ('sword_side', 3, len(data.get('zlist_times', []))),
+                              ('sword_axis', 4, len(data.get('positionList', [])))):
+        rows = data.get(key, [])
+        _rows(rows, width, key)
+        if rows and len(rows) != count:
+            raise ValueError(f'{key} does not match the frame count')
     for key in ('fps', 'front_fps', 'side_fps', 'hand_fps', 'hand_front_fps', 'hand_side_fps'):
         if key in data and (not _finite(data[key]) or data[key] < 0):
             raise ValueError(f'Invalid {key}')
@@ -91,9 +99,16 @@ def validate_extra_views(views):
         fps = view.get('fps', 0)
         if not _finite(fps) or fps < 0:
             raise ValueError('Invalid extra view fps')
-        checked.append({'path': str(view.get('path', '')), 'name': str(view.get('name', '') or 'view'),
-                        'frames': frames, 'times': times, 'vis': vis, 'meta': meta,
-                        'missing_times': missing, 'fps': fps})
+        entry = {'path': str(view.get('path', '')), 'name': str(view.get('name', '') or 'view'),
+                 'frames': frames, 'times': times, 'vis': vis, 'meta': meta,
+                 'missing_times': missing, 'fps': fps}
+        sword = view.get('sword', [])
+        _rows(sword, 3, 'extra view sword')
+        if sword:
+            if len(sword) != len(frames):
+                raise ValueError('An extra view has mismatched sword and frame counts')
+            entry['sword'] = sword
+        checked.append(entry)
     return checked
 
 

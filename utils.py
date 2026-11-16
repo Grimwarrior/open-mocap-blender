@@ -5,6 +5,8 @@ import bpy
 import numpy as np
 from . import globalVariables as gvar
 from . import PackageInstaller
+from . import rtmw3d as rtmw3d_math
+from . import lifter
 from .capture_data import CaptureClock
 
 
@@ -207,6 +209,31 @@ _RTMW_SCORE_LOW, _RTMW_SCORE_RANGE = 2.0, 3.5
 BODY_HAND_MIN_VIS = 0.3     # mean visibility of a hand's 21 points below which the hand is not recorded
 
 
+def _pick_person(keypoints, scores, previous):
+    """:return: index of the person to track: the one nearest the last hip centre, else the largest."""
+    body = keypoints[:, :23]
+    if previous is not None and len(keypoints) > 1:
+        hips = (keypoints[:, 11] + keypoints[:, 12]) / 2
+        return int(np.argmin(np.linalg.norm(hips - previous, axis=1)))
+    size = np.ptp(body[:, :, 0], axis=1) * np.ptp(body[:, :, 1], axis=1)
+    return int(np.argmax(size * scores[:, :23].mean(axis=1)))
+
+
+def _same_actor(pts, visibility, mp_landmarks, mp_visibility):
+    """
+        Independent models can select different actors: only borrow MediaPipe's depth when their
+        torsos agree. :param pts: (33, 2) points of the RTMW / RTMW3D actor.
+    """
+    if not mp_landmarks:
+        return False
+    torso = np.array([11, 12, 23, 24])
+    mp_xy = np.asarray(mp_landmarks)[:, :2]
+    size = max(float(np.linalg.norm(pts[torso[:2]].mean(axis=0) - pts[torso[2:]].mean(axis=0))), 1.0)
+    reliable = np.minimum(np.asarray(visibility)[torso], np.asarray(mp_visibility)[torso]) > 0.3
+    return bool(reliable.sum() >= 3 and float(np.median(
+        np.linalg.norm(pts[torso][reliable] - mp_xy[torso][reliable], axis=1))) < 0.35 * size)
+
+
 class RTMWDetector:
     """
         RTMW whole-body pose (rtmlib, ONNX Runtime) for x/y, with MediaPipe running alongside for
@@ -230,12 +257,7 @@ class RTMWDetector:
         self.depth_source = 'missing'
 
     def _pick_person(self, keypoints, scores):
-        body = keypoints[:, :23]
-        if self.previous is not None and len(keypoints) > 1:
-            hips = (keypoints[:, 11] + keypoints[:, 12]) / 2
-            return int(np.argmin(np.linalg.norm(hips - self.previous, axis=1)))
-        size = np.ptp(body[:, :, 0], axis=1) * np.ptp(body[:, :, 1], axis=1)
-        return int(np.argmax(size * scores[:, :23].mean(axis=1)))
+        return _pick_person(keypoints, scores, self.previous)
 
     def find_pose(self, img, draw=True, timestamp=None):
         """:return: (img, 33 [x, y, z] pixel landmarks or []), self.visibility like PoseDetector."""
@@ -260,15 +282,7 @@ class RTMWDetector:
                      for i, (x, y) in enumerate(pts)]
         self.visibility = np.clip((sc - _RTMW_SCORE_LOW) / _RTMW_SCORE_RANGE, 0.0, 1.0).tolist()
         self.xy_source = 'rtmw'
-        # Independent models can select different actors. Only borrow depth when their torsos agree.
-        matched = False
-        if mp_landmarks:
-            torso = np.array([11, 12, 23, 24])
-            mp_xy = np.asarray(mp_landmarks)[:, :2]
-            size = max(float(np.linalg.norm(pts[torso[:2]].mean(axis=0) - pts[torso[2:]].mean(axis=0))), 1.0)
-            reliable = np.minimum(np.asarray(self.visibility)[torso], np.asarray(mp_visibility)[torso]) > 0.3
-            matched = reliable.sum() >= 3 and float(np.median(
-                np.linalg.norm(pts[torso][reliable] - mp_xy[torso][reliable], axis=1))) < 0.35 * size
+        matched = _same_actor(pts, self.visibility, mp_landmarks, mp_visibility)
         self.depth_source = self.depth.depth_source if matched else 'missing'
         self.depth_confidence = ([min(a, b) for a, b in zip(self.visibility, self.depth.depth_confidence)]
                                  if matched else [0.0] * 33)
@@ -294,19 +308,118 @@ class RTMWDetector:
         self.model = None
 
 
+class RTMW3DDetector:
+    """
+        Experimental: RTMW3D whole-body pose (rtmlib, ONNX Runtime) for x/y and depth. Depth is the
+        model's own, in metres, brought to pixels by the actor's size (see rtmw3d.py, which also
+        says why it is experimental). With `mediapipe_share` MediaPipe runs alongside and the two
+        depths are mixed, RTMW3D's at that share (tracker "RTMW3D + MediaPipe depth"); a frame in
+        which RTMW3D finds nobody then falls back to MediaPipe. Same interface as PoseDetector;
+        hands are x/y only, like RTMW's.
+    """
+
+    def __init__(self, fps=None, device='dml', mediapipe_share=None):
+        import rtmlib
+        from rtmlib.tools import base as rtm_base
+        rtm_base.RTMLIB_SETTINGS['onnxruntime'].setdefault('dml', 'DmlExecutionProvider')
+        self.det_model = rtmlib.YOLOX(PackageInstaller.rtmw_model_path("det"), model_input_size=(640, 640),
+                                      backend='onnxruntime', device=device)
+        self.pose_model = rtmlib.RTMPose3d(PackageInstaller.rtmw3d_model_path(), model_input_size=(288, 384),
+                                           backend='onnxruntime', device=device)
+        session = getattr(self.pose_model, "session", None)
+        shapes = [o.shape for o in session.get_outputs()] if session is not None else []
+        self.depth_bins = rtmw3d_math.depth_bins(shapes)
+        self.share = mediapipe_share
+        self.depth = PoseDetector(fps) if mediapipe_share is not None else None
+        self.scale = None               # running pixels per metre of the actor
+        self.previous = None            # hip centre of the tracked person, to stay on the same one
+        self.visibility = []
+        self.hands = {}
+        self.depth_confidence = []
+        self.xy_source = 'rtmw3d'
+        self.depth_source = 'missing'
+
+    def find_pose(self, img, draw=True, timestamp=None):
+        """:return: (img, 33 [x, y, z] pixel landmarks or []), self.visibility like PoseDetector."""
+        self.hands = {}
+        mp_landmarks = []
+        if self.depth is not None:
+            _img, mp_landmarks = self.depth.find_pose(img, draw=False, timestamp=timestamp)
+        bboxes = self.det_model(img)
+        if len(bboxes) == 0:
+            if mp_landmarks:
+                # RTMW3D found nobody: fall back to MediaPipe for this frame
+                self.visibility = list(self.depth.visibility)
+                self.depth_confidence = list(self.depth.depth_confidence)
+                self.xy_source, self.depth_source = 'mediapipe', self.depth.depth_source
+                if draw:
+                    _draw_landmarks(img, mp_landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
+                                    (255, 255, 255), (255, 0, 255))
+                return img, mp_landmarks
+            self.visibility, self.depth_confidence, self.depth_source = [], [], 'missing'
+            return img, []
+        # trained on RGB pictures (rtmlib would pass OpenCV's BGR)
+        _k3, scores, simcc, keypoints = self.pose_model(np.ascontiguousarray(img[..., ::-1]), bboxes=bboxes)
+        k = _pick_person(keypoints, scores, self.previous)
+        self.previous = (keypoints[k][11] + keypoints[k][12]) / 2
+        pts = keypoints[k][_WB_TO_MP].astype(float)
+        vis = rtmw3d_math.visibility(scores[k][_WB_TO_MP])
+        z = rtmw3d_math.decode_depth(simcc[k][_WB_TO_MP, 2], self.depth_bins)
+        depth, self.scale = rtmw3d_math.depth_pixels(pts, z, vis, self.scale)
+        self.visibility = vis.tolist()
+        self.xy_source = 'rtmw3d'
+        mp_depth = mp_conf = None
+        if mp_landmarks and _same_actor(pts, vis, mp_landmarks, self.depth.visibility):
+            mp_depth = [p[2] for p in mp_landmarks]
+            mp_conf = self.depth.depth_confidence
+        depth, conf, self.depth_source = rtmw3d_math.blend_depth(depth, vis, mp_depth, mp_conf,
+                                                                 self.share if self.share is not None else 1.0)
+        if depth is None:
+            depth = np.zeros(33)
+        self.depth_confidence = np.asarray(conf, dtype=float).tolist()
+        landmarks = [[float(x), float(y), float(d)] for (x, y), d in zip(pts, depth)]
+        for name, first in (("Left", _WB_LHAND), ("Right", _WB_RHAND)):
+            conf = rtmw3d_math.visibility(scores[k][first:first + 21])
+            self.hands[name] = (keypoints[k][first:first + 21].astype(float).tolist(), conf.tolist())
+        if draw:
+            _draw_landmarks(img, landmarks, mp_vision.PoseLandmarksConnections.POSE_LANDMARKS,
+                            (255, 255, 255), (255, 160, 0))
+            for name, (points, conf) in self.hands.items():
+                if float(np.mean(conf)) >= BODY_HAND_MIN_VIS:
+                    _draw_landmarks(img, points, mp_vision.HandLandmarksConnections.HAND_CONNECTIONS,
+                                    (200, 200, 200), (0, 200, 255))
+        return img, landmarks
+
+    def close(self):
+        if self.depth is not None:
+            self.depth.close()
+        self.det_model = self.pose_model = None
+
+
 def create_pose_detector(fps=None):
     """The pose tracker chosen in the add-on preferences (falls back to MediaPipe)."""
-    if PackageInstaller.pose_tracker() == 'RTMW':
-        missing = PackageInstaller.rtmw_missing()
+    tracker = PackageInstaller.pose_tracker()
+    if tracker in PackageInstaller.RTMW_TRACKERS:
+        missing = PackageInstaller.rtmw_missing(tracker)
+        device = PackageInstaller.rtmw_device()
         if not missing:
             try:
-                det = RTMWDetector(fps, PackageInstaller.rtmw_device())
-                print(f"[Open Mocap] Pose tracker: RTMW ({PackageInstaller.rtmw_device()}) + MediaPipe depth")
+                if tracker == 'RTMW3D':
+                    det = RTMW3DDetector(fps, device)
+                    print(f"[Open Mocap] Pose tracker: RTMW3D, experimental ({device})")
+                elif tracker == 'RTMW3D_MP':
+                    share = PackageInstaller.rtmw3d_depth_share()
+                    det = RTMW3DDetector(fps, device, mediapipe_share=share)
+                    print(f"[Open Mocap] Pose tracker: RTMW3D + MediaPipe depth ({share:.0%} RTMW3D), "
+                          f"experimental ({device})")
+                else:
+                    det = RTMWDetector(fps, device)
+                    print(f"[Open Mocap] Pose tracker: RTMW ({device}) + MediaPipe depth")
                 return det
             except Exception as e:  # noqa: BLE001
-                print(f"[Open Mocap] RTMW failed to start ({e}); using MediaPipe.")
+                print(f"[Open Mocap] {tracker} failed to start ({e}); using MediaPipe.")
         else:
-            print(f"[Open Mocap] RTMW is not installed ({', '.join(missing)}); using MediaPipe. "
+            print(f"[Open Mocap] {tracker} is not installed ({', '.join(missing)}); using MediaPipe. "
                   "Click Install Dependencies in the add-on preferences.")
     return PoseDetector(fps)
 
@@ -578,6 +691,48 @@ class VideoPlaneManager:
 # -------------------------------------------------------------
 # POSE TRACKING UTILITY
 # -------------------------------------------------------------
+LIFTER_MIN_FRAMES = 10
+
+
+def lift_take_depth(tracker):
+    """
+        Depth Lifter (lifter.py, add-on preference) over the take a pose tracker just recorded from
+        a video: its body depth is rebuilt from the whole 2D movement and mixed with the tracker's.
+        Runs once per take; realtime tracking is left alone.
+    """
+    if tracker.mode == "rt_pose" or getattr(tracker, "lifted", False) or not PackageInstaller.depth_lifter():
+        return
+    tracker.lifted = True
+    if tracker.view is not None:
+        frames, vis, meta = tracker.view["frames"], tracker.view["vis"], tracker.view["meta"]
+    elif tracker.mode == "side_pose":
+        frames, vis, meta = gvar.zlist, gvar.zlist_vis, gvar.zlist_meta
+    else:
+        frames, vis, meta = gvar.positionList, gvar.position_vis, gvar.position_meta
+    if len(frames) < LIFTER_MIN_FRAMES or len(vis) < len(frames):
+        return
+    missing = PackageInstaller.lifter_missing()
+    if missing:
+        print(f"[Open Mocap] Depth Lifter is not installed ({', '.join(missing)}); depth left as tracked. "
+              "Click Install Dependencies in the add-on preferences.")
+        return
+    try:
+        start = time.monotonic()
+        PackageInstaller.add_lib_to_path()
+        import onnxruntime as ort
+        # CPU: DirectML refuses this model's graph
+        session = ort.InferenceSession(PackageInstaller.lifter_model_path(), providers=['CPUExecutionProvider'])
+        name = session.get_inputs()[0].name
+        points = np.asarray(frames, dtype=float).reshape(len(frames), 40, 3)[:, :, :2]
+        depth = lifter.lift(points, np.asarray(vis[:len(frames)], dtype=float),
+                            lambda x: session.run(None, {name: x})[0])
+        lifter.apply(frames, vis[:len(frames)], meta, depth, PackageInstaller.lifter_share())
+        print(f"[Open Mocap] Depth Lifter: {len(frames)} frames in {time.monotonic() - start:.1f} s "
+              f"({PackageInstaller.lifter_share():.0%} lifted depth)")
+    except Exception as e:  # noqa: BLE001 - the tracked take stays usable as it is
+        print(f"[Open Mocap] Depth Lifter failed ({e}); depth left as tracked.")
+
+
 class PoseTracking:
     view = None         # the further view being tracked (mode "extra_pose"), else None
 
@@ -612,17 +767,21 @@ class PoseTracking:
                 self.view = {"path": self.path, "name": os.path.splitext(os.path.basename(self.path))[0],
                              "frames": [], "times": [], "vis": [], "meta": [], "missing_times": [], "fps": 0}
                 gvar.extra_views.append(self.view)
+            gvar.sword_axis.clear()
         elif self.mode == "side_pose":
-            for lst in (gvar.zlist, gvar.zlist_times, gvar.zlist_vis, gvar.zlist_meta, gvar.zlist_missing_times):
+            for lst in (gvar.zlist, gvar.zlist_times, gvar.zlist_vis, gvar.zlist_meta, gvar.zlist_missing_times,
+                        gvar.sword_side, gvar.sword_axis):
                 lst.clear()
         else:
             for lst in (gvar.positionList, gvar.position_times, gvar.position_vis,
                         gvar.position_meta, gvar.position_missing_times,
                         gvar.R_body_hand_positionList, gvar.L_body_hand_positionList,
-                        gvar.R_body_hand_times, gvar.L_body_hand_times):
+                        gvar.R_body_hand_times, gvar.L_body_hand_times, gvar.sword_front, gvar.sword_axis):
                 lst.clear()
             gvar.positionList_raw = None
             gvar.position_meta_raw = None
+            gvar.body_hands_3d = False
+            gvar.body_spine = None
 
         # --- Handle realtime webcam tracking ---
         if self.mode == "rt_pose":
@@ -824,6 +983,8 @@ class PoseTracking:
 
         if hasattr(self, 'cap') and self.cap.isOpened():
             self.cap.release()
+
+        lift_take_depth(self)
 
         if self.mode == "rt_pose":
             VideoPlaneManager.remove_plane()

@@ -99,11 +99,24 @@ def register():
         name="Field of View", default=60.0, min=10.0, max=120.0, precision=0,   # plain degrees: subtype ANGLE is radians
         description="Horizontal field of view of the front camera in degrees (phone main camera about 65-70, "
                     "a 35 mm lens on a full-frame camera about 54, zoomed in 30). Too wide overcorrects")
+    bpy.types.Scene.gemx_fov = bpy.props.FloatProperty(
+        name="GEM-X Field of View", default=0.0, min=0.0, max=120.0, precision=0,
+        description="Horizontal field of view of the camera in degrees, for GEM-X's distances. 0: GEM-X's own "
+                    "guess (about 47 degrees on a 16:9 video)")
+    bpy.types.Scene.combine_auto_fov = bpy.props.BoolProperty(
+        name="Find FOV", default=True,
+        description="Find the field of view that keeps the actor one size while walking toward or away from the "
+                    "front camera, and set FOV to it. Needs the actor to change distance; otherwise FOV is used "
+                    "as set. It also makes up for depth the other views get too long")
     bpy.types.Scene.combine_auto_horizon = bpy.props.BoolProperty(
         name="Find Horizon", default=True,
         description="Find the camera's horizon (its height and tilt) from the frames where both feet stand: the "
                     "one that puts them on one floor. Off: a level camera at the actor's hip height (the horizon "
                     "at the middle of the picture)")
+    bpy.types.Scene.combine_grip = bpy.props.BoolProperty(
+        name="Hands on One Handle", default=False,
+        description="Both hands hold one handle (a two-handed sword): a hand the videos lose is put back on the "
+                    "handle next to the other, along the tracked blade, and its elbow solved again")
     bpy.types.Scene.combine_whole_take = bpy.props.BoolProperty(
         name="Whole Take", default=True,
         description="Scale every frame to one distance from the camera, so an actor stepping toward or away "
@@ -151,6 +164,10 @@ def register():
             ('RIGHT', "Right Hand Leads", "Both hands hold one thing: the left hand keeps a steady distance to the right"),
             ('LEFT', "Left Hand Leads", "Both hands hold one thing: the right hand keeps a steady distance to the left"),
         ], default='NONE')
+    bpy.types.Scene.retarget_sword = bpy.props.BoolProperty(
+        name="Sword", default=True,
+        description="Turn the hands to the tracked sword (Track Sword, then Combine Data and Animate): the "
+                    "hands hold its handle. With a two-handed grip the other hand also sits along the blade")
     bpy.types.Scene.bake_in_place = bpy.props.BoolProperty(
         name="In Place", default=False,
         description="After baking, remove the hips' travel over the ground (their height is kept), "
@@ -188,8 +205,11 @@ def unregister():
     del bpy.types.Scene.combine_bone_strength
     del bpy.types.Scene.combine_perspective
     del bpy.types.Scene.combine_fov
+    del bpy.types.Scene.combine_auto_fov
+    del bpy.types.Scene.gemx_fov
     del bpy.types.Scene.combine_auto_horizon
     del bpy.types.Scene.combine_whole_take
+    del bpy.types.Scene.combine_grip
     del bpy.types.Scene.combine_auto_offset
     del bpy.types.Scene.combine_offset
     del bpy.types.Scene.combine_sync
@@ -205,6 +225,7 @@ def unregister():
     del bpy.types.Scene.retarget_spine_twist
     del bpy.types.Scene.retarget_fingers
     del bpy.types.Scene.retarget_grip
+    del bpy.types.Scene.retarget_sword
     del bpy.types.Scene.bake_in_place
 
 

@@ -139,23 +139,28 @@ def tracked(truth, rng, noise=0.006, camera_distance=5.0, camera_height=1.3):
     return P
 
 
-def solve(P, fps, plant=True, hip_height=True):
-    """Run the retarget's floor and leg solve on landmark positions. :return: solver output in metres."""
+def solve(P, fps, plant=True, hip_height=True, hip_offsets=None):
+    """
+        Run the retarget's floor and leg solve on landmark positions. :return: solver output in metres.
+        :param hip_offsets: {side: (N, 3)} measured hip joints relative to the hips, metres (see "Hip joints").
+    """
     frames = np.arange(len(P), dtype=float)
     saved = R._true, R.landmark_confidence
     R._true = lambda _e, idx, _f, _m: {i: P[:, i].copy() for i in idx}
-    R.landmark_confidence = lambda _e, f, _i: np.ones(len(f))
+    R.landmark_confidence = lambda _e, f, _i, *_floor: np.ones(len(f))
     try:
         floor = R.mocap_floor(None, frames, fps, False)
         leg = float(np.median(np.linalg.norm(P[:, R.L_HIP] - P[:, R.L_KNEE], axis=1)
                               + np.linalg.norm(P[:, R.L_KNEE] - P[:, R.L_ANKLE], axis=1)))
         ratio = leg / (THIGH + SHIN)
         offsets = {"Left": (HIP_HALF, 0.0, 0.0), "Right": (-HIP_HALF, 0.0, 0.0)}
+        if hip_offsets is not None:
+            offsets = {side: np.asarray(v) * ratio for side, v in hip_offsets.items()}
         legs, shift, share = R.leg_directions(None, frames, fps, False, ratio, THIGH, SHIN, offsets, 0.0, plant,
                                               floor if hip_height else None)
     finally:
         R._true, R.landmark_confidence = saved
-    out = {"down": floor[1], "share": share, "ratio": ratio}
+    out = {"down": floor[1], "share": share, "ratio": ratio, "floor": floor[0] / ratio}
     for side, (joint, thigh, knee, shin) in legs.items():
         ankle = knee + SHIN * ratio * shin
         an, toe_i = (R.L_ANKLE, R.L_TOE) if side == "Left" else (R.R_ANKLE, R.R_TOE)

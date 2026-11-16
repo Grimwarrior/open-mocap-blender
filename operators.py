@@ -11,10 +11,15 @@ import bpy
 import json
 import math
 import os
+import queue
+import subprocess
+import threading
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 from . import utils
 from . import combine
 from . import capture_data
+from . import gemx
+from . import PackageInstaller
 from mathutils import Vector
 from . import globalVariables as gvar
 
@@ -230,6 +235,80 @@ class StopTracking(bpy.types.Operator):
     
 
 
+class TrackSword(bpy.types.Operator):
+    bl_idname = "object.open_mocap_track_sword"
+    bl_label = "Track Sword"
+    bl_description = ("Find the sword blade in every tracked video (front, side and further views). Combine Data "
+                      "turns it into one 3D direction and the retarget turns the hands to it. Needs a camera "
+                      "that stands still, and the pose tracked first")
+
+    @classmethod
+    def poll(cls, context):
+        return bool(gvar.positionList or gvar.positionList_raw)
+
+    def execute(self, context):
+        if not utils.load_libraries():
+            self.report({'ERROR'}, "OpenCV is not installed: install the dependencies in the add-on preferences")
+            return {'CANCELLED'}
+        from . import sword
+        front = gvar.positionList_raw if gvar.positionList_raw is not None else gvar.positionList
+        jobs = []
+        if front and len(gvar.position_times) == len(front) and len(gvar.position_vis) == len(front):
+            jobs.append(("front video", gvar.front_video_path, front, gvar.position_vis, gvar.position_times, "front"))
+        if gvar.zlist and len(gvar.zlist_times) == len(gvar.zlist) and len(gvar.zlist_vis) == len(gvar.zlist):
+            jobs.append(("side video", gvar.side_video_path, gvar.zlist, gvar.zlist_vis, gvar.zlist_times, "side"))
+        for view in gvar.extra_views:
+            if view.get("frames") and len(view["times"]) == len(view["frames"]) == len(view["vis"]):
+                jobs.append((view.get("name", "view"), view.get("path", ""), view["frames"], view["vis"], view["times"], view))
+        if not jobs:
+            self.report({'ERROR'}, "Track the pose in at least one video first (with timestamps and confidence)")
+            return {'CANCELLED'}
+        wm = context.window_manager
+        wm.progress_begin(0, 100 * len(jobs))
+        lines, problems = [], []
+        try:
+            for k, (name, path, frames, vis, times, target) in enumerate(jobs):
+                if not path or not os.path.isfile(path):
+                    problems.append(f"{name}: video not found ({path or 'no path'})")
+                    continue
+                try:
+                    rows = sword.track_video(path, frames, vis, times,
+                                             progress=lambda share, k=k: wm.progress_update(int(100 * (k + share))))
+                except (ValueError, OSError) as error:
+                    problems.append(f"{name}: {error}")
+                    continue
+                if target == "front":
+                    gvar.sword_front[:] = rows
+                elif target == "side":
+                    gvar.sword_side[:] = rows
+                else:
+                    target["sword"] = rows
+                seen = sum(r[2] > 0.5 for r in rows) / max(len(rows), 1)
+                lines.append(f"{name} {seen:.0%}")
+                print(f"[Open Mocap]   sword in {name}: clearly seen in {seen:.0%} of {len(rows)} frames")
+        finally:
+            wm.progress_end()
+        gvar.sword_axis.clear()           # until Combine Data fuses the new directions
+        if not lines:
+            self.report({'ERROR'}, "No sword tracked: " + "; ".join(problems))
+            return {'CANCELLED'}
+        msg = "Sword tracked, clearly seen in: " + ", ".join(lines)
+        if problems:
+            msg += ". Skipped: " + "; ".join(problems)
+        msg += ". Run Combine Data to give it depth" if (gvar.zlist or gvar.extra_views) else ""
+        self.report({'WARNING'} if problems else {'INFO'}, msg)
+        return {'FINISHED'}
+
+
+def sword_rows_for_animate(count):
+    """[x, y, depth, confidence] per front frame: Combine Data's 3D blade, else the front picture's."""
+    if len(gvar.sword_axis) == count:
+        return [list(r) for r in gvar.sword_axis]
+    if len(gvar.sword_front) == count:
+        return [[r[0], r[1], 0.0, 0.5 * r[2]] for r in gvar.sword_front]
+    return []
+
+
 class CombineMotionData(bpy.types.Operator):
     bl_idname = "object.combine_data"
     bl_label = "Combine Motion Data"
@@ -285,7 +364,8 @@ class CombineMotionData(bpy.types.Operator):
             self.report({'ERROR'}, "The original method needs the side video; further views need the improved method")
             return {'CANCELLED'}
         if method == 'IMPROVED' and have_meta and len(front) >= 10 and (len(side) >= 10 or (not side and more)):
-            views = ([{"frames": side, "times": gvar.zlist_times, "vis": gvar.zlist_vis, "name": "Side video"}]
+            views = ([{"frames": side, "times": gvar.zlist_times, "vis": gvar.zlist_vis, "name": "Side video",
+                       "sword": gvar.sword_side}]
                      if side else []) + more
             try:
                 combined, rep = combine.combine_multi(
@@ -306,11 +386,39 @@ class CombineMotionData(bpy.types.Operator):
                             + ("  " + "; ".join(view_lines) if view_lines else ""))
                 return {'CANCELLED'}
             combined_meta = rep['metadata']
+            sword_line = ""
+            gvar.sword_axis.clear()
+            if len(gvar.sword_front) == len(front) and front:
+                axis, srep = combine.sword_axis(front, gvar.position_times, gvar.sword_front, views, combined, rep,
+                                                gvar.position_vis)
+                gvar.sword_axis.extend(axis)
+                depth_from = ", ".join(v["name"] for v in srep["views"]) or "no further view (blade kept in the front picture's plane)"
+                sword_line = (f". Sword: seen in {srep['seen']:.0%} of front frames, depth from {depth_from} "
+                              f"({srep['with_depth']:.0%} of frames)")
+            if getattr(scene, "combine_grip", False):
+                vis = gvar.position_vis[:len(combined)]
+                reliability = [[min(v, c) for v, c in zip(vr, m['depth_confidence'])]
+                               for vr, m in zip(vis, combined_meta)]
+                combined, grep = combine.two_hand_grip(combined, reliability, gvar.sword_axis or None,
+                                                       gvar.front_fps or gvar.fps or 30.0)
+                sword_line += (f". Hands on one handle {grep['spacing']:.2f} shoulder widths apart (tracked: median "
+                               f"{grep['gap_before']:.2f}), moved in {grep['moved']:.0%} of frames")
             if scene.combine_perspective:
                 # A camera of unknown make: a horizontal field of view stands in for its focal length
                 width, height = gvar.front_width or 1920, gvar.front_height or 1080
                 focal = combine.focal_from_fov(width, scene.combine_fov)
                 fps = gvar.front_fps or gvar.fps or 30.0
+                fov_line = f"{scene.combine_fov:.0f} deg field of view"
+                if getattr(scene, "combine_auto_fov", False):
+                    lo, hi = combine.FOV_RANGE
+                    limits = (combine.focal_from_fov(width, hi), combine.focal_from_fov(width, lo))
+                    focal, frep = combine.fit_focal(combined, focal, fps, limits)
+                    if frep["focal_found"]:
+                        scene.combine_fov = combine.fov_from_focal(width, focal)   # start manual tweaking from it
+                        fov_line = (f"{scene.combine_fov:.0f} deg field of view found from the actor's size "
+                                    f"(it changes {frep['focal_size_change']:.0%} with distance)")
+                    else:
+                        fov_line += f" (not found: {frep['focal_reason']})"
                 horizon, hrep = -height / 200.0, {}
                 whole = scene.combine_whole_take
                 if scene.combine_auto_horizon:
@@ -325,7 +433,7 @@ class CombineMotionData(bpy.types.Operator):
                          f"{hrep['horizon_samples']} {samples}" if hrep.get("horizon_found")
                          else "horizon at the middle of the picture"
                          + (f" ({hrep['horizon_reason']})" if hrep.get("horizon_reason") else ""))
-                print(f"[Open Mocap]   perspective corrected ({scene.combine_fov:.0f} deg field of view, {where}, "
+                print(f"[Open Mocap]   perspective corrected ({fov_line}, {where}, "
                       f"{'whole take at one distance, ' if whole else ''}size factor {lo:.2f}..{hi:.2f})")
             if scene.combine_auto_offset and side:
                 scene.combine_offset = rep["offset_s"]   # start manual tweaking from what was found
@@ -334,6 +442,7 @@ class CombineMotionData(bpy.types.Operator):
             msg = "Combined: " + combine.format_report(rep)
             if view_lines:
                 msg += f". {rep.get('views_for_depth', 0)} of {len(views)} views measure depth: " + "; ".join(view_lines)
+            msg += sword_line
             level = {'WARNING'} if rep["sync_corr"] < 0.4 else {'INFO'}
             if rep["sync_corr"] < 0.4:
                 msg += ". Low sync match: check that both videos show the same performance"
@@ -344,6 +453,7 @@ class CombineMotionData(bpy.types.Operator):
                 return {'CANCELLED'}
             combined = combine.combine_simple(front, side, 40)
             combined.extend([list(f) for f in front[len(combined):]])
+            gvar.sword_axis.clear()       # the sword is fused by the improved method only
             combined_meta = []  # original combine has no reliable confidence propagation
             msg = f"Combined {len(combined)} frames (original method)."
             level = {'INFO'}
@@ -479,10 +589,19 @@ class AnimatePose(bpy.types.Operator):
             hand_frames = getattr(gvar, f"{key}_body_hand_positionList")
             hand_times = getattr(gvar, f"{key}_body_hand_times")
             if hand_frames and len(hand_frames) == len(hand_times):
-                hands[side] = {'frames': [float(t * fps) + 1 for t in hand_times],
-                               'points': [[v for i in range(21) for v in f[3 * i:3 * i + 2]] for f in hand_frames]}
+                dims = 3 if gvar.body_hands_3d else 2          # GEM-X hands have real depth
+                hands[side] = {'frames': [float(t * fps) + 1 for t in hand_times], 'dims': dims,
+                               'points': [[v for i in range(21) for v in f[3 * i:3 * i + dims]] for f in hand_frames]}
         if hands:
             root['open_mocap_hands'] = json.dumps(hands)
+        # GEM-X's spine chain (see gemx.SPINE_CHAIN), in the empties' coordinates, for the retarget
+        spine = getattr(gvar, "body_spine", None)
+        if spine and len(spine["points"]) == len(frame_numbers):
+            pts = [[c for k in range(len(row) // 3)
+                    for c in utils.MathUtility.cv2blender_coordinates(row[3 * k:3 * k + 3])] for row in spine["points"]]
+            root['open_mocap_spine'] = json.dumps({'frames': frame_numbers, 'names': spine["names"], 'points': pts,
+                                                   'rest': spine["rest"],
+                                                   'rest_up': spine["rest_up"]})
 
         for frame_index, frame in zip(frame_numbers, gvar.positionList):
             for i in range(40):
@@ -492,8 +611,40 @@ class AnimatePose(bpy.types.Operator):
                 obj.location = local_pos
                 obj.keyframe_insert(data_path="location", frame=frame_index)
 
+        # Sword (Track Sword): its direction for the retarget, and an arrow from the grip to see it
+        sword_rows = sword_rows_for_animate(len(frame_numbers))
+        if sword_rows:
+            dirs = [utils.MathUtility.cv2blender_coordinates(r[:3]) for r in sword_rows]
+            root['open_mocap_sword'] = json.dumps({'frames': frame_numbers, 'dirs': dirs,
+                                                   'confidence': [r[3] for r in sword_rows]})
+            add_sword_arrow(root, pose_empties_collection, frame_numbers, gvar.positionList, dirs)
+
         start_playback(context)
         return {'FINISHED'}
+
+
+def add_sword_arrow(root, collection, frame_numbers, frames, dirs):
+    """An arrow empty along the blade, from the centre of the hand points, keyed per frame."""
+    pts = [[utils.MathUtility.cv2blender_coordinates(f[3 * i:3 * i + 3]) for i in (0, 27, 28, 15, 16, 17, 18, 19, 20)]
+           for f in frames]
+    heights = sorted(p[0][2] - (p[1][2] + p[2][2]) / 2 for p in pts)
+    arrow = bpy.data.objects.new("Sword", None)
+    arrow.empty_display_type = 'SINGLE_ARROW'
+    arrow.empty_display_size = max(0.4 * abs(heights[len(heights) // 2]), 0.1)   # a blade is ~0.4 body heights
+    arrow.rotation_mode = 'QUATERNION'
+    collection.objects.link(arrow)
+    arrow.parent = root
+    previous = None
+    for frame_index, p, d in zip(frame_numbers, pts, dirs):
+        grip = Vector([sum(q[k] for q in p[3:]) / 6.0 for k in range(3)])
+        quat = Vector((0.0, 0.0, 1.0)).rotation_difference(Vector(d))
+        if previous is not None:
+            quat.make_compatible(previous)
+        previous = quat
+        arrow.location = grip
+        arrow.rotation_quaternion = quat
+        arrow.keyframe_insert(data_path="location", frame=frame_index)
+        arrow.keyframe_insert(data_path="rotation_quaternion", frame=frame_index)
 
 
 
@@ -857,7 +1008,8 @@ class ClearMoCapCache(bpy.types.Operator):
             gvar.object_list.clear()
             gvar.bones_list.clear()
             for lst in (gvar.R_body_hand_positionList, gvar.L_body_hand_positionList,
-                        gvar.R_body_hand_times, gvar.L_body_hand_times):
+                        gvar.R_body_hand_times, gvar.L_body_hand_times,
+                        gvar.sword_front, gvar.sword_side, gvar.sword_axis):
                 lst.clear()
             self.report({'INFO'}, "Body Motion Capture data cleared.")
         else:
@@ -883,7 +1035,8 @@ CAPTURE_LISTS = ("positionList", "zlist", "position_times", "position_vis", "zli
                  "position_meta", "zlist_meta", "position_missing_times", "zlist_missing_times",
                  "R_hand_positionList", "L_hand_positionList", "R_hand_zlist", "L_hand_zlist",
                  "R_hand_times", "L_hand_times", "R_hand_ztimes", "L_hand_ztimes",
-                 "R_body_hand_positionList", "L_body_hand_positionList", "R_body_hand_times", "L_body_hand_times")
+                 "R_body_hand_positionList", "L_body_hand_positionList", "R_body_hand_times", "L_body_hand_times",
+                 "sword_front", "sword_side", "sword_axis")
 CAPTURE_VALUES = ("fps", "front_fps", "side_fps", "front_width", "front_height", "hand_fps", "hand_front_fps", "hand_side_fps", "front_video_path", "side_video_path",
                   "hand_front_video_path", "hand_side_video_path")
 
@@ -1137,6 +1290,127 @@ class HideSkeleton(bpy.types.Operator):
 
 
 
-classes = [StartTracking, StopTracking, CombineMotionData, AnimatePose, AnimateHand, BakeMotion,
+class TrackGEMX(bpy.types.Operator):
+    bl_idname = "object.open_mocap_track_gemx"
+    bl_label = "Track with GEM-X"
+    bl_description = ("Track the selected video with NVIDIA GEM-X in its own environment (add-on preferences): "
+                      "whole-body 3D motion from this one video, fingers included, for a fixed camera. The "
+                      "result replaces the tracked pose like Start Pose Tracking + Combine Data; press "
+                      "Animate next. Esc cancels")
+
+    _timer = None
+    _proc = None
+    _lines = None
+    _out = ""
+
+    @classmethod
+    def poll(cls, context):
+        return bool(gvar.front_video_path) and not gvar.gemx_status.endswith("...")
+
+    def execute(self, context):
+        missing = PackageInstaller.gemx_missing()
+        if missing:
+            self.report({'ERROR'}, "GEM-X is not set up (add-on preferences): missing " + ", ".join(missing))
+            return {'CANCELLED'}
+        video = bpy.path.abspath(gvar.front_video_path)
+        if not os.path.isfile(video):
+            self.report({'ERROR'}, f"Video not found: {video}")
+            return {'CANCELLED'}
+        folder = os.path.join(PackageInstaller.data_dir(), "gemx")
+        os.makedirs(folder, exist_ok=True)
+        self._out = os.path.join(folder, os.path.splitext(os.path.basename(video))[0] + "_gemx.npz")
+        runner = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemx_runner.py")
+        cmd = [PackageInstaller.gemx_python(), "-u", runner, "--repo", PackageInstaller.gemx_repo(),
+               "--video", video, "--out", self._out]
+        if context.scene.gemx_fov > 0:
+            cmd += ["--fov", f"{context.scene.gemx_fov:.3f}"]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                      encoding="utf-8", errors="replace", creationflags=flags)
+        self._lines = queue.Queue()
+        threading.Thread(target=self._read, args=(self._proc, self._lines), daemon=True).start()
+        gvar.gemx_status = "GEM-X: starting..."
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    @staticmethod
+    def _read(proc, lines):
+        for line in proc.stdout:
+            lines.put(line.rstrip())
+        lines.put(None)
+
+    def _status(self, context, text):
+        gvar.gemx_status = text
+        for area in context.screen.areas if context.screen else []:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self._proc.kill()
+            return self._finish(context, {'WARNING'}, "GEM-X cancelled")
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+        result = None
+        while True:
+            try:
+                line = self._lines.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                result = result or "ERROR GEM-X stopped without a result"
+                break
+            print("[Open Mocap] GEM-X: " + line)
+            if line.startswith("STAGE "):
+                self._status(context, "GEM-X: " + line[6:] + "...")
+            elif line.startswith(("DONE ", "ERROR ")):
+                result = line
+        if result is None:
+            return {'PASS_THROUGH'}
+        if result.startswith("ERROR"):
+            return self._finish(context, {'ERROR'}, result[6:])
+        try:
+            frames = load_gemx_capture(self._out)
+        except (OSError, KeyError, ValueError) as error:
+            return self._finish(context, {'ERROR'}, f"Could not read GEM-X's result: {error}")
+        return self._finish(context, {'INFO'}, f"GEM-X tracked {frames} frames. Press Animate, then Retarget (Hip Height: From Floor, "
+                                                   "GEM-X's floor is levelled)")
+
+    def _finish(self, context, level, message):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+        self._status(context, message)
+        self.report(level, message)
+        return {'FINISHED'} if 'INFO' in level else {'CANCELLED'}
+
+
+def load_gemx_capture(path):
+    """Fill the capture cache with a GEM-X take (see gemx.py), as tracking + Combine Data would."""
+    import numpy as np
+    with np.load(path) as data:
+        take = gemx.to_capture({key: data[key] for key in data.files})
+    for lst in (gvar.positionList, gvar.position_times, gvar.position_vis, gvar.position_meta,
+                gvar.position_missing_times, gvar.R_body_hand_positionList, gvar.L_body_hand_positionList,
+                gvar.R_body_hand_times, gvar.L_body_hand_times, gvar.sword_front, gvar.sword_axis):
+        lst.clear()
+    gvar.positionList.extend(take["frames"])
+    gvar.position_times.extend(take["times"])
+    gvar.position_vis.extend(take["vis"])
+    gvar.position_meta.extend(take["meta"])
+    gvar.positionList_raw = None
+    gvar.position_meta_raw = None
+    gvar.front_fps = gvar.fps = take["fps"]
+    gvar.front_width, gvar.front_height = take["width"], take["height"]
+    gvar.L_body_hand_positionList.extend(take["hands"]["Left"])
+    gvar.R_body_hand_positionList.extend(take["hands"]["Right"])
+    gvar.L_body_hand_times.extend(take["times"])
+    gvar.R_body_hand_times.extend(take["times"])
+    gvar.body_hands_3d = True
+    gvar.body_spine = take["spine"]
+    return len(take["frames"])
+
+
+classes = [StartTracking, StopTracking, TrackSword, CombineMotionData, AnimatePose, AnimateHand, BakeMotion,
            ClearMoCapCache, SaveCapture, LoadCapture, VideoSelect,  ClearVideoPath, RemoveExtraView,
-           ToggleCopyRotationConstraints, HideSkeleton]
+           ToggleCopyRotationConstraints, HideSkeleton, TrackGEMX]

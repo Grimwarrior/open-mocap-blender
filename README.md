@@ -22,6 +22,22 @@ Optional pose tracker (add-on preferences > Pose Tracker > "RTMW + MediaPipe dep
 - Install Dependencies also installs rtmlib and onnxruntime-directml and downloads the RTMW-x and YOLOX-m models (about 330 MB) from OpenMMLab.
 - RTMW Device: GPU (DirectML, any DirectX 12 card, about 11 frames per second including MediaPipe) or CPU (about 3 frames per second).
 
+Experimental pose tracker (Pose Tracker > "RTMW3D (experimental)"):
+- OpenMMLab RTMW3D-x (Apache-2.0) gives joint positions and its own depth, without MediaPipe. Install Dependencies downloads the RTMW3D-x ONNX file (about 370 MB, the copy rtmlib uses) and RTMW's YOLOX-m detector.
+- On four views of one performance its depth agreed with a 90 degree camera far less than MediaPipe's (correlation 0.12-0.55 against 0.69-0.81) and jittered about twice as much, so Combine Data trusts its depth half as much. Use it to compare, not as the default.
+- "RTMW3D + MediaPipe depth (experimental)" runs MediaPipe alongside and mixes the two depths; RTMW3D Depth Share (default 0.1) sets RTMW3D's part. At 0.1 the katana take's depth agreed slightly better with the 90 degree cameras (0.772 -> 0.781) and the Whirlpool take's stayed the same (0.732 -> 0.730); shares above 0.3 made both worse.
+
+Optional Depth Lifter (add-on preferences > Depth Lifter, works with every pose tracker):
+- After a video is tracked, MotionAGFormer-B (TaatiTeam/MotionAGFormer, Apache-2.0, 11.7M parameters) rebuilds the body depth from the whole 2D movement, 243 frames at a time, and mixes it with the tracker's depth (Lifter Share, default 0.5). Face, hand and foot points move with the joint they belong to. It runs on the CPU, about 2 s per 120 frames.
+- Install Dependencies downloads the model as ONNX (about 48 MB, checked by SHA-256) and installs ONNX Runtime if no RTMW tracker brought it already.
+- Measured with RTMW on the katana and Whirlpool takes (four cameras each, depth against the camera 90 degrees to the side): agreement 0.745 -> 0.817 and 0.720 -> 0.796 at share 0.5, the nearer shoulder/hip/wrist told right 89.0 -> 91.8% and 91.9 -> 95.2%, depth jitter about halved (share 1: a fifth, agreement 0.783 / 0.770).
+
+Optional GEM-X (add-on preferences > GEM-X, then Pose Tracking > Track with GEM-X):
+- NVIDIA GEM-X (github.com/NVlabs/GEM-X; code Apache-2.0, weights under the NVIDIA Open Model License) tracks the whole body, fingers included, in 3D from one video of a fixed camera. It is not installed by the add-on: set up its repository, weights and SOMA assets in an environment of its own (PyTorch with CUDA) as its INSTALL.md says, then point GEM-X Python (that environment's python.exe) and GEM-X Folder at them.
+- Track with GEM-X runs it outside Blender (Esc cancels) and fills the tracked pose as Start Pose Tracking + Combine Data would: press Animate, then Retarget. No side video, no Combine Data. FOV next to the button sets the camera's horizontal field of view for GEM-X's distances (0: its own guess).
+- The world-space joints are used, turned to the camera's level right/forward, with the floor levelled where GEM-X finds a foot standing still (its world height drifted 0.19 m over a 3.4 s take). SOMA has no ears, nose, mouth or heels: they are placed from the head and the foot. Fingers use the 3D hand joints. Retarget with Hip Height From Floor: From First Frame pins the hips to their standing height, and a take that starts crouched then stands below the floor. The heel is placed in the foot's own plane, so the foot turns as one piece, and the retarget keeps GEM-X's own foot direction (no turning toward the knee). The spine follows GEM-X's own: each Mixamo spine bone (Hips, Spine, Spine1, Spine2, Neck) turns as its SOMA segment turns away from the actor's rest skeleton, so a rounded upper back over a straight lower back comes through, not only one lean between hips and shoulders. Takes tracked before this need Track with GEM-X again (or the runner's --reuse) for the rest skeleton.
+- On an RTX 4070 Laptop (8 GB) a 3.4 s 1080p take took about 2 minutes, at most 3.9 GB of graphics memory; clips can be up to 60 s.
+
 MediaPipe Tasks models: pose_landmarker_full.task and hand_landmarker.task (downloaded from Google's MediaPipe model storage)
 
 They are installed into `<Blender user folder>/<version>/datafiles/open_mocap/` (`lib` and `models`), not into Blender's own Python, so Blender's bundled numpy is never replaced and no admin rights are needed.
@@ -60,6 +76,8 @@ Video created by Larenju Rai (https://github.com/Larenju-Rai).
 
 🚀 Other Features:
 
+✔️ Sword tracking: "Track Sword" finds the blade in every tracked video (static camera), Combine Data turns it into a 3D direction, and the retarget turns the hands to its handle (option "Sword"), so the hand roll the pose tracker cannot see on a two-handed grip comes from the blade
+✔️ Perspective in Combine Data: an actor walking toward or away from the front camera keeps one size. "Find FOV" (on by default) picks the field of view that keeps the actor's size steady while the hips move in depth and sets FOV to it; a take where the actor stays at one distance keeps FOV as set. The hips' travel toward the camera is measured at one scale, so an actor walking from near the camera to the back of the room (up to 2.5 times nearer or farther than their middle distance) keeps one size. On a back-to-front take that shrank 20% at 65 degrees it found 44 degrees (-6%, bone length variation 15.0 -> 12.6%); on its front-to-back twin bone length variation went 22.5 -> 15.3%
 ✔️ Blender-native workflow
 ✔️ Easy installation
 ✔️ Works fully offline

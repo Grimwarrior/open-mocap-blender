@@ -31,6 +31,12 @@ zlist_missing_times = []
 # "missing_times", "fps"}.
 extra_video_path = ""
 extra_views = []
+# Sword (Track Sword): blade direction in each video's picture, [dx, dy, confidence] per tracked frame
+# (x right, y down). Further views keep theirs under "sword". Combine Data fuses them into sword_axis:
+# [x, y, depth, confidence] per front frame, a unit vector in the combined take's coordinates.
+sword_front = []
+sword_side = []
+sword_axis = []
 root = None #root empty to which the skeleton rig is parented
 pose_tracker = None
 
@@ -79,3 +85,6 @@ R_body_hand_positionList = []
 L_body_hand_positionList = []
 R_body_hand_times = []
 L_body_hand_times = []
+body_spine = None #GEM-X: its spine chain per front frame and the actor's rest skeleton (gemx.to_capture)
+body_hands_3d = False #the body hand points above carry real depth (GEM-X), not only x/y
+gemx_status = "" #progress of Track with GEM-X, shown in the Pose Tracking panel

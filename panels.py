@@ -29,6 +29,13 @@ class OpenMocapAddonPreferences(bpy.types.AddonPreferences):
             ('RTMW', "RTMW + MediaPipe depth",
              "OpenMMLab RTMW whole-body tracker for the joint positions (steadier, real hand and foot "
              "points), MediaPipe alongside for depth. Downloads about 330 MB of models"),
+            ('RTMW3D', "RTMW3D (experimental)",
+             "OpenMMLab RTMW3D whole-body tracker for joint positions and depth, without MediaPipe. "
+             "Experimental: on test footage its depth was less reliable and noisier than MediaPipe's. "
+             "Downloads about 400 MB of models"),
+            ('RTMW3D_MP', "RTMW3D + MediaPipe depth (experimental)",
+             "RTMW3D for the joint positions, with MediaPipe alongside: the depth is MediaPipe's with "
+             "RTMW3D's mixed in (RTMW3D Depth Share). Downloads about 400 MB of models"),
         ],
         default='MEDIAPIPE')
     pose_model: bpy.props.EnumProperty(
@@ -46,6 +53,26 @@ class OpenMocapAddonPreferences(bpy.types.AddonPreferences):
             ('CPU', "CPU", "Slower (about 3 frames per second on 1080p video)"),
         ],
         default='GPU')
+    depth_lifter: bpy.props.BoolProperty(
+        name="Depth Lifter", default=False,
+        description="After a video is tracked, rebuild its body depth from the whole 2D movement with "
+                    "MotionAGFormer (Apache-2.0). Steadier depth that is less often wrong about which limb is "
+                    "nearer. Runs on the CPU, about 1.5 s per 8 s of video. Downloads about 48 MB")
+    lifter_share: bpy.props.FloatProperty(
+        name="Lifter Share", min=0.0, max=1.0, default=0.5, subtype='FACTOR',
+        description="How much of the body depth comes from the Depth Lifter, the rest from the pose tracker. "
+                    "0.5 agreed best with side cameras on the test takes; 1 is steadiest")
+    gemx_python: bpy.props.StringProperty(
+        name="GEM-X Python", subtype='FILE_PATH', default="",
+        description="python.exe of the environment GEM-X is installed in (PyTorch with CUDA). Open Mocap runs "
+                    "GEM-X there, outside Blender")
+    gemx_repo: bpy.props.StringProperty(
+        name="GEM-X Folder", subtype='DIR_PATH', default="",
+        description="The GEM-X repository (github.com/NVlabs/GEM-X) with its weights and SOMA assets")
+    rtmw3d_depth_share: bpy.props.FloatProperty(
+        name="RTMW3D Depth Share", min=0.0, max=1.0, default=0.1, subtype='FACTOR',
+        description="How much of the depth comes from RTMW3D, the rest from MediaPipe. 0.1 was best on "
+                    "the test takes; more made the depth worse (0.5: clearly, 1: RTMW3D only)")
 
     def draw(self, context):
         layout = self.layout
@@ -66,12 +93,21 @@ class OpenMocapAddonPreferences(bpy.types.AddonPreferences):
                   icon="PACKAGE")
         col.separator()
         col.prop(self, "pose_tracker")
-        if self.pose_tracker == 'RTMW':
+        if self.pose_tracker in PackageInstaller.RTMW_TRACKERS:
             col.prop(self, "rtmw_device")
+        if self.pose_tracker == 'RTMW3D_MP':
+            col.prop(self, "rtmw3d_depth_share")
+        if self.pose_tracker == 'RTMW3D':
+            col.label(text="Experimental: depth is less reliable than MediaPipe's on test footage.", icon="ERROR")
         col.prop(self, "pose_model")
+        row = col.row(align=True)
+        row.prop(self, "depth_lifter")
+        if self.depth_lifter:
+            row.prop(self, "lifter_share")
         col.separator()
 
-        missing = check_required_packages(self.mediapipe_channel, self.pose_tracker, self.pose_model)
+        missing = check_required_packages(self.mediapipe_channel, self.pose_tracker, self.pose_model,
+                                          self.depth_lifter)
 
         if missing:
             col.label(text=f"Missing: {', '.join(missing)}", icon="ERROR")
@@ -86,6 +122,17 @@ class OpenMocapAddonPreferences(bpy.types.AddonPreferences):
             col.label(text=f"Location: {PackageInstaller.data_dir()}", icon="FILE_FOLDER")
         if status["message"]:
             col.label(text=status["message"], icon="INFO")
+
+        # GEM-X: NVIDIA's single-video whole-body motion, installed by hand in its own environment
+        col = layout.column(align=True)
+        col.separator()
+        col.label(text="GEM-X (optional, NVIDIA, single video)", icon="ARMATURE_DATA")
+        col.prop(self, "gemx_python")
+        col.prop(self, "gemx_repo")
+        if self.gemx_python or self.gemx_repo:
+            gaps = PackageInstaller.gemx_missing()
+            col.label(text="Missing: " + ", ".join(gaps) if gaps else "GEM-X is ready.",
+                      icon="ERROR" if gaps else "CHECKMARK")
             #col.operator("addon.uninstall_dependencies", text="Uninstall Dependencies", icon="TRASH")
 
 
@@ -104,14 +151,23 @@ class PoseTrackingPanel(bpy.types.Panel):
     def draw(self, context):
         scene = context.scene
         layout = self.layout
-        if PackageInstaller.pose_tracker() == 'RTMW':
-            ready = not PackageInstaller.rtmw_missing()
+        tracker = PackageInstaller.pose_tracker()
+        if tracker in PackageInstaller.RTMW_TRACKERS:
+            ready = not PackageInstaller.rtmw_missing(tracker)
             device = "GPU" if PackageInstaller.rtmw_device() == 'dml' else "CPU"
-            layout.label(text=f"Tracker: RTMW ({device}) + MediaPipe depth" if ready
-                         else "Tracker: RTMW not installed, using MediaPipe",
+            name = {"RTMW3D": "RTMW3D, experimental", "RTMW3D_MP": "RTMW3D, experimental"}.get(tracker, "RTMW")
+            depth = {"RTMW3D": "",
+                     "RTMW3D_MP": f" + MediaPipe depth, {PackageInstaller.rtmw3d_depth_share():.0%} RTMW3D"
+                     }.get(tracker, " + MediaPipe depth")
+            layout.label(text=f"Tracker: {name} ({device}){depth}" if ready
+                         else f"Tracker: {tracker} not installed, using MediaPipe",
                          icon="CHECKMARK" if ready else "ERROR")
         else:
             layout.label(text="Tracker: MediaPipe", icon="ARMATURE_DATA")
+        if PackageInstaller.depth_lifter():
+            ready = not PackageInstaller.lifter_missing()
+            layout.label(text=f"Depth Lifter: {PackageInstaller.lifter_share():.0%} of body depth" if ready
+                         else "Depth Lifter not installed", icon="CHECKMARK" if ready else "ERROR")
         layout.prop(scene, "multi_view_tracking")
         #layout.label(text="Realtime Pose-tracking")
         #layout.operator("object.start_tracking", text="Start RealTime Pose Tracking", icon='PLAY').track = "rt_pose"
@@ -129,6 +185,12 @@ class PoseTrackingPanel(bpy.types.Panel):
         else:
             layout.operator("object.open_mocap_filebrowser", text="Select Video", icon='FILEBROWSER').video = "front_video_pose"
         layout.operator("object.start_tracking", text="Start Pose Tracking", icon='PLAY').track = "front_pose"
+        if PackageInstaller.gemx_python() or PackageInstaller.gemx_repo():
+            row = layout.row(align=True)
+            row.operator("object.open_mocap_track_gemx", text="Track with GEM-X", icon='OUTLINER_OB_ARMATURE')
+            row.prop(scene, "gemx_fov", text="FOV")
+            if gvar.gemx_status:
+                layout.label(text=gvar.gemx_status, icon='SORTTIME' if gvar.gemx_status.endswith("...") else 'INFO')
         layout.operator("object.clear_video_path", text="Delete Video", icon='X').video = "front_video_pose"
 
         #Side Video
@@ -152,6 +214,17 @@ class PoseTrackingPanel(bpy.types.Panel):
                 layout.label(text=gvar.extra_video_path, icon='FILE_MOVIE')
             layout.operator("object.open_mocap_filebrowser", text="Select Another View", icon='FILEBROWSER').video = "extra_video_pose"
             layout.operator("object.start_tracking", text="Track This View", icon='PLAY').track = "extra_pose"
+
+        # Sword: its blade in every tracked video, for the hands' roll and grip
+        if gvar.positionList or gvar.positionList_raw:
+            layout.separator()
+            row = layout.row(align=True)
+            row.operator("object.open_mocap_track_sword", text="Track Sword", icon='TRACKING')
+            tracked = [n for n, ok in (("front", gvar.sword_front), ("side", gvar.sword_side)) if ok]
+            tracked += [v.get("name", "view") for v in gvar.extra_views if v.get("sword")]
+            if tracked:
+                layout.label(text="Sword tracked: " + ", ".join(tracked) + (" (combined)" if gvar.sword_axis else ""),
+                             icon='CHECKMARK')
 
         #Settings
         layout.separator()
@@ -178,11 +251,15 @@ class PoseTrackingPanel(bpy.types.Panel):
                 row.prop(scene, "combine_perspective", toggle=True)
                 sub = row.row(align=True)
                 sub.enabled = scene.combine_perspective
-                sub.prop(scene, "combine_fov", text="FOV")
+                sub.prop(scene, "combine_auto_fov", toggle=True)
+                fov = sub.row(align=True)
+                fov.enabled = not scene.combine_auto_fov
+                fov.prop(scene, "combine_fov", text="FOV")
                 row = box.row(align=True)
                 row.enabled = scene.combine_perspective
                 row.prop(scene, "combine_auto_horizon", toggle=True)
                 row.prop(scene, "combine_whole_take", toggle=True)
+                box.prop(scene, "combine_grip")
             box.operator("object.combine_data", text="Combine Data", icon='PLUS').mode = "pose"
         layout.operator("object.animate_obj", text="Animate", icon='RENDER_ANIMATION')
         layout.operator("object.hide_skeleton", text="Hide/Unhide Empties", icon='HIDE_OFF').collection_name = "PoseEmpties"
@@ -201,6 +278,7 @@ class PoseTrackingPanel(bpy.types.Panel):
                 box.prop(scene, "retarget_arm_mode")
                 if scene.retarget_arm_mode == 'POSITION':
                     box.prop(scene, "retarget_grip")
+                box.prop(scene, "retarget_sword")
                 box.prop(scene, "retarget_leg_mode")
                 box.prop(scene, "retarget_move_hips")
                 if scene.retarget_move_hips:
@@ -223,6 +301,7 @@ class PoseTrackingPanel(bpy.types.Panel):
                 op.spine_twist = scene.retarget_spine_twist
                 op.fingers = scene.retarget_fingers
                 op.grip = scene.retarget_grip
+                op.sword = scene.retarget_sword
                 op = row.operator("object.open_mocap_clear_retarget", text="", icon="X")
                 op.target_rig = scene.bake_rig.name
             op = layout.operator("pose.toggle_copy_rotation", text="Toggle Constraints", icon="CONSTRAINT")
