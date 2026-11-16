@@ -21,6 +21,7 @@ import numpy as np
 from mathutils import Matrix, Vector
 from . import globalVariables as gvar
 from . import combine
+from . import layers
 
 
 PREFIX = "OM "
@@ -1827,6 +1828,9 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
         :param use_sword: turn the hands to the take's tracked sword, if it has one (see sword_directions).
     """
     info = {} if info is None else info
+    # A layer being edited (NLA tweak mode) locks the rig's action; the layers stop playing while
+    # the constraints drive the rig, or they would show through (see layers.py)
+    info["layers_off"] = layers.layers_off(context, rig)
     clear_retarget(rig)
     _stash_action(rig)
     _mute_legacy_constraints(rig)
@@ -2259,6 +2263,9 @@ class RetargetToMixamo(bpy.types.Operator):
                 msg += f" Hands turned to the sword, clearly seen in {info['sword']:.0%} of the frames."
             else:
                 msg += " No tracked sword with this take."
+        if info.get("layers_off"):
+            msg += (f" Its {info['layers_off']} animation layers are off while retargeted; Bake Motion "
+                    "adds the result as a layer.")
         if missing:
             msg += f" Not found: {', '.join(missing)}"
         self.report({'WARNING'} if missing else {'INFO'}, msg)
@@ -2279,6 +2286,8 @@ class ClearRetarget(bpy.types.Operator):
         clear_retarget(rig)
         restored = _restore_action(rig) if rig else None
         msg = "Retarget removed."
+        if layers.layers_back(rig):
+            msg += " Animation layers back on."
         if rig and LEGACY_MUTED_PROP in rig:
             _restore_legacy_constraints(rig)
             msg += " Earlier copy constraints turned back on."

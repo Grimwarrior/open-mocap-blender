@@ -19,6 +19,7 @@ from . import utils
 from . import combine
 from . import capture_data
 from . import gemx
+from . import layers
 from . import PackageInstaller
 from mathutils import Vector
 from . import globalVariables as gvar
@@ -849,6 +850,9 @@ class BakeMotion(bpy.types.Operator):
     in_place: bpy.props.BoolProperty(
         name="In Place", default=False,
         description="After baking, remove the hips' travel over the ground (their height is kept)")
+    layers: bpy.props.EnumProperty(
+        name="Layers", items=layers.LAYER_MODES, default='BASE',
+        description="Where the bake goes on a rig with animation layers (NLA tracks)")
 
     """
         :param frame_start: Starting frame for baking animation.
@@ -913,16 +917,27 @@ class BakeMotion(bpy.types.Operator):
         if not bones:
             self.report({'ERROR'}, 'No selected bones to bake. Select bones or turn off Only Selected Bones.')
             return {'CANCELLED'}
+        # A layer being edited (NLA tweak mode) would take the bake into its own action
+        layers.leave_tweak(context, obj)
+        # With animation layers the mocap is baked on its own (layers off) into a new action that
+        # then becomes a layer (layers.py)
+        layered = self.layers != 'ACTION' and layers.has_layers(obj)
+        layer_name = self.action_name.strip() or "Mocap"
         # Leave the source action attached during sampling. Blender creates the new action
         # and its slot AFTER sampling when use_current_action=False. Detaching it first loses
         # any motion (fingers, controls, etc.) supplied by the existing action.
         name = self.action_name.strip()
+        if layered and not name:
+            name = f"{obj.name}_{layers.unique_name(obj.animation_data, layer_name)}"
         previous = obj.animation_data.action if obj.animation_data else None
         previous_slot = getattr(obj.animation_data, 'action_slot', None)
         previous_fake = previous.use_fake_user if previous else False
+        nla_was = obj.animation_data.use_nla if layered else None
         if name and previous:
             previous.use_fake_user = True
         try:
+            if layered:
+                obj.animation_data.use_nla = False
             result = bpy.ops.nla.bake(
                 frame_start=self.frame_start,
                 frame_end=self.frame_end,
@@ -952,6 +967,8 @@ class BakeMotion(bpy.types.Operator):
                 obj.animation_data.action = previous
                 if previous_slot is not None:
                     obj.animation_data.action_slot = previous_slot
+            if obj.animation_data and nla_was is not None:
+                obj.animation_data.use_nla = nla_was
             if previous:
                 previous.use_fake_user = previous_fake
             self.report({'ERROR'}, f'Bake failed: {error}')
@@ -968,14 +985,29 @@ class BakeMotion(bpy.types.Operator):
                 if constraint.name.startswith('OM ') and not constraint.mute:
                     constraint.mute = True
                     muted += 1
-        if not self.only_selected_bones:
-            obj.animation_data.use_nla = False  # the visual bake already includes the evaluated stack
+        if not self.only_selected_bones and not layered:
+            # The visual bake already includes the evaluated NLA stack, so its tracks go off. A rig
+            # without tracks keeps NLA on: turned off, layers made from the bake later (NLA Anim
+            # Layers) played nothing, and the edited layer froze the bones
+            if layers.has_layers(obj):
+                obj.animation_data.use_nla = False
+            layers.forget(obj)
         if self.in_place and baked is not None:
             if not keep_in_place(obj):
                 self.report({'WARNING'}, "In Place: no baked location keys on the hips, nothing changed")
+        where = ""
+        if layered:
+            track, old_base = layers.add_to_layers(context, obj, baked, self.layers, layer_name,
+                                                   full=not self.only_selected_bones)
+            where = f" as layer '{track.name}'"
+            if old_base is not None:
+                where += f" (old base '{old_base.name}' muted)"
+            if previous is not None and previous != baked:
+                where += f"; the earlier active action '{previous.name}' is kept with a fake user"
         context.scene.frame_set(context.scene.frame_current, subframe=context.scene.frame_subframe)
         scope = 'Selected bones' if self.only_selected_bones else 'Full rig'
-        self.report({'INFO'}, f"{scope}: baked {len(bones)} bones into '{baked.name}'; muted {muted} mocap constraints.")
+        self.report({'INFO'}, f"{scope}: baked {len(bones)} bones into '{baked.name}'{where}; "
+                              f"muted {muted} mocap constraints.")
         return {'FINISHED'}
 
 

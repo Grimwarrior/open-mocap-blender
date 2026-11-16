@@ -22,6 +22,7 @@ class BakeTests(unittest.TestCase):
         op = operators.BakeMotion()
         op.frame_start, op.frame_end = 1, 10
         op.only_selected_bones, op.action_name, op.in_place = selected, 'Baked', False
+        op.layers = 'BASE'                                   # no NLA tracks: as without layers
         op.report = MagicMock()
         return op, context, rig, previous
 
@@ -41,7 +42,7 @@ class BakeTests(unittest.TestCase):
             self.assertEqual(op._bake(context, rig), {'FINISHED'})
         self.assertEqual(rig.animation_data.action.name, 'Baked')
         self.assertTrue(previous.use_fake_user)
-        self.assertFalse(rig.animation_data.use_nla)
+        self.assertTrue(rig.animation_data.use_nla)      # no NLA tracks: evaluation stays on for layers made later
         for bone in rig.pose.bones:
             self.assertTrue(bone.constraints[0].mute)
             self.assertFalse(bone.constraints[1].mute)
@@ -77,6 +78,21 @@ class BakeTests(unittest.TestCase):
             self.assertEqual(op._bake(context, rig), {'CANCELLED'})
         self.assertIs(rig.animation_data.action, previous)
         self.assertFalse(rig.pose.bones[0].constraints[0].mute)
+
+    def test_full_bake_into_the_action_turns_existing_tracks_off(self):
+        op, context, rig, previous = self.fixture()
+        op.layers = 'ACTION'
+        rig.animation_data.nla_tracks = ['Base Layer']
+
+        def bake(**kwargs):
+            curves = [types.SimpleNamespace(data_path=b.path_from_id('location'), keyframe_points=[1])
+                      for b in rig.pose.bones]
+            rig.animation_data.action = types.SimpleNamespace(name='Action', use_fake_user=False, fcurves=curves)
+            return {'FINISHED'}
+
+        with patch.object(operators.bpy, 'ops', types.SimpleNamespace(nla=types.SimpleNamespace(bake=bake)), create=True):
+            self.assertEqual(op._bake(context, rig), {'FINISHED'})
+        self.assertFalse(rig.animation_data.use_nla)
 
     def test_partial_bake_mutes_only_baked_bone(self):
         op, context, rig, _ = self.fixture(selected=True)

@@ -11,7 +11,7 @@ bl_info = {
 
 
 import bpy
-from . import PackageInstaller, operators, retarget, panels
+from . import PackageInstaller, operators, retarget, panels, layers
 
 classes = PackageInstaller.classes + operators.classes + retarget.classes + panels.classes
 
@@ -168,6 +168,9 @@ def register():
         name="Sword", default=True,
         description="Turn the hands to the tracked sword (Track Sword, then Combine Data and Animate): the "
                     "hands hold its handle. With a two-handed grip the other hand also sits along the blade")
+    bpy.types.Scene.bake_layers = bpy.props.EnumProperty(
+        name="Layers", items=layers.LAYER_MODES, default='BASE',
+        description="Where Bake Motion puts the mocap on a rig with animation layers (NLA tracks)")
     bpy.types.Scene.bake_in_place = bpy.props.BoolProperty(
         name="In Place", default=False,
         description="After baking, remove the hips' travel over the ground (their height is kept), "
@@ -227,6 +230,7 @@ def unregister():
     del bpy.types.Scene.retarget_grip
     del bpy.types.Scene.retarget_sword
     del bpy.types.Scene.bake_in_place
+    del bpy.types.Scene.bake_layers
 
 
 

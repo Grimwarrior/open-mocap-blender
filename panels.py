@@ -1,6 +1,6 @@
 import bpy
 from . import globalVariables as gvar
-from . import PackageInstaller, retarget
+from . import PackageInstaller, retarget, layers
 from .PackageInstaller import check_required_packages
 
 
@@ -315,6 +315,8 @@ class PoseTrackingPanel(bpy.types.Panel):
             layout.label(text=f"Partial bake: {count} selected bones", icon='ERROR')
         layout.prop(scene, "bake_in_place")
         layout.prop(scene, "bake_action_name", text="Action", icon="ACTION")
+        if layers.has_layers(scene.bake_rig):
+            layout.prop(scene, "bake_layers", icon="NLA")
 
         op = layout.operator("object.bake_motion", text="Bake Motion", icon="ACTION_TWEAK")
         if scene.bake_rig:
@@ -324,6 +326,7 @@ class PoseTrackingPanel(bpy.types.Panel):
         op.only_selected_bones = scene.bake_only_selected
         op.action_name = scene.bake_action_name
         op.in_place = scene.bake_in_place
+        op.layers = scene.bake_layers
 
 
 
@@ -406,12 +409,15 @@ class HandTrackingPanel(bpy.types.Panel):
             count = sum(bool(getattr(pb, 'select', getattr(pb.bone, 'select', False)))
                         for pb in scene.bake_rig.pose.bones)
             layout.label(text=f"Partial bake: {count} selected bones", icon='ERROR')
+        if layers.has_layers(scene.bake_rig):
+            layout.prop(scene, "bake_layers", icon="NLA")
 
         if scene.bake_rig:
             op.target_rig = scene.bake_rig.name
         op.frame_start = scene.bake_frame_start
         op.frame_end = scene.bake_frame_end
         op.only_selected_bones = scene.bake_only_selected
+        op.layers = scene.bake_layers
 
 
 
