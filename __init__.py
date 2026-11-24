@@ -11,9 +11,9 @@ bl_info = {
 
 
 import bpy
-from . import PackageInstaller, operators, retarget, panels, layers
+from . import PackageInstaller, operators, retarget, panels, layers, foot_lock
 
-classes = PackageInstaller.classes + operators.classes + retarget.classes + panels.classes
+classes = PackageInstaller.classes + operators.classes + retarget.classes + [foot_lock.LockFeet] + panels.classes
 
 
 
@@ -43,6 +43,9 @@ def register():
     bpy.types.Scene.bake_frame_start = bpy.props.IntProperty(name="Start Frame", default=1, min = 1)
     bpy.types.Scene.bake_frame_end = bpy.props.IntProperty(name="End Frame", default=250, min = 1)
     bpy.types.Scene.bake_only_selected = bpy.props.BoolProperty(name="Only Selected Bones", default=False)
+    bpy.types.Scene.foot_lock_floor_z = bpy.props.FloatProperty(
+        name="Floor Z", subtype='DISTANCE', default=0.,
+        description="World height of the ground for Lock Feet on Baked Action")
     bpy.types.Scene.bake_action_name = bpy.props.StringProperty(
         name="Action Name", default="",
         description="Bake into a new action with this name (kept with a fake user, so each named take "
@@ -200,6 +203,7 @@ def unregister():
     del bpy.types.Scene.bake_frame_start
     del bpy.types.Scene.bake_frame_end
     del bpy.types.Scene.bake_only_selected
+    del bpy.types.Scene.foot_lock_floor_z
     del bpy.types.Scene.bake_action_name
     del bpy.types.Scene.multi_view_tracking
     del bpy.types.Scene.realtime_tracking

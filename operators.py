@@ -977,6 +977,14 @@ class BakeMotion(bpy.types.Operator):
         if name and baked is not None:
             baked.name = name              # Blender adds .001 if the name is taken
             baked.use_fake_user = True
+        # Bind tracker evidence to the take while the retarget is driving it. Unrelated
+        # actions and imported FBXs use the boot mesh for contact detection.
+        if not self.only_selected_bones and any(
+                "Leg" in b.name and c.name.startswith("OM ") and not c.mute for b in bones for c in b.constraints):
+            if obj.get("open_mocap_foot_contacts"):
+                baked["open_mocap_foot_contacts"] = obj["open_mocap_foot_contacts"]
+            elif "open_mocap_foot_contacts" in baked:
+                del baked["open_mocap_foot_contacts"]
         # The baked pose replaces the mocap drivers. Keep helpers for re-enabling/rebaking,
         # and keep control-rig constraints intact; only the baked bones' OM constraints mute.
         muted = 0

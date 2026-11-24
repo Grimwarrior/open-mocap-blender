@@ -211,6 +211,19 @@ def take_fps(empties):
         return None
 
 
+def take_foot_contacts(empties):
+    """Optional tracker evidence belonging to this animated landmark source."""
+    try:
+        meta = json.loads(empties[0].parent.get("open_mocap_metadata", "{}"))
+        frames = meta["frames"]
+        values = [row["foot_contact"] for row in meta["metadata"]]
+        if frames and np.shape(values) == (len(frames), 4) and np.isfinite(values).all():
+            return json.dumps({"frames": frames, "confidence": values})
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError):
+        pass
+    return None
+
+
 def landmark_confidence(empties, frames, indices, depth_floor=0.0):
     """
         Confidence carried by this animated source, independent of the current capture cache.
@@ -1732,6 +1745,8 @@ def clear_retarget(rig):
     """Remove only this rig's helpers; also support the old shared collection safely."""
     if rig is None or rig.type != 'ARMATURE':
         return
+    if "open_mocap_foot_contacts" in rig:
+        del rig["open_mocap_foot_contacts"]
     collections = [c for c in bpy.data.collections
                    if c.get(HELPER_OWNER) is not None or c.name == HELPER_COLLECTION]
     candidates = {obj for coll in collections for obj in coll.objects}
@@ -2250,6 +2265,9 @@ class RetargetToMixamo(bpy.types.Operator):
             hip_height=self.hip_height, shoulders=self.shoulders, spine_twist=self.spine_twist,
             grip=self.grip, info=info, fingers=self.fingers, use_sword=self.sword)
         mapped = list(dict.fromkeys(mapped))
+        contacts = take_foot_contacts(empties)
+        if contacts:
+            rig["open_mocap_foot_contacts"] = contacts
         scene.bake_rig = rig
         scene.bake_frame_start = scene.frame_start
         scene.bake_frame_end = scene.frame_end

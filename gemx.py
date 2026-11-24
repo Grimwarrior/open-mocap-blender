@@ -303,6 +303,9 @@ def to_capture(data, unit=UNIT):
                      "rest": {n: rest[idx[n]].tolist() for n in SPINE_CHAIN + SPINE_REST_EXTRA},
                      "rest_up": [0.0, 1.0, 0.0]}
     meta = [{"depth_confidence": [1.0] * 40, "depth_source": "gemx"} for _ in range(T)]
+    if "static_conf" in data:
+        for row, confidence in zip(meta, data["static_conf"]):
+            row["foot_contact"] = [float(x) for x in confidence[:4]]
     return {"frames": pts.reshape(T, 120).tolist(), "times": times.tolist(), "vis": np.ones((T, 40)).tolist(),
             "meta": meta, "hands": {s: h.tolist() for s, h in hands.items()}, "spine": spine, "fps": fps,
             "width": int(np.asarray(data["width"]).reshape(-1)[0]),

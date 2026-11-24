@@ -11,6 +11,15 @@ These are interpreted Python checks, with bytecode file generation disabled. The
 build the add-on, open Blender, load detector models, or change a Blender scene. The unit
 tests use mock Blender objects; they do not validate Blender's dependency graph or UI.
 
+Run the foot-lock integration check from the same directory with Blender 5.1:
+
+```powershell
+blender -b --factory-startup --python-exit-code 1 -P tests/blender_foot_lock.py
+```
+
+It creates a rotated test rig with two separate boots above a raised floor, applies the
+operator, samples the skinned soles between keys, and checks that a failed retry restores the action.
+
 ## First capture improvement batch
 
 - Live timestamps measure acquisition time before inference. Files use OpenCV presentation

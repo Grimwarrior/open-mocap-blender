@@ -156,7 +156,9 @@ class Floor(unittest.TestCase):
         static[jump, :4] = 0.0
         data = take(J)
         data["static_conf"] = static
-        P = np.asarray(gemx.to_capture(data)["frames"]).reshape(T, 40, 3) / gemx.UNIT
+        capture = gemx.to_capture(data)
+        np.testing.assert_array_equal([row["foot_contact"] for row in capture["meta"]], static[:, :4])
+        P = np.asarray(capture["frames"]).reshape(T, 40, 3) / gemx.UNIT
         low = -P[:, [29, 30, 31, 32], 1].max(axis=1)              # lowest foot point's height (y down)
         stand = np.ones(T, bool)
         stand[jump] = False

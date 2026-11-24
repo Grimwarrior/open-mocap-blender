@@ -328,6 +328,13 @@ class PoseTrackingPanel(bpy.types.Panel):
         op.in_place = scene.bake_in_place
         op.layers = scene.bake_layers
 
+        if scene.bake_rig:
+            col = layout.column(align=True)
+            op = col.operator("object.open_mocap_lock_feet", icon="CON_KINEMATIC")
+            op.target_rig = scene.bake_rig.name
+            op.floor_z = scene.foot_lock_floor_z
+            col.prop(scene, "foot_lock_floor_z")
+
 
 
 # -------------------------------------------------------------
