@@ -49,6 +49,7 @@ pose_tracker = None
 hand_front_video_path = "" 
 hand_side_video_path = "" 
 hand_tracker = None
+live_hands = None        # smoothing.LiveHands of the running live hand tracker
 hand_fps = 0
 hand_front_fps = 0
 hand_side_fps = 0

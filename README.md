@@ -70,6 +70,8 @@ Video created by Larenju Rai (https://github.com/Larenju-Rai).
 
 ✔️ Realtime hand tracking
 
+**Live Smoothing** (Hand Tracking panel, default 50, 0 off) steadies the live hands with a One Euro filter (as RGB MoCap's live preview uses it, github.com/toyxyz/toyxyz_RGBMocap, MIT): a hand held still is smoothed strongly, a fast move hardly at all. On a test hand with 2% jitter it cuts the still hand's jitter to a fifth; a fast swipe trails by about a sixth of the hand's length. Higher values are steadier and lag more; it can be changed while tracking.
+
 Video created by Larenju Rai (https://github.com/Larenju-Rai).
 
 ![RT_HandTracking GIF](assets/RealTimeHandTracking.gif)

@@ -27,6 +27,10 @@ def register():
         min=1,
         max=2
     )
+    bpy.types.Scene.hand_live_smoothing = bpy.props.FloatProperty(
+        name="Live Smoothing", default=50.0, min=0.0, max=100.0, subtype='PERCENTAGE',
+        description="Steadies the live hands (One Euro filter): still hands strongly, fast moves little. "
+                    "Higher is steadier but lags more in fast moves; 0 is off. Can be changed while tracking")
     bpy.types.Scene.cam_index = bpy.props.IntProperty(
         name="Camera Index",
         description="Choose a camera. Index 0 means primary webcam.",
@@ -206,6 +210,7 @@ def unregister():
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.num_hands
     del bpy.types.Scene.cam_index
+    del bpy.types.Scene.hand_live_smoothing
     del bpy.types.Scene.bake_rig
     del bpy.types.Scene.bake_frame_start
     del bpy.types.Scene.bake_frame_end

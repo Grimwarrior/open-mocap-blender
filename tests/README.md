@@ -10,6 +10,9 @@ python -B tests/synthetic_combine.py
 These are interpreted Python checks, with bytecode file generation disabled. They do not
 build the add-on, open Blender, load detector models, or change a Blender scene. The unit
 tests use mock Blender objects; they do not validate Blender's dependency graph or UI.
+`test_smoothing.py` checks the live hand filter against a synthetic hand with known motion
+(still, slow drift, finger curl and fast swipes, 2% jitter): steadier when still, not worse when
+slow, and under a quarter of a hand length behind in a fast swipe.
 
 Run the foot-lock integration check from the same directory with Blender 5.1:
 

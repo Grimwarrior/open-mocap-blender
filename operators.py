@@ -21,6 +21,7 @@ from . import capture_data
 from . import gemx
 from . import layers
 from . import PackageInstaller
+from . import smoothing
 from mathutils import Vector
 from . import globalVariables as gvar
 
@@ -739,6 +740,7 @@ class AnimateHand(bpy.types.Operator):
         if self.mode == "realtime":
             num_hands = context.scene.num_hands
             gvar.hand_tracker = utils.HandTracking(num_hands,"rt_hand")
+            gvar.live_hands = smoothing.LiveHands(context.scene.hand_live_smoothing)
 
             # --- Create Right Hand ---
             if not self.hand_exists("R"):
@@ -812,20 +814,19 @@ class AnimateHand(bpy.types.Operator):
 
         img = gvar.hand_tracker.detect_hand(img)
 
-
-        # --- Animate Right Hand ---
-        if gvar.R_hand_object_list and len(gvar.rt_hand_lmlist_R) > 0:
-            for i, point in enumerate(gvar.rt_hand_lmlist_R):
-                loc = utils.MathUtility.cv2blender_coordinates(point)
-                obj = gvar.R_hand_object_list[i]
-                obj.location = Vector(loc) - gvar.R_hand_root.location
-
-        # --- Animate Left Hand ---
-        if gvar.L_hand_object_list and len(gvar.rt_hand_lmlist_L) > 0:
-            for i, point in enumerate(gvar.rt_hand_lmlist_L):
-                loc = utils.MathUtility.cv2blender_coordinates(point)
-                obj = gvar.L_hand_object_list[i]
-                obj.location = Vector(loc) - gvar.L_hand_root.location
+        # Each hand's latest points, steadied by the live filter (smoothing.py) once per new detection
+        live = gvar.live_hands
+        if live is not None:
+            live.set_strength(bpy.context.scene.hand_live_smoothing)
+        for side, points, times, objects, root in (
+                ("R", gvar.rt_hand_lmlist_R, gvar.R_hand_times, gvar.R_hand_object_list, gvar.R_hand_root),
+                ("L", gvar.rt_hand_lmlist_L, gvar.L_hand_times, gvar.L_hand_object_list, gvar.L_hand_root)):
+            if not objects or not points:
+                continue
+            if live is not None and times:
+                points = live.points(side, points, times[-1])
+            for obj, point in zip(objects, points):
+                obj.location = Vector(utils.MathUtility.cv2blender_coordinates(point)) - root.location
         utils.VideoPlaneManager.update_frame(img)
         return gvar.delay
 

@@ -367,6 +367,7 @@ class HandTrackingPanel(bpy.types.Panel):
             layout.label(text="Realtime Hand-tracking")
             layout.prop(scene, "cam_index", text="Choose a camera")
             layout.prop(scene, "num_hands", text="Number of Hands")
+            layout.prop(scene, "hand_live_smoothing")
             layout.operator("object.animatehand", text="Start RealTime Hand Tracking", icon='PLAY').mode = "realtime"
             layout.operator("object.stop_tracking", text="Stop Hand Tracking", icon='PAUSE').mode = "realtime"
         layout.separator()
