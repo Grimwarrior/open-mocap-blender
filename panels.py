@@ -333,7 +333,18 @@ class PoseTrackingPanel(bpy.types.Panel):
             op = col.operator("object.open_mocap_lock_feet", icon="CON_KINEMATIC")
             op.target_rig = scene.bake_rig.name
             op.floor_z = scene.foot_lock_floor_z
-            col.prop(scene, "foot_lock_floor_z")
+            op.mode = scene.foot_lock_mode
+            op.preset = scene.foot_lock_preset
+            op.lower_hips = scene.foot_lock_lower_hips
+            col.prop(scene, "foot_lock_mode", text="")
+            if scene.foot_lock_mode == 'FLAT':
+                col.prop(scene, "foot_lock_floor_z")
+            col.prop(scene, "foot_lock_preset", text="")
+            col.prop(scene, "foot_lock_lower_hips")
+            marked = sorted({m.name.strip().upper()[:1] for m in scene.timeline_markers
+                             if m.name.strip().upper() in ("L+", "L-", "R+", "R-")})
+            if marked:
+                col.label(text="Contacts from markers: " + " ".join(marked), icon='MARKER_HLT')
 
 
 

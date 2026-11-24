@@ -81,6 +81,13 @@ Video created by Larenju Rai (https://github.com/Larenju-Rai).
 ✔️ Perspective in Combine Data: an actor walking toward or away from the front camera keeps one size. "Find FOV" (on by default) picks the field of view that keeps the actor's size steady while the hips move in depth and sets FOV to it; a take where the actor stays at one distance keeps FOV as set. The hips' travel toward the camera is measured at one scale, so an actor walking from near the camera to the back of the room (up to 2.5 times nearer or farther than their middle distance) keeps one size. On a back-to-front take that shrank 20% at 65 degrees it found 44 degrees (-6%, bone length variation 15.0 -> 12.6%); on its front-to-back twin bone length variation went 22.5 -> 15.3%
 **Lock Feet on Baked Action** is in Open Mocap → Pose Tracking → Animation Baking. Select the skinned Mixamo rig and its baked action, set **Floor Z** to the height of the ground, then click the button. The corrected action becomes active and the original is kept in the file. The pass uses the heel and toe surfaces of the skinned mesh, allows the heel to rise during a toe pivot, and checks the sole between keys. New GEM-X takes can also supply contact confidence. For an NLA stack, bake the full rig with **Layers → Active Action** first. The companion Mixamo Rig O3DE exporter writes four samples per scene frame for foot-locked actions.
 
+Foot lock options (contact rules after RGB MoCap's motion correction, github.com/toyxyz/toyxyz_RGBMocap, MIT):
+- **Flat Ground / Multi Level**: Flat Ground pins every contact to Floor Z. Multi Level pins each stance at its own height (stairs, steps, slopes, a foot on a box) and has no floor check; a stance can stand up to 0.3 leg lengths above the other foot.
+- **Gentle / Normal / Firm**: Gentle takes fewer contacts and pins them at 60%, keeping more of the original foot motion. Normal is the default. Firm takes looser contacts and bridges dropouts up to 80 ms where the foot stayed in place; avoid it on deliberate foot slides.
+- **Lower Hips** (on by default) keys the hips down, smoothly and at most 0.3 leg lengths, where a planted foot cannot reach its pin with the leg straight. Without it that foot stays short of the ground. Locked or constrained hip locations are left alone.
+- Jumps never plant: where both feet rise well above their surroundings and come down again, nothing is pinned.
+- **Contact markers**: timeline markers named `L+` / `L-` and `R+` / `R-` start and end a contact by hand (inclusive). A foot with markers takes its contacts only from them; the other foot stays automatic.
+
 ✔️ Blender-native workflow
 ✔️ Easy installation
 ✔️ Works fully offline

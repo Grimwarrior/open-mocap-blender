@@ -1,4 +1,9 @@
-"""Post-bake sole contact on a Mixamo rig. Positions and the ground plane are in world space."""
+"""Post-bake sole contact on a Mixamo rig. Positions and the ground plane are in world space.
+
+Contact gating ideas (presets, gap bridging, rejecting jump arcs, per-stance heights for stairs,
+lowering the hips when a planted foot is out of reach, sparse manual timing that overrides
+detection) follow RGB MoCap's motion correction (github.com/toyxyz/toyxyz_RGBMocap, MIT).
+"""
 import json
 import math
 
@@ -13,6 +18,133 @@ SIDES = ("Left", "Right")
 CHAIN = ("UpLeg", "Leg", "Foot", "ToeBase")
 SUBSTEPS = 4
 CONTACTS = "open_mocap_foot_contacts"
+
+# Thresholds in leg lengths (thigh + shin) and seconds. NORMAL keeps the original values.
+#   height / speed: toe within this height of the ground, moving slower than this (per second)
+#   flat_height / flat_speed: the heel's, for a flat foot
+#   minimum: shortest contact; strength: share of the pin; gap: dropouts bridged inside a stance
+PRESETS = {
+    'GENTLE': dict(height=.035, speed=.40, flat_height=.014, flat_speed=.40, minimum=.085, strength=.6, gap=0.),
+    'NORMAL': dict(height=.045, speed=.48, flat_height=.018, flat_speed=.46, minimum=.085, strength=1., gap=0.),
+    'FIRM': dict(height=.060, speed=.60, flat_height=.024, flat_speed=.58, minimum=.060, strength=1., gap=.08),
+}
+PRESET_ITEMS = [
+    ('GENTLE', "Gentle", "Fewer, stricter contacts, pinned at 60%: keeps more of the original foot motion"),
+    ('NORMAL', "Normal", "Balanced contact detection with full pins"),
+    ('FIRM', "Firm", "Looser contacts that also bridge dropouts up to 80 ms where the foot stayed in place. "
+                     "Avoid on deliberate foot slides"),
+]
+MODE_ITEMS = [
+    ('FLAT', "Flat Ground", "One horizontal ground plane at Floor Z"),
+    ('MULTI', "Multi Level", "Each stance keeps its own height: stairs, steps, slopes, boxes. No floor check"),
+]
+MULTI_STEP = .3        # multi level: a stance may stand at most this many leg lengths above the other foot
+JUMP_RISE = .17        # both feet this many leg lengths over their surroundings, with a landing: a jump
+HIP_DROP_MAX = .3      # the hips go down at most this many leg lengths for a planted foot to reach
+MARKERS = ("L", "R")   # timeline markers "L+" / "L-" and "R+" / "R-" start and end a manual contact
+
+
+def runs(mask):
+    """(start, end) of each run of True, end exclusive."""
+    edge = np.diff(np.r_[0, np.asarray(mask, dtype=np.int8), 0])
+    return list(zip(np.flatnonzero(edge == 1), np.flatnonzero(edge == -1)))
+
+
+def gaussian(x, sigma):
+    if sigma <= 0 or len(x) < 2:
+        return np.asarray(x, dtype=float).copy()
+    r = int(math.ceil(3*sigma))
+    k = np.exp(-.5*(np.arange(-r, r+1)/sigma)**2)
+    return np.convolve(np.pad(x, r, mode='edge'), k/k.sum(), mode='valid')
+
+
+def window(x, radius, reduce):
+    """Sliding min / max over 2*radius+1 samples, edges held."""
+    if radius < 1:
+        return np.asarray(x, dtype=float).copy()
+    return reduce(np.lib.stride_tricks.sliding_window_view(np.pad(x, radius, mode='edge'), 2*radius+1), axis=1)
+
+
+def airborne(low, fps, span):
+    """
+        Frames of a jump: the lower foot rises JUMP_RISE leg lengths over its surroundings (4 s either
+        side, so a slow drift in height is not a jump) and comes back down on both sides of the peak.
+        A take that floats throughout has no landing and stays groundable.
+    """
+    n = len(low)
+    flight = np.zeros(n, bool)
+    if n < 5:
+        return flight
+    reach = min(n, max(2, round(4*fps)))
+    smooth = gaussian(low, max(.5, .03*fps))
+    rise = JUMP_RISE*span
+    for start, end in runs(low - window(low, reach, np.min) > rise):
+        peak = start + int(np.argmax(smooth[start:end]))
+        lo, hi = max(0, peak-reach), min(n, peak+reach+1)
+        if peak == lo or peak+1 == hi:
+            continue
+        left, right = smooth[lo:peak].min(), smooth[peak+1:hi].min()
+        if smooth[peak] - max(left, right) >= rise:
+            flight[start:end] = True
+    return flight
+
+
+def bridge(mask, points, fps, gap, limit):
+    """Fill dropouts up to `gap` seconds inside a stance where the foot stayed within `limit`."""
+    out = mask.copy()
+    if gap <= 0:
+        return out
+    for start, end in runs(~mask):
+        if start == 0 or end == len(mask) or end-start > round(gap*fps):
+            continue
+        if np.linalg.norm(points[end]-points[start-1]) < limit:
+            out[start:end] = True
+    return out
+
+
+def marker_masks(markers, frames):
+    """
+        {side index: contact mask over frames} from timeline markers named "L+" ... "L-" and
+        "R+" ... "R-" (inclusive). A side with markers uses only them; an unclosed "+" runs to the end.
+    """
+    out = {}
+    for index, letter in enumerate(MARKERS):
+        marks = sorted((frame, name.strip().upper()[1:]) for name, frame in markers
+                       if name.strip().upper() in (letter+"+", letter+"-"))
+        if not marks:
+            continue
+        mask = np.zeros(len(frames), bool)
+        start = None
+        for frame, sign in marks:
+            if sign == "+":
+                start = frame if start is None else start
+            elif start is not None:
+                mask |= (frames >= start) & (frames <= frame)
+                start = None
+        if start is not None:
+            mask |= frames >= start
+        out[index] = mask
+    return out
+
+
+def hip_drop(hips, goals, lengths, weights, limit):
+    """
+        How far down the hips must go (world Z, >= 0) for every pinned foot to reach its goal, as in
+        RGB MoCap's reachable_pelvis_drop: hips (S, F, 3) hip joints, goals (S, F, 3) ankle goals,
+        lengths (S,) thigh + shin, weights (S, F) pin strength. Goals out of reach sideways are left.
+    """
+    radius = np.asarray(lengths)[:, None]*.999
+    horizontal = np.sum((hips[..., :2]-goals[..., :2])**2, axis=-1)
+    vertical = hips[..., 2]-goals[..., 2]
+    possible = (horizontal < radius**2) & (vertical > 0) & (weights > 1e-4)
+    need = np.where(possible, np.maximum(vertical-np.sqrt(np.maximum(radius**2-horizontal, 0)), 0), 0)
+    return np.minimum((need*np.minimum(weights, 1)).max(axis=0), limit)
+
+
+def smooth_drop(need, rate):
+    """A smooth curve that stays (nearly) above the needed drop: widen the peaks, then blur."""
+    sigma = max(1., .04*rate)
+    return gaussian(window(need, int(math.ceil(3*sigma)), np.max), sigma)
 
 
 def set_time(scene, frame):
@@ -106,7 +238,14 @@ def anchors(frames, mask, points, fps, minimum):
     return weights, goals, len(spans)
 
 
-def plan(boot, frames, fps, floor, hint):
+def plan(boot, frames, fps, floor, hint, preset=PRESETS['NORMAL'], multi=False, support=None,
+         flight=None, manual=None):
+    """
+        Contacts of one boot. Flat ground pins to `floor`; multi level pins each stance at its own
+        median height, needs the foot within MULTI_STEP leg lengths of `support` (the lower foot's
+        lowest point per frame) and still in height. `flight` frames (jumps) never plant, and a
+        `manual` mask replaces detection.
+    """
     data = np.array(boot.samples)
     keys = data[::SUBSTEPS]
     span = boot.length
@@ -114,22 +253,44 @@ def plan(boot, frames, fps, floor, hint):
                                              (m[3].translation-m[2].translation).x) for m in boot.pose]))
     toe_speed = np.linalg.norm(np.gradient(keys[:, 1:3], axis=0), axis=1) * fps
     heel_speed = np.linalg.norm(np.gradient(keys[:, 4:6], axis=0), axis=1) * fps
-    plant = (np.abs(keys[:, 7]-floor) < .045*span) & (toe_speed < .48*span)
-    flat = (keys[:, 8] < floor + .018*span) & (heel_speed < .46*span)
-    flat &= np.abs(np.gradient(heading[::SUBSTEPS])) * fps < 1.7
-    if hint is not None:
-        ankle, ball = hint.T
-        plant &= ball > .46
-        flat &= ankle > .50
-    duration = max(2, math.ceil(.085*fps))
+    duration = max(2, math.ceil(preset['minimum']*fps))
+    lowest = np.interp(frames, frames[::SUBSTEPS], keys[:, 0])
+    if manual is not None:
+        plant = manual.copy()
+        duration = 1
+    else:
+        if multi:
+            rising = np.abs(np.gradient(keys[:, 7])) * fps
+            plant = ((keys[:, 7]-keys[:, 0] < preset['height']*span) & (toe_speed < preset['speed']*span)
+                     & (rising < preset['speed']*span) & (keys[:, 0] < support + MULTI_STEP*span))
+        else:
+            plant = (np.abs(keys[:, 7]-floor) < preset['height']*span) & (toe_speed < preset['speed']*span)
+        if hint is not None:
+            plant &= hint[:, 1] > .46
+        if flight is not None:
+            plant &= ~flight
+        plant = bridge(plant, np.c_[keys[:, 1:3], keys[:, 7]], fps, preset['gap'], preset['height']*span)
     weight, toe, count = anchors(frames, plant, data[:, 1:3], fps, duration)
-    blend, yaw, flats = anchors(frames, plant & flat, heading, fps, duration)
-    # Keep the sampled lift during a swing. A floor guard also covers landing between frames.
     clearance = .001*span
-    ground = np.maximum(floor+clearance, np.interp(frames, frames[::SUBSTEPS], keys[:, 0]))
-    boot.height = (1-weight)*ground + weight*(floor+clearance)
+    if multi:
+        _, level, _ = anchors(frames, plant, data[:, 0], fps, duration)
+        ground = lowest
+        stand = level
+    else:
+        # Keep the sampled lift during a swing. A floor guard also covers landing between frames.
+        ground = np.maximum(floor+clearance, lowest)
+        stand = np.full(len(frames), floor+clearance)
+    level_keys = stand[::SUBSTEPS] - (0 if multi else clearance)
+    flat = (keys[:, 8] < level_keys + preset['flat_height']*span) & (heel_speed < preset['flat_speed']*span)
+    flat &= np.abs(np.gradient(heading[::SUBSTEPS])) * fps < 1.7
+    if hint is not None and manual is None:
+        flat &= hint[:, 0] > .50
+    blend, yaw, flats = anchors(frames, plant & flat, heading, fps, duration)
+    weight *= preset['strength']
+    boot.weight = weight
+    boot.height = (1-weight)*ground + weight*stand
     boot.anchor = data[:, 1:3]*(1-weight[:, None]) + toe*weight[:, None]
-    boot.flat, boot.yaw = blend, yaw
+    boot.flat, boot.yaw = blend*preset['strength'], yaw
     return count, flats
 
 
@@ -247,21 +408,85 @@ def check_floor(scene, boots, frames, graph, floor):
     return minimum, extra
 
 
-def apply_pass(context, rig, boots, frames, floor, confidence):
+def sample_poses(context, rig, boots, frames, graph=None, hips=None):
+    """World leg matrices per frame (and the sole samples / hips pose matrices when asked)."""
     scene = context.scene
-    graph = context.evaluated_depsgraph_get()
-    fps = scene.render.fps/scene.render.fps_base
+    hip_mats = []
     for boot in boots:
         boot.pose = []
     for i, f in enumerate(frames):
         set_time(scene, f)
         for boot in boots:
             boot.pose.append([(rig.matrix_world @ b.matrix).copy() for b in boot.bones])
-            boot.samples.append(boot.measure(graph))
+            if graph is not None:
+                boot.samples.append(boot.measure(graph))
+        if hips is not None:
+            hip_mats.append(hips.matrix.copy())
         context.window_manager.progress_update(i)
-    counts = [plan(b, frames, fps, floor, hint) for b, hint in zip(boots, confidence)]
+    return hip_mats
+
+
+def ankle_goals(boot):
+    """Where each pinned ankle has to go: the ankle moved by the sole's planned correction."""
+    data = np.array(boot.samples)
+    ankle = np.array([m[2].translation for m in boot.pose])
+    shift = np.c_[boot.anchor - data[:, 1:3], boot.height - data[:, 0]]
+    return ankle + shift
+
+
+def lower_hips(context, rig, hips, hip_mats, boots, frames):
+    """Key the hips down where a pinned foot is out of reach. Returns the largest drop (world units)."""
+    scene = context.scene
+    hip_points = np.array([[m[0].translation for m in boot.pose] for boot in boots])
+    goals = np.array([ankle_goals(boot) for boot in boots])
+    lengths = [boot.length for boot in boots]
+    weights = np.array([boot.weight for boot in boots])
+    need = hip_drop(hip_points, goals, lengths, weights, HIP_DROP_MAX*min(lengths))
+    fps = scene.render.fps/scene.render.fps_base
+    drop = np.minimum(smooth_drop(need, fps*SUBSTEPS), HIP_DROP_MAX*min(lengths))
+    if drop.max() < 1e-4*min(lengths):
+        return 0.
+    to_pose = rig.matrix_world.to_3x3().inverted()
+    for f, m, d in zip(frames, hip_mats, drop):
+        set_time(scene, f)
+        pose = m.copy()
+        pose.translation = m.translation - to_pose @ Vector((0, 0, float(d)))
+        hips.location = rig.convert_space(pose_bone=hips, matrix=pose, from_space='POSE',
+                                          to_space='LOCAL').translation
+        hips.keyframe_insert(data_path="location", frame=f, group=hips.name)
+    path = hips.path_from_id("location")
+    for fc in curve_bag(rig):
+        if fc.data_path == path:
+            for k in fc.keyframe_points:
+                k.interpolation = 'LINEAR'
+            fc.update()
+    return float(drop.max())
+
+
+def apply_pass(context, rig, boots, frames, floor, confidence, preset=PRESETS['NORMAL'], multi=False,
+               hips=None, markers=()):
+    """
+        Plan and key the contacts. Returns ([(toe contacts, flat plants)] per boot, minimum sole
+        clearance over the floor (nan in multi level), largest hip drop, sides set by markers).
+    """
+    scene = context.scene
+    graph = context.evaluated_depsgraph_get()
+    fps = scene.render.fps/scene.render.fps_base
+    hip_mats = sample_poses(context, rig, boots, frames, graph, hips)
+    keyframes = frames[::SUBSTEPS]
+    lows = np.array([np.array(b.samples)[::SUBSTEPS, 0] for b in boots])
+    support = lows.min(axis=0)
+    flight = airborne(support, fps, min(b.length for b in boots))
+    manual = marker_masks(markers, keyframes)
+    counts = [plan(b, frames, fps, floor, hint, preset, multi, support, flight, manual.get(side))
+              for side, (b, hint) in enumerate(zip(boots, confidence))]
     if not any(n for n, _ in counts):
-        raise ValueError("No sustained contact at this floor height")
+        raise ValueError("No sustained contact" + ("" if multi else " at this floor height"))
+    dropped = 0.
+    if hips is not None:
+        dropped = lower_hips(context, rig, hips, hip_mats, boots, frames)
+        if dropped:
+            sample_poses(context, rig, boots, frames)
     previous = {}
     # FK controls on the copied action can reproduce the visual leg pose from either IK or FK.
     switches = [rig.pose.bones.get('Ctrl_Foot_IK_'+s) for s in SIDES] if retarget.is_control_rig(rig) else []
@@ -283,6 +508,8 @@ def apply_pass(context, rig, boots, frames, floor, confidence):
             for k in fc.keyframe_points:
                 k.interpolation = 'LINEAR'
             fc.update()
+    if multi:
+        return counts, math.nan, dropped, sorted(manual)
     minimum, extra = check_floor(scene, boots, frames, graph, floor)
     if extra.any():
         for side, boot in enumerate(boots):
@@ -291,7 +518,7 @@ def apply_pass(context, rig, boots, frames, floor, confidence):
                 set_time(scene, frames[i])
                 key_contact(context, rig, boot, i, frames[i], {}, graph)
         minimum, _ = check_floor(scene, boots, frames, graph, floor)
-    return counts, minimum
+    return counts, minimum, dropped, sorted(manual)
 
 
 def source_hints(action, frame_keys):
@@ -319,6 +546,16 @@ class LockFeet(bpy.types.Operator):
     target_rig: bpy.props.StringProperty(options={'HIDDEN'})
     floor_z: bpy.props.FloatProperty(name="Floor Z", default=0., subtype='DISTANCE',
                                      description="Height of the horizontal ground plane in world space")
+    mode: bpy.props.EnumProperty(name="Ground", items=MODE_ITEMS, default='FLAT')
+    preset: bpy.props.EnumProperty(name="Contacts", items=PRESET_ITEMS, default='NORMAL')
+    lower_hips: bpy.props.BoolProperty(
+        name="Lower Hips", default=True,
+        description="Key the hips down (smoothly, at most 0.3 leg lengths) where a planted foot "
+                    "cannot reach its pin with the leg straight")
+    use_markers: bpy.props.BoolProperty(
+        name="Contact Markers", default=True,
+        description="Timeline markers named L+ / L- and R+ / R- start and end a contact by hand. A foot "
+                    "with markers takes its contacts only from them")
 
     def execute(self, context):
         rig = bpy.data.objects.get(self.target_rig) if self.target_rig else context.active_object
@@ -358,6 +595,14 @@ class LockFeet(bpy.types.Operator):
             for boot in boots:
                 if any(not c.mute and c.influence > 0 for b in boot.controls for c in b.constraints):
                     raise ValueError("Bake and disable the constraints driving the leg controls first")
+            hips = retarget.drive_bone(rig, "Hips") if self.lower_hips else None
+            if hips is not None and (any(not c.mute and c.influence > 0 for c in hips.constraints)
+                                     or any(hips.lock_location)):
+                hips = None
+                skipped_hips = True
+            else:
+                skipped_hips = False
+            markers = [(m.name, m.frame) for m in scene.timeline_markers] if self.use_markers else []
             hints = source_hints(old, frames[::SUBSTEPS])
             old.use_fake_user = True
             copy = old.copy()
@@ -365,7 +610,7 @@ class LockFeet(bpy.types.Operator):
             ad.action = copy
             if old_slot:
                 ad.action_slot = next(s for s in copy.slots if s.identifier == old_slot.identifier)
-            affected = {b for boot in boots for b in boot.controls}
+            affected = {b for boot in boots for b in boot.controls} | ({hips} if hips else set())
             original_basis = {b: b.matrix_basis.copy() for b in affected}
             for side in SIDES:
                 switch = rig.pose.bones.get("Ctrl_Foot_IK_" + side)
@@ -374,7 +619,9 @@ class LockFeet(bpy.types.Operator):
             continuous_keys(rig, affected | {p for b in affected for p in b.parent_recursive})
             context.window_manager.progress_begin(0, 2 * len(frames))
             progress_started = True
-            counts, minimum = apply_pass(context, rig, boots, frames, self.floor_z, hints)
+            counts, minimum, dropped, manual = apply_pass(
+                context, rig, boots, frames, self.floor_z, hints, PRESETS[self.preset],
+                self.mode == 'MULTI', hips, markers)
             copy["open_mocap_samples_per_frame"] = SUBSTEPS
             if hasattr(copy, 'mr_o3de_name'):
                 copy.mr_o3de_name = ""
@@ -397,7 +644,14 @@ class LockFeet(bpy.types.Operator):
             if progress_started:
                 context.window_manager.progress_end()
         units = scene.unit_settings.scale_length * 1000
-        self.report({'WARNING'} if minimum < 0 else {'INFO'},
-                    f"{copy.name}: {sum(n for n, _ in counts)} toe contacts, "
-                    f"{sum(n for _, n in counts)} flat plants. Minimum sole clearance {minimum*units:.2f} mm")
+        msg = f"{copy.name}: {sum(n for n, _ in counts)} toe contacts, {sum(n for _, n in counts)} flat plants."
+        if manual:
+            msg += " " + " and ".join(SIDES[s].lower() for s in manual) + " from markers."
+        if dropped:
+            msg += f" Hips lowered up to {dropped*units:.1f} mm."
+        if skipped_hips:
+            msg += " Hips not lowered: their location is locked or constrained."
+        if not math.isnan(minimum):
+            msg += f" Minimum sole clearance {minimum*units:.2f} mm"
+        self.report({'WARNING'} if minimum < 0 else {'INFO'}, msg)
         return {'FINISHED'}

@@ -46,6 +46,13 @@ def register():
     bpy.types.Scene.foot_lock_floor_z = bpy.props.FloatProperty(
         name="Floor Z", subtype='DISTANCE', default=0.,
         description="World height of the ground for Lock Feet on Baked Action")
+    bpy.types.Scene.foot_lock_mode = bpy.props.EnumProperty(
+        name="Ground", items=foot_lock.MODE_ITEMS, default='FLAT')
+    bpy.types.Scene.foot_lock_preset = bpy.props.EnumProperty(
+        name="Contacts", items=foot_lock.PRESET_ITEMS, default='NORMAL')
+    bpy.types.Scene.foot_lock_lower_hips = bpy.props.BoolProperty(
+        name="Lower Hips", default=True,
+        description="Key the hips down where a planted foot cannot reach its pin with the leg straight")
     bpy.types.Scene.bake_action_name = bpy.props.StringProperty(
         name="Action Name", default="",
         description="Bake into a new action with this name (kept with a fake user, so each named take "
@@ -204,6 +211,9 @@ def unregister():
     del bpy.types.Scene.bake_frame_end
     del bpy.types.Scene.bake_only_selected
     del bpy.types.Scene.foot_lock_floor_z
+    del bpy.types.Scene.foot_lock_mode
+    del bpy.types.Scene.foot_lock_preset
+    del bpy.types.Scene.foot_lock_lower_hips
     del bpy.types.Scene.bake_action_name
     del bpy.types.Scene.multi_view_tracking
     del bpy.types.Scene.realtime_tracking

@@ -19,6 +19,10 @@ blender -b --factory-startup --python-exit-code 1 -P tests/blender_foot_lock.py
 
 It creates a rotated test rig with two separate boots above a raised floor, applies the
 operator, samples the skinned soles between keys, and checks that a failed retry restores the action.
+It then checks Lower Hips on straight legs 2 cm short of the floor, Multi Level with one foot on
+a 15 cm step, manual `L+` / `L-` contact markers, and the jump, gap-bridging, marker and hip-drop helpers.
+Set `BLENDER_USER_RESOURCES` to a throwaway folder first, so the headless run leaves your own
+Blender profile's extensions alone.
 
 ## First capture improvement batch
 
