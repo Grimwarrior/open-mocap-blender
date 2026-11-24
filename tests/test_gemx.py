@@ -8,6 +8,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import gemx  # noqa: E402
+import gemx_runner  # noqa: E402
 
 FINGERS = ["Thumb1", "Thumb2", "Thumb3", "ThumbEnd"] + [f"{f}{p}" for f in ("Index", "Middle", "Ring", "Pinky")
                                                         for p in ("1", "2", "3", "4", "End")]
@@ -253,6 +254,35 @@ class Fingers3D(unittest.TestCase):
         b = R.finger_curls(deep, frames, frames, 30.0)
         for finger in a:
             np.testing.assert_allclose(a[finger], b[finger])
+
+
+class RunnerErrors(unittest.TestCase):
+    # The last lines GEM-X printed when libx264 could not start under low memory (2026-11-24).
+    TAIL = [
+        "Traceback (most recent call last):",
+        '    subprocess.run(command, check=True, capture_output=True, text=True)',
+        r'  File "D:\mocap\envs\gemx\Lib\subprocess.py", line 571, in run',
+        "    raise CalledProcessError(retcode, process.args,",
+        "subprocess.CalledProcessError: Command '['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', "
+        "'-i', 'C:\\clip.mp4', '-c:v', 'libx264', 'C:\\input.mp4']' returned non-zero exit status 3752568763.",
+    ]
+
+    def test_ffmpeg_codes(self):
+        self.assertIn("external library", gemx_runner.ffmpeg_meaning(3752568763))
+        self.assertIn("memory", gemx_runner.ffmpeg_meaning(2**32 - 12))
+        self.assertIsNone(gemx_runner.ffmpeg_meaning(1))
+
+    def test_explains_ffmpeg_failure(self):
+        msg = gemx_runner.explain_failure(self.TAIL, 2.5)
+        self.assertIn("0xDFABA7BB", msg)
+        self.assertIn("2.5 GB", msg)
+        self.assertIn("Close other Blender instances", msg)
+        self.assertIsNone(gemx_runner.explain_failure(["RuntimeError: CUDA out of memory"]))
+
+    def test_free_memory_is_readable(self):
+        free = gemx_runner.free_commit_gb()
+        if sys.platform == "win32":
+            self.assertGreater(free, 0)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,63 @@ def stage(text):
     print("STAGE " + text, flush=True)
 
 
+# FFmpeg exits with its negative AVERROR code, which Windows shows as a large unsigned number.
+FFMPEG_ERRORS = {
+    b"EXT ": "an external library failed (libx264 could not start its encoder, usually because memory ran out)",
+    12: "it ran out of memory",
+    b"INDA": "the video has invalid data",
+    2: "a file was not found",
+    13: "permission was denied",
+}
+
+
+def ffmpeg_meaning(code):
+    """What an ffmpeg exit code means, or None. 3752568763 (0xDFABA7BB) is AVERROR_EXTERNAL."""
+    code = int(code)
+    if code >= 2**31:
+        code -= 2**32
+    if code >= 0:
+        return None
+    tag = (-code).to_bytes(4, "little")
+    return FFMPEG_ERRORS.get(tag) or FFMPEG_ERRORS.get(-code)
+
+
+def free_commit_gb():
+    """Memory Windows can still hand out (RAM plus page file), in GB; None elsewhere."""
+    try:
+        import ctypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                       [(n, ctypes.c_ulonglong) for n in ("total_phys", "avail_phys", "total_page", "avail_page",
+                                                          "total_virtual", "avail_virtual", "avail_ext")]
+        s = Status()
+        s.dwLength = ctypes.sizeof(Status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s)):
+            return s.avail_page / 2**30
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def explain_failure(tail, free_gb=None):
+    """A plain message for GEM-X failures we recognise in its last output lines, else None."""
+    import re
+    text = "\n".join(tail)
+    match = re.search(r"Command '\['ffmpeg'.*returned non-zero exit status (\d+)", text, re.S)
+    if not match:
+        return None
+    code = int(match.group(1))
+    meaning = ffmpeg_meaning(code)
+    msg = (f"GEM-X could not re-encode the clip to 30 fps: ffmpeg stopped with exit code {code} "
+           f"(0x{code & 0xFFFFFFFF:08X})" + (f", which means {meaning}" if meaning else "") + ".")
+    if free_gb is not None:
+        msg += f" Windows has {free_gb:.1f} GB of memory (RAM plus page file) free now."
+    if meaning and "memory" in meaning:
+        msg += " Close other Blender instances or large programs, then run Track with GEM-X again."
+    return msg
+
+
 def fov_config(repo, base, width, height, fov):
     """A copy of the video configuration with the camera's focal length set from a horizontal field of
     view, next to the original (its paths are relative to its own folder)."""
@@ -77,11 +134,12 @@ def main():
         if not line:
             continue
         tail = (tail + [line])[-20:]
-        if line[:1].isupper() and not line.startswith(("Warning", "Warp", "Module", "UserWarning")) \
+        if line[:1].isupper() and not line.startswith(("Warning", "Warp", "Module", "UserWarning", "Traceback")) \
                 and "Warning" not in line and len(line) < 120:
             stage(line)
     if proc.wait() != 0 or not os.path.exists(out_pt):
-        print("ERROR GEM-X failed: " + " | ".join(tail[-4:]), flush=True)
+        known = explain_failure(tail, free_commit_gb())
+        print("ERROR " + (known or "GEM-X failed: " + " | ".join(tail[-4:])), flush=True)
         return 1
     return write_joints(a, repo, out_pt, out_npz, width, height)
 
