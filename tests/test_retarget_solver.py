@@ -40,6 +40,11 @@ class LegSolver(unittest.TestCase):
         self.assertLess(noisy["knee_straight"], 9.0)             # 15.7 before bend_direction
         self.assertLess(noisy["flips"], 1.0)
 
+    def test_straight_legs_under_heavy_jitter(self):
+        heavy = bench.run(noise=0.02)
+        self.assertLess(heavy["knee_straight"], 12.0)            # 24.6 with bend_direction for knees
+        self.assertEqual(heavy["flips"], 0.0)
+
 
 class HipJoints(unittest.TestCase):
     """Legs solved from hip joints read off the posed rig, and held feet kept on the floor."""
@@ -347,6 +352,54 @@ class FootStates(unittest.TestCase):
         confidence[30:60] = 0.1
         states = R.foot_states(*self.foot(ankle), 0.88, self.fps, confidence)
         self.assertFalse(states["down"][35:55].any())
+
+
+class StableKnee(unittest.TestCase):
+    """The knee's side as one smooth angle over the take (retarget "Knees")."""
+
+    def test_banded_solve_matches_a_dense_solve(self):
+        rng = np.random.default_rng(3)
+        n = 30
+        w, obs, stiff, start = rng.random(n), rng.normal(size=n), rng.random(n - 2) * 3, rng.normal(size=n)
+        D = np.zeros((n - 2, n))
+        for j in range(n - 2):
+            D[j, j:j + 3] = [1.0, -2.0, 1.0]
+        A = np.diag(w + 1e-5) + D.T @ np.diag(stiff) @ D
+        np.testing.assert_allclose(R.smooth_through_gaps(obs, w, stiff, 1e-5, start),
+                                   np.linalg.solve(A, w * obs + 1e-5 * start), atol=1e-10)
+
+    def test_reference_is_defined_for_every_leg_but_straight_up(self):
+        rng = np.random.default_rng(4)
+        legs = R._unit(rng.normal(size=(2000, 3)))
+        legs = legs[legs[:, 2] < 0.95]
+        up = np.tile([0.0, 0.0, 1.0], (len(legs), 1))
+        fwd = np.tile([0.0, -1.0, 0.0], (len(legs), 1))
+        ref = R.knee_reference(legs, up, fwd)
+        self.assertGreater(float(np.linalg.norm(ref, axis=1).min()), 0.02)
+        self.assertLess(float(np.abs(np.sum(ref * legs, axis=1)).max()), 1e-9)      # across the leg
+
+    def test_straight_stretch_keeps_the_bend_from_before_and_after(self):
+        n = 90
+        along = np.tile([0.0, 0.0, -1.0], (n, 1))
+        rng = np.random.default_rng(1)
+        knee_way = np.tile([0.3, -1.0, 0.0], (n, 1)) / np.hypot(0.3, 1.0)
+        bent = np.where((np.arange(n) < 30) | (np.arange(n) >= 60), 0.3, 0.0)[:, None]
+        thigh = 0.45 * R._unit(along + bent * knee_way)
+        shin = 0.45 * R._unit(along - bent * knee_way)
+        thigh[30:60, :2] += rng.normal(size=(30, 2)) * 0.01          # straight: only jitter is left
+        ref = np.tile([1.0, 0.0, 0.0], (n, 1))                       # a reference that points elsewhere
+        way = R.stable_bend_direction(thigh, shin, along, ref, 30.0)
+        self.assertGreater(float(np.min(way @ knee_way[0])), 0.97)
+
+    def test_heading_survives_a_fast_spin(self):
+        n = 200
+        yaw = np.radians(20.0 * np.arange(n))                       # 20 deg a frame, as heavy_backtofront
+        fwd = np.stack([np.cos(yaw), np.sin(yaw), np.zeros(n)], axis=1)
+        up = np.tile([0.0, 0.0, 1.0], (n, 1))
+        _up, heading = R.smooth_heading(up, fwd, 15.0)
+        np.testing.assert_allclose(np.linalg.norm(heading, axis=1), 1.0, atol=1e-9)
+        step = np.degrees(np.arccos(np.clip(np.sum(heading[1:] * heading[:-1], axis=1), -1, 1)))
+        self.assertLess(float(np.abs(step[60:-60] - 20.0).max()), 0.5)    # away from the held edges
 
 
 if __name__ == "__main__":

@@ -190,6 +190,137 @@ def bend_direction(joint_offset, along, limb_length, hint, fps, confidence=None)
     return _unit(way + 1e-3 * hint)
 
 
+# Knees: a steadier bend direction (after RGB MoCap's stable_pole, github.com/toyxyz/toyxyz_RGBMocap,
+# MIT). The way the knee points is read as an angle about the hip -> ankle line, measured from a
+# reference built from the body's forward and up, smoothed over KNEE_BODY_SMOOTH_S (knee_reference:
+# defined for every leg direction but straight up from the hip). Frames count by how bent the knee is:
+# (bend / STABLE_FULL_DEG) ** 4, nothing under STABLE_MIN_DEG. One solve then finds the angle over the
+# whole take: near the bent frames, and through a stretch of straight frames a smooth curve between
+# the bends either side (its bending costs STABLE_STIFF where the frames are unreliable and
+# STABLE_LOOSE on top everywhere), so a straight leg keeps its knee where it bent before and after.
+# Synthetic actor (tests/synthetic_retarget.py), knee error on all-but-straight legs at tracker noise
+# 0.6 / 1.2 / 2 %: 3.3 / 5.8 / 24.6 deg with the older weighted average (bend_direction) -> 3.7 / 4.6 /
+# 6.7, all legs 2.8 / 3.6 / 5.9 -> 2.9 / 3.6 / 5.1, flips 0.3 -> 0. Ten real takes (four tracked, six
+# GEM-X): frame-to-frame knee turn within half a degree of before, 45 degree flips 1 -> 0, and the end
+# of swordRef1, where the old way followed an all but straight left knee's jitter round to 150 deg
+# from the body's forward (bending backwards), now keeps it 20 to 35 deg from forward. Tried and
+# dropped: the foot's heading as the reference (its depth jitter passes into straight legs: 5.1 / 8.6 /
+# 12.6 deg), a fixed world direction, and body vectors averaged as vectors (see smooth_heading).
+STABLE_FULL_DEG = 45.0
+STABLE_MIN_DEG = 5.0
+STABLE_RELIABLE_DEG = 40.0
+STABLE_STIFF = 20.0
+STABLE_LOOSE = 20.0
+STABLE_HOLD = 0.05
+KNEE_BODY_SMOOTH_S = 0.5
+KNEE_STABLE = True          # False: the older bend_direction for knees too
+
+
+def _solve_pentadiagonal(diag, off1, off2, rhs):
+    """Solve the symmetric positive definite system with these three diagonals (LDL^T, band 2)."""
+    n = len(diag)
+    d = np.zeros(n)
+    l1 = np.zeros(n)
+    l2 = np.zeros(n)
+    for i in range(n):
+        s = diag[i]
+        if i >= 1:
+            s -= l1[i - 1] ** 2 * d[i - 1]
+        if i >= 2:
+            s -= l2[i - 2] ** 2 * d[i - 2]
+        d[i] = s
+        if i + 1 < n:
+            v = off1[i] - (l2[i - 1] * l1[i - 1] * d[i - 1] if i >= 1 else 0.0)
+            l1[i] = v / s
+        if i + 2 < n:
+            l2[i] = off2[i] / s
+    y = np.array(rhs, dtype=float)
+    for i in range(n):
+        if i >= 1:
+            y[i] -= l1[i - 1] * y[i - 1]
+        if i >= 2:
+            y[i] -= l2[i - 2] * y[i - 2]
+    y /= d
+    for i in range(n - 1, -1, -1):
+        if i + 1 < n:
+            y[i] -= l1[i] * y[i + 1]
+        if i + 2 < n:
+            y[i] -= l2[i] * y[i + 2]
+    return y
+
+
+def smooth_through_gaps(observed, weight, stiffness, eps=1e-5, start=None):
+    """
+        x minimising sum weight * (x - observed)^2 + eps * (x - start)^2 + sum stiffness_j * (second
+        difference at j)^2, stiffness (N - 2,) per three-frame window.
+    """
+    n = len(observed)
+    start = np.zeros(n) if start is None else start
+    diag = np.asarray(weight, float) + eps
+    off1 = np.zeros(n)
+    off2 = np.zeros(n)
+    for j, s in enumerate(stiffness):        # D_j = [1, -2, 1] at j, j+1, j+2
+        diag[j] += s
+        diag[j + 1] += 4 * s
+        diag[j + 2] += s
+        off1[j] += -2 * s
+        off1[j + 1] += -2 * s
+        off2[j] += s
+    return _solve_pentadiagonal(diag, off1, off2, np.asarray(weight) * observed + eps * start)
+
+
+def _across(v, along):
+    return v - np.sum(v * along, axis=1, keepdims=True) * along
+
+
+def _turned(prior, along, angle):
+    """`prior` (across `along`) turned by `angle` about `along`."""
+    c, s = np.cos(angle)[:, None], np.sin(angle)[:, None]
+    return _unit(c * prior + s * np.cross(along, prior))
+
+
+def angle_track(prior, target, along, weight, valid, fps, stiff, loose):
+    """
+        The angle of `target` about `along`, measured from `prior` (both across `along`), over the
+        whole take: unwrapped between `valid` frames, then fitted to the frames by `weight` with
+        bending that costs `stiff` where the weights are low and `loose` where they are high.
+    """
+    n = len(along)
+    raw = np.arctan2(np.sum(along * np.cross(prior, target), axis=1), np.sum(prior * target, axis=1))
+    ids = np.flatnonzero(valid)
+    phase = np.interp(np.arange(n), ids, np.unwrap(raw[ids])) if len(ids) else np.zeros(n)
+    observed = raw + 2 * np.pi * np.round((phase - raw) / (2 * np.pi))
+    if n < 3:
+        return phase
+    sure = np.minimum.reduce([weight[:-2], weight[1:-1], weight[2:]])
+    stiffness = (stiff * (1.0 - sure) + loose) * (fps / 30.0) ** 4
+    # A small pull toward `phase` (held flat before the first and after the last valid frame): the
+    # bending cost alone lets a straight start or end run on along the first slope (KatanaKomibination's
+    # right knee: 55 deg off over its straight first 0.4 s).
+    return smooth_through_gaps(observed, weight, stiffness, eps=STABLE_HOLD, start=phase)
+
+
+def stable_bend_direction(thigh, shin, along, reference, fps, confidence=None):
+    """
+        :param thigh, shin: (N, 3) hip -> knee and knee -> ankle.
+        :param along: (N, 3) unit hip -> ankle.
+        :param reference: (N, 3) a direction that turns with the leg (foot heading, body forward).
+        :return: (N, 3) unit vectors across `along`: the side the knee bends to.
+    """
+    prior = _unit(_across(reference, along))
+    pole = _unit(_across(thigh, along))
+    bend = np.degrees(np.arccos(np.clip(np.sum(_unit(thigh) * _unit(shin), axis=1), -1.0, 1.0)))
+    weight = np.clip(bend / STABLE_FULL_DEG, 0.0, 1.0) ** 4
+    weight[bend < STABLE_MIN_DEG] = 0.0
+    if confidence is not None:
+        weight = weight * np.asarray(confidence, float)
+    valid = (bend > STABLE_RELIABLE_DEG) & (weight > 0)
+    if valid.sum() < 2:
+        valid = (bend >= np.percentile(bend, 85)) & (weight > 0)
+    fit = angle_track(prior, pole, along, weight, valid, fps, STABLE_STIFF, STABLE_LOOSE)
+    return _turned(prior, along, fit)
+
+
 def take_source(empties):
     """What made this take's depth, as Animate stored it ('gemx', 'combined', a tracker...), or ''."""
     try:
@@ -878,6 +1009,48 @@ FOOT_YAW_LIMIT = 6.0
 FOOT_YAW_SMOOTH_S = 0.1
 
 
+def knee_side(P, side, frame, fps, confidence):
+    """(N, 3) the side this knee bends to, across its own smoothed hip -> ankle line (see "Knees")."""
+    h, k, an = LEG_IK_MAP[side]
+    sigma = REACH_SMOOTH_S * fps
+    line = _unit(_gauss_np(P[an] - P[h], sigma))
+    thigh = _gauss_np(P[k] - P[h], sigma)
+    if not KNEE_STABLE:
+        return bend_direction(thigh, line, float(np.median(np.linalg.norm(P[k] - P[h], axis=1))), frame[2], fps,
+                              confidence)
+    up, forward = smooth_heading(frame[1], frame[2], KNEE_BODY_SMOOTH_S * fps)
+    return stable_bend_direction(thigh, _gauss_np(P[an] - P[k], sigma), line, knee_reference(line, up, forward),
+                                 fps, confidence)
+
+
+def smooth_heading(up, forward, sigma):
+    """
+        The body's up and forward smoothed over `sigma` frames, the heading as an unwrapped angle about
+        the take's median up: averaging the forward vectors themselves shrinks them to nothing in a fast
+        spin (heavy_backtofront turns 20 deg a frame) and their direction then jumps.
+    """
+    up_s = _unit(_gauss_np(up, sigma))
+    axis = _unit(np.median(up, axis=0)[None])[0]
+    e1 = _unit(np.cross(axis, np.eye(3)[int(np.argmin(np.abs(axis)))])[None])[0]
+    e2 = np.cross(axis, e1)
+    yaw = _gauss_np(np.unwrap(np.arctan2(forward @ e2, forward @ e1)), sigma)
+    heading = np.cos(yaw)[:, None] * e1 + np.sin(yaw)[:, None] * e2
+    return up_s, _unit(_across(heading, up_s))
+
+
+def knee_reference(along, up, forward):
+    """
+        A direction across the leg to measure the knee's angle from, turning smoothly with the leg:
+        the body's forward for a leg hanging down, up for a leg kicked straight forward, down for one
+        stretched back. Every such field has a direction it is undefined in (any fixed one, e.g. the
+        body's forward, is undefined for a leg along it, and forward + up for a lunge's back leg); this
+        one only for a leg pointing straight up from the hip: (1 - up.a) forward + (forward.a)(up - a).
+    """
+    u = np.sum(up * along, axis=1, keepdims=True)
+    f = np.sum(forward * along, axis=1, keepdims=True)
+    return (1.0 - u) * forward + f * (up - along)
+
+
 def knee_bend_directions(empties, frames, fps, mirror):
     """{side: (N, 3)} the side each knee bends to (unit, across the leg), as leg_directions reads it."""
     idx = {i for v in LEG_IK_MAP.values() for i in v} | {HIP_C, SHOULDER_C}
@@ -887,9 +1060,7 @@ def knee_bend_directions(empties, frames, fps, mirror):
     out = {}
     for side, (h, k, an) in LEG_IK_MAP.items():
         line = _unit(_gauss_np(P[an] - P[h], sigma))
-        way = bend_direction(_gauss_np(P[k] - P[h], sigma), line,
-                             float(np.median(np.linalg.norm(P[k] - P[h], axis=1))), frame[2], fps,
-                             landmark_confidence(empties, frames, (h, k, an), DIRECTION_DEPTH_FLOOR))
+        way = knee_side(P, side, frame, fps, landmark_confidence(empties, frames, (h, k, an), DIRECTION_DEPTH_FLOOR))
         out[side] = _unit(way - np.sum(way * line, axis=1, keepdims=True) * line)
     return out
 
@@ -1003,10 +1174,8 @@ def leg_directions(empties, frames, fps, mirror, ratio, thigh_len, shin_len, hip
         T = ankles[side] - joint
         d = np.clip(np.linalg.norm(T, axis=1), abs(a - b) * 1.02 + 1e-6, reach)
         t = _unit(T)
-        # knee side, as the mocap leg bends (its own hip-ankle line, like its own bend); forward if unknown
-        own_line = _unit(_gauss_np(P[_an] - P[h], sigma))
-        p = bend_direction(_gauss_np(P[k] - P[h], sigma), own_line, float(np.median(np.linalg.norm(P[k] - P[h], axis=1))),
-                           frame[2], fps, landmark_confidence(empties, frames, (h, k, _an), DIRECTION_DEPTH_FLOOR))
+        # knee side, as the mocap leg bends (its own hip-ankle line, like its own bend); see "Knees"
+        p = knee_side(P, side, frame, fps, landmark_confidence(empties, frames, (h, k, _an), DIRECTION_DEPTH_FLOOR))
         p = _unit(p - np.sum(p * t, axis=1, keepdims=True) * t)
         cos_a = np.clip((a * a + d * d - b * b) / (2 * a * d), -1.0, 1.0)
         thigh = _unit(cos_a[:, None] * t + np.sqrt(1 - cos_a ** 2)[:, None] * p)
