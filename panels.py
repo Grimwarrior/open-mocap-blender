@@ -345,6 +345,18 @@ class PoseTrackingPanel(bpy.types.Panel):
                              if m.name.strip().upper() in ("L+", "L-", "R+", "R-")})
             if marked:
                 col.label(text="Contacts from markers: " + " ".join(marked), icon='MARKER_HLT')
+            # Palms share the ground (Flat Ground at Floor Z / Multi Level) with the feet
+            col = layout.column(align=True)
+            op = col.operator("object.open_mocap_lock_hands", icon="VIEW_PAN")
+            op.target_rig = scene.bake_rig.name
+            op.floor_z = scene.foot_lock_floor_z
+            op.mode = scene.foot_lock_mode
+            op.preset = scene.hand_lock_preset
+            col.prop(scene, "hand_lock_preset", text="")
+            marked = sorted({m.name.strip().upper()[:2] for m in scene.timeline_markers
+                             if m.name.strip().upper() in ("LH+", "LH-", "RH+", "RH-")})
+            if marked:
+                col.label(text="Palm contacts from markers: " + " ".join(marked), icon='MARKER_HLT')
 
 
 

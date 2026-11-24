@@ -90,6 +90,12 @@ Foot lock options (contact rules after RGB MoCap's motion correction, github.com
 - Jumps never plant: where both feet rise well above their surroundings and come down again, nothing is pinned.
 - **Contact markers**: timeline markers named `L+` / `L-` and `R+` / `R-` start and end a contact by hand (inclusive). A foot with markers takes its contacts only from them; the other foot stays automatic.
 
+**Lock Palms on Baked Action** (below Lock Feet; after RGB MoCap's palm contacts, MIT) holds a palm still where it rests on a support (push-ups, crawling, getting up off the floor, a wall push, a vault) by turning the upper arm and forearm alone. The torso, legs and the hand's own turn stay as baked, so a palm out of the arm's reach is left short (the report gives the largest miss). The corrected action becomes active as "... Hand Lock"; run it after Lock Feet, which may lower the hips. A contact needs the palm still, at least 0.22 arm lengths under its shoulder and 0.55 away from its hip (a hand resting at the side is no support). It shares Ground and Floor Z with the feet:
+- **Flat Ground** (default) also needs the palm on the floor. Keep it for weapon takes: a sword held still in guard is otherwise a "contact" (on the Hikigiri katana take Multi Level pinned both hands, Flat Ground none; the HeavyStaff take had none either way).
+- **Multi Level** takes palms at any height under the shoulder: walls, boxes, railings.
+- **Gentle / Normal / Firm** palm contacts: Normal takes palms slower than a third of an arm length per second for 0.25 s and bridges 0.1 s dropouts; Gentle is stricter, Firm looser.
+- **Palm markers** `LH+` / `LH-` and `RH+` / `RH-` set a hand's contacts by hand, at any height (overhead bars too).
+
 ✔️ Blender-native workflow
 ✔️ Easy installation
 ✔️ Works fully offline

@@ -11,9 +11,10 @@ bl_info = {
 
 
 import bpy
-from . import PackageInstaller, operators, retarget, panels, layers, foot_lock
+from . import PackageInstaller, operators, retarget, panels, layers, foot_lock, hand_lock
 
-classes = PackageInstaller.classes + operators.classes + retarget.classes + [foot_lock.LockFeet] + panels.classes
+classes = (PackageInstaller.classes + operators.classes + retarget.classes + [foot_lock.LockFeet, hand_lock.LockHands]
+           + panels.classes)
 
 
 
@@ -54,6 +55,8 @@ def register():
         name="Ground", items=foot_lock.MODE_ITEMS, default='FLAT')
     bpy.types.Scene.foot_lock_preset = bpy.props.EnumProperty(
         name="Contacts", items=foot_lock.PRESET_ITEMS, default='NORMAL')
+    bpy.types.Scene.hand_lock_preset = bpy.props.EnumProperty(
+        name="Palm Contacts", items=hand_lock.PRESET_ITEMS, default='NORMAL')
     bpy.types.Scene.foot_lock_lower_hips = bpy.props.BoolProperty(
         name="Lower Hips", default=True,
         description="Key the hips down where a planted foot cannot reach its pin with the leg straight")
@@ -219,6 +222,7 @@ def unregister():
     del bpy.types.Scene.foot_lock_mode
     del bpy.types.Scene.foot_lock_preset
     del bpy.types.Scene.foot_lock_lower_hips
+    del bpy.types.Scene.hand_lock_preset
     del bpy.types.Scene.bake_action_name
     del bpy.types.Scene.multi_view_tracking
     del bpy.types.Scene.realtime_tracking

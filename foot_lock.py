@@ -102,14 +102,15 @@ def bridge(mask, points, fps, gap, limit):
     return out
 
 
-def marker_masks(markers, frames):
+def marker_masks(markers, frames, letters=MARKERS):
     """
         {side index: contact mask over frames} from timeline markers named "L+" ... "L-" and
-        "R+" ... "R-" (inclusive). A side with markers uses only them; an unclosed "+" runs to the end.
+        "R+" ... "R-" (inclusive; other `letters` for other contacts, e.g. "LH" / "RH" for hands).
+        A side with markers uses only them; an unclosed "+" runs to the end.
     """
     out = {}
-    for index, letter in enumerate(MARKERS):
-        marks = sorted((frame, name.strip().upper()[1:]) for name, frame in markers
+    for index, letter in enumerate(letters):
+        marks = sorted((frame, name.strip()[-1]) for name, frame in markers
                        if name.strip().upper() in (letter+"+", letter+"-"))
         if not marks:
             continue

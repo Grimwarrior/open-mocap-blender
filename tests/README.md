@@ -27,6 +27,12 @@ a 15 cm step, manual `L+` / `L-` contact markers, and the jump, gap-bridging, ma
 Set `BLENDER_USER_RESOURCES` to a throwaway folder first, so the headless run leaves your own
 Blender profile's extensions alone.
 
+`tests/blender_hand_lock.py` (same command) builds a crouched rig with both palms on the floor while
+the body rocks 4 cm toward them, and checks that Lock Palms holds the palm surfaces to under 0.6 mm
+on the floor, keeps each hand's baked world turn and leaves the torso's keys alone. It then checks
+that a floor 50 cm up finds no contacts (and restores the action), that Multi Level finds them
+anyway, `RH+` / `RH-` markers, and that still hands at the hip, overhead or moving are never pinned.
+
 ## First capture improvement batch
 
 - Live timestamps measure acquisition time before inference. Files use OpenCV presentation
