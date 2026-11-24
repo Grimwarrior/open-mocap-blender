@@ -1153,6 +1153,16 @@ def hand_points(empties):
     return out
 
 
+def finger_bone(rig, side, finger, k):
+    """
+        The bone that bends this finger joint: the Mixamo bone, or on a control rig its control
+        (Ctrl_Index1_Left ...), which stands as the Mixamo bone does and is copied by it.
+    """
+    if is_control_rig(rig):
+        return rig.pose.bones.get(f"Ctrl_{finger}{k}_{side}")
+    return find_bone(rig, f"{side}Hand{finger}{k}")
+
+
 def finger_axes(rig, side):
     """
         {(finger, 1..3): (pose bone, flexion axis in the bone's own rest frame)}: turning the bone
@@ -1174,7 +1184,7 @@ def finger_axes(rig, side):
     out = {}
     for finger in FINGER_POINTS:
         for k in (1, 2, 3):
-            pb = find_bone(rig, f"{side}Hand{finger}{k}")
+            pb = finger_bone(rig, side, finger, k)
             if pb is None:
                 continue
             m = (mw.to_3x3() @ pb.bone.matrix_local.to_3x3()).normalized()
@@ -1221,8 +1231,6 @@ def setup_fingers(rig, coll, empties, frames, fps):
         :return: ({side: number of hand frames used}, list of what could not be done)
     """
     used, problems = {}, []
-    if is_control_rig(rig):
-        return used, ["fingers (not on a control rig: pose its finger controls by hand)"]
     hands = hand_points(empties)
     for side in ("Left", "Right"):
         if side not in hands:
@@ -2256,7 +2264,7 @@ class RetargetToMixamo(bpy.types.Operator):
             used = info.get("fingers") or {}
             if used:
                 msg += " Fingers from " + ", ".join(f"{n} {s.lower()} hand frames" for s, n in used.items()) + "."
-            elif not is_control_rig(rig):
+            else:
                 msg += " No hand points with this take, fingers left as they are."
         if self.sword:
             if "sword" in info:
