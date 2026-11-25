@@ -402,5 +402,34 @@ class StableKnee(unittest.TestCase):
         self.assertLess(float(np.abs(step[60:-60] - 20.0).max()), 0.5)    # away from the held edges
 
 
+class SwordInTheRigsHand(unittest.TestCase):
+    """grip_turn: the smallest turn that lays the rig's own blade along the take's."""
+
+    def setUp(self):
+        rng = np.random.default_rng(2)
+        n = 50
+        self.hand = R._unit(rng.normal(size=(n, 3)))
+        palm = rng.normal(size=(n, 3))
+        self.palm = R._unit(palm - np.sum(palm * self.hand, axis=1, keepdims=True) * self.hand)
+        self.grip = np.array([0.1, -0.98, 0.15]) / np.linalg.norm([0.1, -0.98, 0.15])
+        self.blade = R._unit(rng.normal(size=(n, 3)))
+
+    def rig_blade(self, hand, palm):
+        f2 = R._unit(palm - np.sum(palm * hand, axis=1, keepdims=True) * hand)
+        return R._unit(self.grip[0] * hand + self.grip[1] * f2 + self.grip[2] * np.cross(hand, f2))
+
+    def test_rig_blade_lands_on_the_take_blade(self):
+        axis, angle = R.grip_turn(self.hand, self.palm, self.grip, self.blade, np.ones(len(self.hand)))
+        hand, palm = R._turn(self.hand, axis, angle), R._turn(self.palm, axis, angle)
+        np.testing.assert_allclose(self.rig_blade(hand, palm), self.blade, atol=1e-9)
+        np.testing.assert_allclose(np.sum(hand * palm, axis=1), 0.0, atol=1e-9)        # still a frame
+        before = self.rig_blade(self.hand, self.palm)
+        self.assertTrue(np.allclose(angle, np.arccos(np.clip(np.sum(before * self.blade, 1), -1, 1))))  # the least turn
+
+    def test_no_confidence_no_turn(self):
+        axis, angle = R.grip_turn(self.hand, self.palm, self.grip, self.blade, np.zeros(len(self.hand)))
+        np.testing.assert_allclose(R._turn(self.hand, axis, angle), self.hand, atol=1e-12)
+
+
 if __name__ == "__main__":
     unittest.main()

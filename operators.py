@@ -254,9 +254,19 @@ class TrackSword(bpy.types.Operator):
             return {'CANCELLED'}
         from . import sword
         front = gvar.positionList_raw if gvar.positionList_raw is not None else gvar.positionList
+        front_vis = gvar.position_vis
+        # A GEM-X take keeps 3D joints; the blade is searched around the points GEM-X saw in the picture
+        is_gemx = bool(gvar.position_meta) and (gvar.position_meta[0] or {}).get("depth_source") == "gemx"
+        if is_gemx:
+            picture = gvar.gemx_picture
+            if picture is None or len(picture[0]) != len(front):
+                self.report({'ERROR'}, "This GEM-X take has no picture points yet: Track with GEM-X again with "
+                                       "Reuse on (seconds), then Track Sword")
+                return {'CANCELLED'}
+            front, front_vis = picture[0].tolist(), picture[1].tolist()
         jobs = []
-        if front and len(gvar.position_times) == len(front) and len(gvar.position_vis) == len(front):
-            jobs.append(("front video", gvar.front_video_path, front, gvar.position_vis, gvar.position_times, "front"))
+        if front and len(gvar.position_times) == len(front) and len(front_vis) == len(front):
+            jobs.append(("front video", gvar.front_video_path, front, front_vis, gvar.position_times, "front"))
         if gvar.zlist and len(gvar.zlist_times) == len(gvar.zlist) and len(gvar.zlist_vis) == len(gvar.zlist):
             jobs.append(("side video", gvar.side_video_path, gvar.zlist, gvar.zlist_vis, gvar.zlist_times, "side"))
         for view in gvar.extra_views:
@@ -297,7 +307,37 @@ class TrackSword(bpy.types.Operator):
         msg = "Sword tracked, clearly seen in: " + ", ".join(lines)
         if problems:
             msg += ". Skipped: " + "; ".join(problems)
-        msg += ". Run Combine Data to give it depth" if (gvar.zlist or gvar.extra_views) else ""
+        if is_gemx and len(gvar.sword_front) == len(front):
+            # one video: the blade in 3D from GEM-X's hands, fitted to where the picture shows it (gemx.sword_axis)
+            import numpy as np
+            with np.load(gvar.gemx_npz) as data:
+                data = {key: data[key] for key in data.files}
+            other = None
+            side = gemx_side_result()
+            if side is not None:
+                # a side video tracked with GEM-X too: it sees the blade's lean toward the front camera
+                frames2, vis2 = gemx.picture_capture(side)
+                try:
+                    rows2 = sword.track_video(bpy.path.abspath(gvar.side_video_path), frames2.tolist(), vis2.tolist(),
+                                              np.asarray(side["frame_times"]).reshape(-1).tolist())
+                    other = (side, rows2)
+                except (ValueError, OSError) as error:
+                    problems.append(f"side video: {error}")
+            axis, rep = gemx.sword_axis(data, gvar.sword_front, other=other)
+            gvar.sword_axis.extend(axis)
+            grips = [f"{s.lower()} hand {rep[s]['miss_deg']:.0f} deg on {rep[s]['inliers']} frames"
+                     for s in ("Right", "Left")]
+            msg += (f". 3D blade from GEM-X's hands, grip fitted to the picture ({', '.join(grips)}); the picture "
+                    f"sets its direction in {rep['picture_share']:.0%} of the frames")
+            if "second_view" in rep:
+                sv = rep["second_view"]
+                msg += (f"; the side video sets its depth in {sv['used']:.0%} (matched in time, "
+                        f"{sv['offset_frames']:+.0f} frames)")
+            elif gvar.side_video_path:
+                msg += "; Track Side with GEM-X to take its depth from the side video"
+            msg += ". Animate, then Retarget with Sword"
+            print(f"[Open Mocap]   GEM-X sword: {rep}")
+        msg += ". Run Combine Data to give it depth" if (not is_gemx and (gvar.zlist or gvar.extra_views)) else ""
         self.report({'WARNING'} if problems else {'INFO'}, msg)
         return {'FINISHED'}
 
@@ -618,8 +658,10 @@ class AnimatePose(bpy.types.Operator):
         sword_rows = sword_rows_for_animate(len(frame_numbers))
         if sword_rows:
             dirs = [utils.MathUtility.cv2blender_coordinates(r[:3]) for r in sword_rows]
-            root['open_mocap_sword'] = json.dumps({'frames': frame_numbers, 'dirs': dirs,
-                                                   'confidence': [r[3] for r in sword_rows]})
+            stored = {'frames': frame_numbers, 'dirs': dirs, 'confidence': [r[3] for r in sword_rows]}
+            if all(len(r) > 4 for r in sword_rows):       # which hand holds it (1 right, -1 left, 0 both)
+                stored['holder'] = [r[4] for r in sword_rows]
+            root['open_mocap_sword'] = json.dumps(stored)
             add_sword_arrow(root, pose_empties_collection, frame_numbers, gvar.positionList, dirs)
 
         start_playback(context)
@@ -1340,6 +1382,11 @@ class TrackGEMX(bpy.types.Operator):
                       "result replaces the tracked pose like Start Pose Tracking + Combine Data; press "
                       "Animate next. Esc cancels")
 
+    view: bpy.props.EnumProperty(items=[
+        ('FRONT', "Front", "The front video: the take Animate and Retarget use"),
+        ('SIDE', "Side", "The side video, kept apart: Track Sword takes the blade's depth from it (the same move "
+                         "filmed from another side, at the same time or another)")], default='FRONT')
+
     _timer = None
     _proc = None
     _lines = None
@@ -1347,25 +1394,29 @@ class TrackGEMX(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bool(gvar.front_video_path) and not gvar.gemx_status.endswith("...")
+        return bool(gvar.front_video_path or gvar.side_video_path) and not gvar.gemx_status.endswith("...")
 
     def execute(self, context):
         missing = PackageInstaller.gemx_missing()
         if missing:
             self.report({'ERROR'}, "GEM-X is not set up (add-on preferences): missing " + ", ".join(missing))
             return {'CANCELLED'}
-        video = bpy.path.abspath(gvar.front_video_path)
+        video = bpy.path.abspath(gvar.side_video_path if self.view == 'SIDE' else gvar.front_video_path)
         if not os.path.isfile(video):
             self.report({'ERROR'}, f"Video not found: {video}")
             return {'CANCELLED'}
-        folder = os.path.join(PackageInstaller.data_dir(), "gemx")
-        os.makedirs(folder, exist_ok=True)
-        self._out = os.path.join(folder, os.path.splitext(os.path.basename(video))[0] + "_gemx.npz")
+        self._out = gemx_result_path(video)
+        os.makedirs(os.path.dirname(self._out), exist_ok=True)
         runner = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemx_runner.py")
         cmd = [PackageInstaller.gemx_python(), "-u", runner, "--repo", PackageInstaller.gemx_repo(),
                "--video", video, "--out", self._out]
         if context.scene.gemx_fov > 0:
             cmd += ["--fov", f"{context.scene.gemx_fov:.3f}"]
+        if context.scene.gemx_reuse:
+            if not os.path.isfile(os.path.splitext(self._out)[0] + ".pt"):
+                self.report({'ERROR'}, "No saved GEM-X result for this video yet: track it once with Reuse off")
+                return {'CANCELLED'}
+            cmd += ["--reuse"]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                       encoding="utf-8", errors="replace", creationflags=flags)
@@ -1412,6 +1463,9 @@ class TrackGEMX(bpy.types.Operator):
             return {'PASS_THROUGH'}
         if result.startswith("ERROR"):
             return self._finish(context, {'ERROR'}, result[6:])
+        if self.view == 'SIDE':                    # kept apart: Track Sword reads it (gemx_side_result)
+            return self._finish(context, {'INFO'}, "GEM-X tracked the side video. Track Sword now takes the "
+                                                   "blade's depth from it")
         try:
             frames = load_gemx_capture(self._out)
         except (OSError, KeyError, ValueError) as error:
@@ -1427,11 +1481,32 @@ class TrackGEMX(bpy.types.Operator):
         return {'FINISHED'} if 'INFO' in level else {'CANCELLED'}
 
 
+def gemx_result_path(video):
+    """Where Track with GEM-X keeps its result for this video."""
+    return os.path.join(PackageInstaller.data_dir(), "gemx", os.path.splitext(os.path.basename(video))[0] + "_gemx.npz")
+
+
+def gemx_side_result():
+    """The side video's GEM-X result with its picture points (Track Side with GEM-X), or None."""
+    if not gvar.side_video_path:
+        return None
+    path = gemx_result_path(bpy.path.abspath(gvar.side_video_path))
+    if not os.path.isfile(path):
+        return None
+    import numpy as np
+    with np.load(path) as data:
+        data = {key: data[key] for key in data.files}
+    return data if "kp2d" in data else None
+
+
 def load_gemx_capture(path):
     """Fill the capture cache with a GEM-X take (see gemx.py), as tracking + Combine Data would."""
     import numpy as np
     with np.load(path) as data:
-        take = gemx.to_capture({key: data[key] for key in data.files})
+        data = {key: data[key] for key in data.files}
+    take = gemx.to_capture(data)
+    gvar.gemx_npz = path
+    gvar.gemx_picture = gemx.picture_capture(data)
     for lst in (gvar.positionList, gvar.position_times, gvar.position_vis, gvar.position_meta,
                 gvar.position_missing_times, gvar.R_body_hand_positionList, gvar.L_body_hand_positionList,
                 gvar.R_body_hand_times, gvar.L_body_hand_times, gvar.sword_front, gvar.sword_axis):

@@ -88,4 +88,6 @@ R_body_hand_times = []
 L_body_hand_times = []
 body_spine = None #GEM-X: its spine chain per front frame and the actor's rest skeleton (gemx.to_capture)
 body_hands_3d = False #the body hand points above carry real depth (GEM-X), not only x/y
+gemx_npz = "" #GEM-X: the runner's .npz the capture came from (Track Sword fits the sword to its hands)
+gemx_picture = None #GEM-X: (frames, vis) of the capture points as GEM-X saw them in the picture, or None
 gemx_status = "" #progress of Track with GEM-X, shown in the Pose Tracking panel

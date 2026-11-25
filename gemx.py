@@ -310,3 +310,397 @@ def to_capture(data, unit=UNIT):
             "meta": meta, "hands": {s: h.tolist() for s, h in hands.items()}, "spine": spine, "fps": fps,
             "width": int(np.asarray(data["width"]).reshape(-1)[0]),
             "height": int(np.asarray(data["height"]).reshape(-1)[0])}
+
+
+# -------------------------------------------------------------
+# THE SWORD FROM ONE VIDEO
+# -------------------------------------------------------------
+# A katana does not move in the hands that hold it: its blade is one fixed direction in each hand's
+# own frame. GEM-X gives each hand's frame (wrist, index and pinky knuckles, all 3D), and Track Sword
+# finds the blade's direction in the picture where it is plain to see. So the blade's direction in
+# each hand is fitted once per take, to the frames where the picture shows the blade (the median
+# miss there is what is minimised, so the frames the tracker gets wrong count little), and then gives
+# the blade in 3D in every frame, also where the picture loses it (blurred, dark, behind the body).
+# Where the picture is sure, it sets the blade's direction across the picture and the hands only its
+# lean toward or away from the camera. Both hands on the handle are averaged, each by how well its fit
+# matched; held in one hand (HANDS_APART_M), only that hand counts. KatanaKomibination_RTL (one camera,
+# 183 frames): the rig's blade as retargeted before missed the picture's by a median 92 deg; fitted
+# grips alone 9-14 deg (14-15 on frames left out of the fit); with the picture's direction and the
+# rig's own sword laid along it, 3.3 deg (all frames the tracker is sure of), 7 % over 45 deg.
+# The fitted blade ran nearly along GEM-X's hand (wrist -> knuckles), tilted 12-15 deg to the palm:
+# GEM-X closes its hands round a handle loosely. GRIP_PRIOR is that, for takes the picture cannot fit.
+GRIP_FIT_CONF = 0.5           # tracked blade confidence from which a frame takes part in the fit ...
+GRIP_FIT_MIN_FRAMES = 12      # ... and how many such frames a fit needs (else GRIP_PRIOR)
+GRIP_INLIER_DEG = 30.0        # the fit is repeated on frames this close to it
+GRIP_PRIOR = {"Right": (0.0, 0.965, 0.26), "Left": (0.0, 0.965, -0.26)}   # (across, along, palm normal)
+SWORD_PICTURE_CONF = (0.3, 0.6)   # the picture's blade sets its direction from this confidence (all of it from the second)
+SWORD_MAX_LEAN = 80.0         # degrees the blade may lean toward / away from the camera there
+SWORD_FILL_S = 0.1            # unsure frames take the picture's direction from sure frames this near ...
+SWORD_HANDS_FILL = 0.05       # ... the hands' with this much weight against them (all of it where none is near)
+SWORD_SMOOTH_S = 0.05
+# One hand or both. KatanaKomibination_RTL: both hands on the handle 0.19-0.20 m apart (wrists, median
+# over frames 1-95), the one-handed overhead and side cuts 0.66-1.20 m. Apart, only the hand holding the
+# sword says where the blade is (the picture's search tells which, sword.GRIP_SPLIT).
+HANDS_APART_M = 0.4
+
+
+def picture_capture(data):
+    """
+        The 40 capture points as GEM-X saw them in the picture: (frames (T, 120) in picture coordinates,
+        x = (px - w/2) / 100, y = (py - h) / 100, depth 0; vis (T, 40)). None without 2D keypoints.
+    """
+    if "kp2d" not in data:
+        return None
+    kp = np.asarray(data["kp2d"], dtype=float)
+    names = [str(n) for n in data["joint_names"]]
+    if len(names) == kp.shape[1] + 1:
+        names = names[1:]
+    idx = {n: i for i, n in enumerate(names)}
+    w = float(np.asarray(data["width"]).reshape(-1)[0])
+    h = float(np.asarray(data["height"]).reshape(-1)[0])
+    T = len(kp)
+    P, V = np.zeros((T, 40, 3)), np.zeros((T, 40))
+    joints = dict(POSE_FROM_SOMA)
+    joints.update({0: "Head", 29: "LeftFoot", 30: "RightFoot", 31: "LeftToeEnd", 32: "RightToeEnd"})
+    for k, n in joints.items():
+        if n in idx:
+            P[:, k, 0] = (kp[:, idx[n], 0] - w / 2) / 100.0
+            P[:, k, 1] = (kp[:, idx[n], 1] - h) / 100.0
+            V[:, k] = kp[:, idx[n], 2]
+    for c, (a, b) in CENTROIDS.items():
+        P[:, c] = (P[:, a] + P[:, b]) / 2
+        V[:, c] = np.minimum(V[:, a], V[:, b])
+    return P.reshape(T, 120), V
+
+
+def hand_frames(J, names, side):
+    """(T, 3, 3) the hand's frame, columns (across: pinky -> index, along: wrist -> knuckles, palm normal)."""
+    idx = {n: i for i, n in enumerate(names)}
+    wrist, index, pinky = (J[:, idx[side + n]] for n in ("Hand", "HandIndex2", "HandPinky2"))
+    along = _unit((index + pinky) / 2 - wrist)
+    across = _unit(index - pinky)
+    normal = _unit(np.cross(along, across))
+    across = np.cross(normal, along)
+    return np.stack([across, along, normal], axis=2)
+
+
+def _project(P, K):
+    q = P @ np.asarray(K, dtype=float).T
+    return q[..., :2] / np.maximum(q[..., 2:3], 1e-6)
+
+
+def _picture_dirs(anchor, dirs, K, length=0.4):
+    """Unit picture directions (pixels, x right, y down) of 3D directions from 3D anchors (camera metres)."""
+    return _unit(_project(anchor + length * _unit(dirs), K) - _project(anchor, K))
+
+
+def _sphere(step_deg):
+    t = np.radians(np.arange(0.0, 180.0 + 1e-9, step_deg))
+    p = np.radians(np.arange(0.0, 360.0, step_deg))
+    tt, pp = np.meshgrid(t, p, indexing="ij")
+    grid = np.stack([np.sin(tt) * np.cos(pp), np.sin(tt) * np.sin(pp), np.cos(tt)], -1).reshape(-1, 3)
+    return np.unique(np.round(grid, 9), axis=0)
+
+
+def _grip_search(frames, anchor, K, blade2d, mask, best=None):
+    for step, around in (((4.0, None),) if best is None else ()) + ((0.75, 6.0),):
+        cand = _sphere(step)
+        if around is not None:
+            cand = cand[np.degrees(np.arccos(np.clip(cand @ best[0], -1, 1))) <= around]
+        dirs = np.einsum('tij,cj->cti', frames[mask], cand)                        # (C, M, 3)
+        pic = _picture_dirs(anchor[mask][None], dirs, K)
+        miss = np.degrees(np.arccos(np.clip(np.sum(pic * blade2d[mask][None], -1), -1, 1)))
+        med = np.median(miss, axis=1)
+        k = int(np.argmin(med))
+        best = (cand[k], float(med[k]))
+    return best
+
+
+def grip_miss(frames, anchor, K, blade2d, b):
+    """(T,) degrees between the picture's blade and the one this grip gives."""
+    pic = _picture_dirs(anchor, np.einsum('tij,j->ti', frames, b), K)
+    return np.degrees(np.arccos(np.clip(np.sum(pic * blade2d, 1), -1, 1)))
+
+
+def fit_grip(frames, anchor, K, blade2d, mask):
+    """
+        The blade's direction in a hand's frame that best matches the picture: (unit (3,), median miss deg,
+        inlier mask). Fitted on all confident frames, then again on those within GRIP_INLIER_DEG of it: a
+        tracker sure of a wrong blade (dark against the wall, behind the body) otherwise pulls the grip.
+        :param frames: (T, 3, 3) hand frames (camera); anchor (T, 3) the wrist; blade2d (T, 2) picture units.
+    """
+    best = _grip_search(frames, anchor, K, blade2d, mask)
+    for _ in range(2):
+        inliers = mask & (grip_miss(frames, anchor, K, blade2d, best[0]) < GRIP_INLIER_DEG)
+        if inliers.sum() < GRIP_FIT_MIN_FRAMES:
+            break
+        best = _grip_search(frames, anchor, K, blade2d, inliers, best)
+    inliers = mask & (grip_miss(frames, anchor, K, blade2d, best[0]) < GRIP_INLIER_DEG)
+    return best[0], best[1], inliers
+
+
+def sword_axis(data, blade_rows, other=None):
+    """
+        :param data: the runner's .npz (dict-like). :param blade_rows: Track Sword's rows for its picture
+                     ([dx, dy, confidence] per frame).
+        :param other: (data, blade_rows) of a second GEM-X take of the same move from another side
+                      (filmed at another time is fine): it sets the blade's lean toward the camera.
+        :return: (rows [x, y, depth, confidence] per frame, a unit blade direction in capture coordinates,
+                 report dict).
+    """
+    J = np.asarray(data["joints_incam"], dtype=float)
+    names = [str(n) for n in data["joint_names"]]
+    if len(names) == J.shape[1] + 1:
+        names = names[1:]
+    idx = {n: i for i, n in enumerate(names)}
+    K = np.asarray(data["K"], dtype=float).reshape(3, 3)
+    rows = np.asarray(blade_rows, dtype=float).reshape(len(J), -1)
+    blade2d, conf = _unit(rows[:, :2]), np.clip(rows[:, 2], 0, 1)
+    mask = conf > GRIP_FIT_CONF
+    apart = np.linalg.norm(J[:, idx["RightHand"]] - J[:, idx["LeftHand"]], axis=1) > HANDS_APART_M
+    holder = sword_holder(rows[:, 3] if rows.shape[1] > 3 else np.zeros(len(J)), mask, apart)
+    report = {"fit_frames": int(mask.sum()), "one_handed": float(np.mean(holder != 0))}
+    preds, weights, wrists = {}, {}, {}
+    for side, sign in (("Right", 1), ("Left", -1)):
+        F = hand_frames(J, names, side)
+        wrists[sign] = J[:, idx[side + "Hand"]]
+        own = mask & ((holder == 0) | (holder == sign))      # a free hand says nothing about the blade
+        if own.sum() >= GRIP_FIT_MIN_FRAMES:
+            b, miss, inliers = fit_grip(F, wrists[sign], K, blade2d, own)
+        else:
+            b = _unit(np.asarray(GRIP_PRIOR[side], dtype=float))
+            miss = float(np.median(grip_miss(F, wrists[sign], K, blade2d, b)[own])) if own.any() else 45.0
+            inliers = np.zeros(len(J), dtype=bool)
+        report[side] = {"grip": [round(float(x), 3) for x in b], "miss_deg": round(miss, 1),
+                        "inliers": int(inliers.sum())}
+        preds[sign] = np.einsum('tij,j->ti', F, b)
+        weights[sign] = 1.0 / max(miss, 3.0) ** 2
+    pred = _unit(weights[1] * preds[1] + weights[-1] * preds[-1])
+    for sign in (1, -1):
+        pred[holder == sign] = _unit(preds[sign][holder == sign])
+    # Where the picture is sure, it sets where the blade points across the picture, and the hands only
+    # how far it leans toward or away from the camera, which one camera cannot see: the blade is the
+    # direction in the picture's plane through the camera, on the picture's side, at the hands' lean.
+    # (Gated on agreeing with the hands, frames 19, 73, 97, 127 and 133 of KatanaKomibination_RTL kept
+    # the hands' blade 60-100 deg off a plainly visible one.)
+    # The blade as two angles: its direction across the picture, and its lean toward (+) or away from
+    # the camera. Smoothing the 3D blade instead pulled sure frames off the picture's line wherever the
+    # blade pointed nearly at the camera (KatanaKomibination_RTL frames 72 and 117: leaning 60-80 deg,
+    # 17-47 deg off a plainly visible blade).
+    wrist = np.where((holder == -1)[:, None], wrists[-1], wrists[1])
+    fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+    pic = _picture_dirs(wrist, pred, K)
+    agree = np.degrees(np.arccos(np.clip(np.sum(pic * blade2d, 1), -1, 1)))
+    lo, hi = SWORD_PICTURE_CONF
+    w = np.clip((conf - lo) / (hi - lo), 0, 1)
+    z_video = blade2d[:, 0] + 1j * blade2d[:, 1]
+    z_hands = pic[:, 0] + 1j * pic[:, 1]
+    # frames the picture is unsure of take its direction from sure frames nearby, else from the hands
+    sigma = SWORD_FILL_S * fps
+    near = _gauss_complex(w * z_video, sigma)
+    weight = np.array([_gauss(w, sigma)]).reshape(-1) if len(w) >= 3 else w
+    z_fill = (near + SWORD_HANDS_FILL * z_hands) / np.maximum(weight + SWORD_HANDS_FILL, 1e-9)
+    z = w * z_video + (1 - w) * z_fill / np.maximum(np.abs(z_fill), 1e-9)
+    direction = np.stack([z.real, z.imag], axis=1) / np.maximum(np.abs(z), 1e-9)[:, None]
+    lean = _lean(wrist, pred, direction, K)
+    if other is not None:
+        # a second video of the same move: where it sees the blade, the two pictures' planes cross in it
+        other_lean, other_weight, flip, other_report = second_view_lean(data, names, wrist, direction, K, *other,
+                                                                        sure=w)
+        direction = np.where(flip[:, None], -direction, direction)
+        lean = np.where(flip, _lean(wrist, pred, direction, K), lean)
+        lean = (1 - other_weight) * lean + other_weight * other_lean
+        report["second_view"] = other_report
+    if len(lean) >= 3:
+        lean = _gauss(lean, SWORD_SMOOTH_S * fps)
+    blade = _blade_at(wrist, direction, lean, K)
+    report.update(picture_share=float(np.mean(w > 0.5)),
+                  agree_median=float(np.median(agree[mask])) if mask.any() else None)
+    # camera -> capture (the world turned level to the camera, see to_capture)
+    R = world_to_camera(np.asarray(data["joints_global"], dtype=float), J)
+    M = np.stack(camera_axes(R))
+    cap = _unit(blade @ R @ M.T)
+    return [[float(x), float(y), float(z), 0.9, float(h)] for (x, y, z), h in zip(cap, holder)], report
+
+
+# A second video. One picture leaves the blade's lean toward or away from its camera open; a camera
+# from another side sees exactly that. The two takes need not be filmed together: the same move done
+# twice is matched in time by the body's own pose (dynamic time warping on the hands, elbows, knees,
+# feet and head relative to the hips, in the body's frame, with their velocities), and the two
+# pictures' planes are compared in that body frame, which both takes share whatever their cameras.
+# Where the second video is sure of the blade and its plane is not nearly the first's, the line the
+# two planes share gives the lean.
+SECOND_VIEW_CONF = (0.3, 0.6)     # the second picture's confidence, as SWORD_PICTURE_CONF
+SECOND_VIEW_PLANES = (0.25, 0.5)  # sine of the angle between the two planes from which their line counts
+POSE_POINTS = ("LeftHand", "RightHand", "LeftForeArm", "RightForeArm", "LeftShin", "RightShin", "LeftFoot",
+               "RightFoot", "Head")
+WARP_VELOCITY = 1.0               # weight of the pose features' velocities next to the poses (DTW)
+
+
+def body_frames(J, names):
+    """(T, 3, 3) the body's frame in the joints' coordinates, columns (left, up, forward)."""
+    idx = {n: i for i, n in enumerate(names)}
+    hips, chest = J[:, idx["Hips"]], J[:, idx["Chest"]]
+    lat = _unit(J[:, idx["LeftLeg"]] - J[:, idx["RightLeg"]])
+    up = chest - hips
+    up = _unit(up - np.sum(up * lat, 1, keepdims=True) * lat)
+    return np.stack([lat, up, np.cross(lat, up)], axis=2)
+
+
+def pose_features(J, names, fps):
+    """(T, F) the move as the body does it, whatever the camera: body-frame poses and their velocities."""
+    idx = {n: i for i, n in enumerate(names)}
+    B = body_frames(J, names)
+    hips = J[:, idx["Hips"]]
+    size = max(float(np.median(np.linalg.norm(J[:, idx["Chest"]] - hips, axis=1))), 1e-6)
+    rel = J[:, [idx[n] for n in POSE_POINTS]] - hips[:, None]
+    local = np.einsum('tij,tki->tkj', B, rel).reshape(len(J), -1) / size
+    local = np.stack([_gauss(local[:, k], 0.05 * fps) for k in range(local.shape[1])], 1) if len(J) >= 3 else local
+    vel = np.gradient(local, axis=0) * fps / 4.0 if len(J) >= 2 else np.zeros_like(local)
+    return np.concatenate([local, WARP_VELOCITY * vel], axis=1)
+
+
+def align_takes(fa, fb):
+    """
+        For each frame of take A, the matching frame of take B (float): dynamic time warping, B free to
+        start and end anywhere (a take may run on before or after the other). :return: (map, mean cost).
+    """
+    na, nb = len(fa), len(fb)
+    cost = np.sqrt(((fa[:, None, :] - fb[None, :, :]) ** 2).sum(-1))
+    acc = np.full((na, nb), np.inf)
+    acc[0] = cost[0]
+    step = np.zeros((na, nb), dtype=np.int8)                 # 0 diagonal, 1 from above (A moves), 2 from left
+    for i in range(1, na):
+        prev = acc[i - 1]
+        diag = np.concatenate([[np.inf], prev[:-1]])
+        best = np.minimum(diag, prev)
+        step[i] = np.where(diag <= prev, 0, 1)
+        row = cost[i] + best
+        for j in range(1, nb):                                # B moves on while A waits
+            if row[j - 1] + cost[i, j] < row[j]:
+                row[j] = row[j - 1] + cost[i, j]
+                step[i, j] = 2
+        acc[i] = row
+    j = int(np.argmin(acc[-1]))
+    i = na - 1
+    pairs = []
+    while i >= 0:
+        pairs.append((i, j))
+        if i == 0:
+            break
+        s = step[i, j]
+        if s == 0:
+            i, j = i - 1, j - 1
+        elif s == 1:
+            i -= 1
+        else:
+            j -= 1
+    out = np.zeros(na)
+    count = np.zeros(na)
+    for i, j in pairs:
+        out[i] += j
+        count[i] += 1
+    out /= np.maximum(count, 1)
+    return out, float(acc[-1].min() / max(len(pairs), 1))
+
+
+def second_view_lean(data, names, wrist, direction, K, other_data, other_rows, sure=None):
+    """
+        (lean (T,) radians, weight (T,), flip (T,) bool, report) the second take gives the first's blade.
+        :param wrist, direction: the first take's grip (camera metres) and the blade's picture direction.
+        :param sure: (T,) 0..1 how sure the first picture is of that direction.
+        flip: frames where the first picture is unsure and both pictures together say the tip points the
+        other way across it (a blade seen nearly end-on there).
+    """
+    J = np.asarray(data["joints_incam"], dtype=float)
+    J2 = np.asarray(other_data["joints_incam"], dtype=float)
+    names2 = [str(n) for n in other_data["joint_names"]]
+    if len(names2) == J2.shape[1] + 1:
+        names2 = names2[1:]
+    idx2 = {n: i for i, n in enumerate(names2)}
+    K2 = np.asarray(other_data["K"], dtype=float).reshape(3, 3)
+    fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+    fps2 = float(np.asarray(other_data["fps"]).reshape(-1)[0])
+    match, cost = align_takes(pose_features(J, names, fps), pose_features(J2, names2, fps2))
+    j = np.clip(np.rint(match).astype(int), 0, len(J2) - 1)
+    rows2 = np.asarray(other_rows, dtype=float).reshape(len(J2), -1)
+    dir2, conf2 = _unit(rows2[:, :2]), np.clip(rows2[:, 2], 0, 1)
+    side2 = rows2[:, 3] if rows2.shape[1] > 3 else np.zeros(len(J2))
+    apart2 = np.linalg.norm(J2[:, idx2["RightHand"]] - J2[:, idx2["LeftHand"]], axis=1) > HANDS_APART_M
+    holder2 = sword_holder(side2, conf2 > GRIP_FIT_CONF, apart2)
+    wrist2 = np.where((holder2 == -1)[:, None], J2[:, idx2["LeftHand"]], J2[:, idx2["RightHand"]])
+    # each picture's plane through its camera, as normals in the body's frame
+    sight, across = _sight_and_across(wrist, direction, K)
+    n1 = np.einsum('tij,ti->tj', body_frames(J, names), np.cross(sight, across))
+    sight2, across2 = _sight_and_across(wrist2[j], dir2[j], K2)
+    n2 = np.einsum('tij,ti->tj', body_frames(J2, names2)[j], np.cross(sight2, across2))
+    line = np.cross(n1, n2)
+    sine = np.linalg.norm(line, axis=1)
+    blade = np.einsum('tij,tj->ti', body_frames(J, names), _unit(line))       # back to the first camera
+    lo, hi = SECOND_VIEW_CONF
+    plo, phi = SECOND_VIEW_PLANES
+    sure2 = np.clip((conf2[j] - lo) / (hi - lo), 0, 1)
+    sure1 = np.ones(len(J)) if sure is None else np.asarray(sure, dtype=float)
+    # which end is the tip: each picture votes by how sure it is and how side-on it sees the blade
+    in2 = np.einsum('tij,tj->ti', body_frames(J2, names2)[j], _unit(line))
+    vote = sure1 * np.sum(blade * across, 1) + sure2 * np.sum(in2 * across2, 1)
+    blade *= np.where(vote < 0, -1.0, 1.0)[:, None]
+    weight = sure2 * np.clip((sine - plo) / (phi - plo), 0, 1)
+    # Only where the first picture is unsure: carried over from another performance through the body's
+    # frame, the second view is good for the lean but outvoted a plainly visible tip (frames 85-87,
+    # 121-125 and 168 turned round, with the first video showing them right).
+    flip = (np.sum(blade * across, 1) < 0) & (weight > 0.5) & (sure1 < 0.5)
+    lean = _lean(wrist, blade, np.where(flip[:, None], -direction, direction), K)
+    return lean, weight, flip, {"warp_cost": round(cost, 3), "used": float(np.mean(weight > 0.5)),
+                                "flipped": int(flip.sum()),
+                                "offset_frames": float(np.median(match - np.arange(len(match))))}
+
+
+def _gauss_complex(z, sigma):
+    if len(z) < 3:
+        return z
+    return _gauss(z.real, sigma) + 1j * _gauss(z.imag, sigma)
+
+
+def _sight_and_across(wrist, direction, K):
+    """Per frame: unit ray from the camera through the grip, and the picture direction as a 3D unit across it."""
+    Kinv = np.linalg.inv(K)
+    g = _project(wrist, K)
+    ray = lambda p: np.concatenate([p, np.ones((len(p), 1))], 1) @ Kinv.T
+    sight = _unit(ray(g))
+    across = ray(g + 50.0 * direction) - ray(g)
+    return sight, _unit(across - np.sum(across * sight, 1, keepdims=True) * sight)
+
+
+def _lean(wrist, blade, direction, K):
+    """(T,) radians a 3D blade leans toward the camera, measured on the picture direction's side."""
+    sight, across = _sight_and_across(wrist, direction, K)
+    lean = np.arctan2(np.sum(blade * sight, 1), np.abs(np.sum(blade * across, 1)))
+    return np.clip(lean, -np.radians(SWORD_MAX_LEAN), np.radians(SWORD_MAX_LEAN))
+
+
+def _blade_at(wrist, direction, lean, K):
+    """(T, 3) the 3D blade (camera) that points along `direction` in the picture and leans `lean` (rad)."""
+    sight, across = _sight_and_across(wrist, direction, K)
+    return _unit(np.cos(lean)[:, None] * across + np.sin(lean)[:, None] * sight)
+
+
+def sword_holder(side, sure, apart):
+    """
+        (T,) which hand holds the sword per frame (1 right, -1 left, 0 both on the handle). Both, where the
+        wrists are close in 3D (apart False); elsewhere the hand Track Sword found the blade at (its 4th
+        value) in the nearest frame it was sure of one hand, the right if it never was.
+    """
+    side = np.rint(np.asarray(side, dtype=float)).astype(int)
+    apart = np.asarray(apart, dtype=bool)
+    out = np.zeros(len(side), dtype=int)
+    known = np.flatnonzero(np.asarray(sure, dtype=bool) & apart & (side != 0))
+    if not len(known):
+        out[apart] = 1
+        return out
+    t = np.arange(len(side))
+    after = known[np.clip(np.searchsorted(known, t), 0, len(known) - 1)]
+    before = known[np.clip(np.searchsorted(known, t) - 1, 0, len(known) - 1)]
+    pick = np.where(np.abs(before - t) < np.abs(after - t), before, after)
+    out[apart] = side[pick][apart]
+    return out

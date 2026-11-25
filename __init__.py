@@ -124,6 +124,10 @@ def register():
         name="Field of View", default=60.0, min=10.0, max=120.0, precision=0,   # plain degrees: subtype ANGLE is radians
         description="Horizontal field of view of the front camera in degrees (phone main camera about 65-70, "
                     "a 35 mm lens on a full-frame camera about 54, zoomed in 30). Too wide overcorrects")
+    bpy.types.Scene.gemx_reuse = bpy.props.BoolProperty(
+        name="Reuse", default=False,
+        description="Read GEM-X's saved result for this video again instead of tracking it (seconds, not "
+                    "minutes): after an add-on update, to give an older take what is new")
     bpy.types.Scene.gemx_fov = bpy.props.FloatProperty(
         name="GEM-X Field of View", default=0.0, min=0.0, max=120.0, precision=0,
         description="Horizontal field of view of the camera in degrees, for GEM-X's distances. 0: GEM-X's own "
@@ -242,6 +246,7 @@ def unregister():
     del bpy.types.Scene.combine_fov
     del bpy.types.Scene.combine_auto_fov
     del bpy.types.Scene.gemx_fov
+    del bpy.types.Scene.gemx_reuse
     del bpy.types.Scene.combine_auto_horizon
     del bpy.types.Scene.combine_whole_take
     del bpy.types.Scene.combine_grip

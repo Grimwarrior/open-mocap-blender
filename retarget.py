@@ -421,14 +421,48 @@ def sword_directions(empties, frames, fps):
     c = cf * np.clip(np.linalg.norm(d, axis=1) / np.maximum(cf, 1e-9), 0.0, 1.0)   # less where neighbours disagree
     c[(f < t[0]) | (f > t[-1])] = 0.0
     c = np.clip((c - SWORD_TRUST[0]) / (SWORD_TRUST[1] - SWORD_TRUST[0]), 0.0, 1.0)
-    return _unit(d), np.clip(_gauss_np(c, SWORD_CONF_SMOOTH_S * fps), 0.0, 1.0)
+    holder = None
+    if len(data.get("holder") or []) == len(t):              # GEM-X takes: which hand holds it, per frame
+        nearest = np.clip(np.searchsorted(t, f), 0, len(t) - 1)
+        earlier = np.clip(nearest - 1, 0, len(t) - 1)
+        pick = np.where(np.abs(t[earlier] - f) < np.abs(t[nearest] - f), earlier, nearest)
+        holder = np.rint(np.asarray(data["holder"], dtype=float)[pick]).astype(int)
+    return _unit(d), np.clip(_gauss_np(c, SWORD_CONF_SMOOTH_S * fps), 0.0, 1.0), holder
 
 
-def arm_directions(empties, frames, fps, sword=None):
+def _turn(v, axis, angle):
+    """(N, 3) vectors turned by (N,) angles about (N, 3) unit axes (Rodrigues)."""
+    c, s = np.cos(angle)[:, None], np.sin(angle)[:, None]
+    return v * c + np.cross(axis, v) * s + axis * np.sum(axis * v, axis=1, keepdims=True) * (1 - c)
+
+
+def grip_turn(hand, palm, grip, blade, confidence):
+    """
+        The smallest turn per frame that brings the rig's own sword onto the take's blade.
+        :param hand, palm: (N, 3) where the hand bone's Y axis and its roll axis would point.
+        :param grip: the rig's blade in that hand bone's frame, as (Y, roll axis, Y x roll axis) components.
+        :param blade, confidence: the take's blade direction (N, 3) and how far to turn toward it (N,).
+        :return: (axis (N, 3), angle (N,)) to turn both hands' directions by.
+    """
+    f1 = _unit(hand)
+    f2 = _unit(palm - np.sum(palm * f1, axis=1, keepdims=True) * f1)
+    f3 = np.cross(f1, f2)
+    rig_blade = _unit(grip[0] * f1 + grip[1] * f2 + grip[2] * f3)
+    axis = np.cross(rig_blade, blade)
+    sin = np.linalg.norm(axis, axis=1)
+    angle = np.arctan2(sin, np.sum(rig_blade * blade, axis=1)) * np.clip(confidence, 0.0, 1.0)
+    fallback = np.cross(rig_blade, f2)            # opposite directions: turn about any axis across the blade
+    axis = np.where(sin[:, None] > 1e-6, axis / np.maximum(sin, 1e-12)[:, None], _unit(fallback))
+    return axis, angle
+
+
+def arm_directions(empties, frames, fps, sword=None, held=None):
     """
         Per frame and side, in the landmark empties' local space: elbow bend direction for the upper
         arm, hand direction (wrist -> hand centre, bend limited) and palm side (index -> pinky, across
         the hand), all smoothed. :param sword: sword_directions(...) or None.
+        :param held: (side, grip) when the rig carries its own sword in that hand (rig_sword): both hands
+                     turn so the rig's sword lies along the take's blade (see "Sword in the rig's hand").
         :return: {side: (wrist, elbow, curl, hand, palm)} as (N, 3) arrays.
     """
     idx = sorted({i for v in ARM_MAP.values() for i in v} | {L_HIP, R_HIP, HIP_C, SHOULDER_C})
@@ -457,7 +491,7 @@ def arm_directions(empties, frames, fps, sword=None):
         rel = np.linalg.norm(across, axis=1) / np.maximum(np.linalg.norm(fore, axis=1), 1e-9)
         weight = np.clip(rel / PALM_RELIABLE, 0.0, 1.0) ** 2
         palm = _smooth_directions(_unit(across), (weight + 1e-3) * hand_conf, sigma, curl)
-        if sword is not None:
+        if sword is not None and held is None:
             # holding the handle: the hand points across the blade, index -> pinky runs toward the pommel
             s_dir, c = sword[0], sword[1][:, None]
             across_blade = hand - c * np.sum(hand * s_dir, axis=1, keepdims=True) * s_dir
@@ -471,6 +505,18 @@ def arm_directions(empties, frames, fps, sword=None):
             palm = _unit(blend)
         palm = _unit(palm - np.sum(palm * hand, axis=1, keepdims=True) * hand)
         out[side] = (P[w], P[e], curl, hand, palm)
+    if sword is not None and held is not None:
+        side, grip = held
+        holder = sword[2] if len(sword) > 2 and sword[2] is not None else np.zeros(len(frames), dtype=int)
+        # The rig's sword hand always turns its sword onto the take's blade, also where the actor holds it
+        # in the other hand alone (the blade then points right from the wrong hand, which keeps the arc;
+        # left alone, it pointed 80-96 deg off, KatanaKomibination_RTL frames 1-13). The off hand turns
+        # with it only while both are on the handle (sword_directions' holder 0).
+        axis, angle = grip_turn(out[side][3], out[side][4], grip, sword[0], sword[1])
+        both = _gauss_np((holder == 0).astype(float), SWORD_CONF_SMOOTH_S * fps)
+        for s, (w, e, curl, hand, palm) in list(out.items()):
+            a = angle if s == side else angle * both
+            out[s] = (w, e, curl, _unit(_turn(hand, axis, a)), _unit(_turn(palm, axis, a)))
     return out
 
 
@@ -1490,6 +1536,55 @@ def measured_hip_offsets(scene, rig, frames, ratio):
     return {side: v * ratio for side, v in out.items()}
 
 
+# Sword in the rig's hand. A rig with its own sword (the Mixamo Rig weapon rig: Ctrl_Sword -> Sword_Tip,
+# carried by a hand socket) holds it at its own grip, set up so the mesh hand closes round the handle.
+# Turning the hand's index -> pinky line along the blade (the rule above) assumes one grip and missed
+# this rig's by about a quarter turn: KatanaKomibination_RTL, the retargeted blade against the video's,
+# median 92 deg off. With the rig's sword found, the hand is turned instead by the smallest turn that
+# lays the rig's own blade along the take's (the roll about the blade stays the tracked one), and the
+# other hand turns with it, both being on the one handle.
+SWORD_TIP_BONES = ("Sword_Tip",)
+SWORD_HAND_REACH = 2.0      # the sword's root (its pommel end on the Mixamo Rig katana: 1.1 forearm lengths
+                            # from the hand) must be within this many forearm lengths of the hand
+
+
+TRACK_AXES = {'TRACK_X': (1.0, 0.0, 0.0), 'TRACK_NEGATIVE_X': (-1.0, 0.0, 0.0),
+              'TRACK_Z': (0.0, 0.0, 1.0), 'TRACK_NEGATIVE_Z': (0.0, 0.0, -1.0)}
+
+
+def rig_sword(rig):
+    """
+        (side, (Y, roll axis, Y x roll axis) components of the rig's blade in that hand bone's frame) for
+        the rig's own sword in its current pose, or None when it has none in a hand.
+    """
+    tip = next((rig.pose.bones[n] for n in SWORD_TIP_BONES if n in rig.pose.bones), None)
+    if tip is None or tip.parent is None:
+        return None
+    base = tip.parent
+    blade = tip.head - base.head
+    if blade.length < 1e-6:
+        return None
+    best = None
+    for side in ("Left", "Right"):
+        hand, fore = drive_bone(rig, side + "Hand"), drive_bone(rig, side + "ForeArm")
+        index1, pinky1 = find_bone(rig, side + "HandIndex1"), find_bone(rig, side + "HandPinky1")
+        if None in (hand, fore, index1, pinky1):
+            continue
+        reach = SWORD_HAND_REACH * max((hand.head - fore.head).length, 1e-6)
+        dist = (hand.head - base.head).length
+        if dist < reach and (best is None or dist < best[0]):
+            best = (dist, side, hand, index1, pinky1)
+    if best is None:
+        return None
+    _dist, side, hand, index1, pinky1 = best
+    mw = rig.matrix_world
+    ref_dir = (mw @ pinky1.bone.head_local) - (mw @ index1.bone.head_local)
+    roll = Vector(TRACK_AXES[_twist_axis(rig, hand, ref_dir)])
+    local = hand.matrix.to_3x3().normalized().inverted() @ blade.normalized()
+    y = Vector((0.0, 1.0, 0.0))
+    return side, (local.dot(y), local.dot(roll), local.dot(y.cross(roll)))
+
+
 def _twist_axis(rig, pb, ref_dir):
     """Locked Track axis of the bone (X or Z, either sign) that lies closest to ref_dir at rest."""
     m = rig.matrix_world.to_3x3() @ pb.bone.matrix_local.to_3x3()
@@ -2206,8 +2301,16 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
     # --- Arms and hands (keyed, smoothed targets; see ARM_MAP)
     reach = {}
     sword_dirs = sword_directions(empties, frames, fps) if use_sword and len(frames) >= 2 else None
+    held = None
     if sword_dirs is not None:
         info["sword"] = float(np.mean(sword_dirs[1] > 0.5))
+        context.view_layer.update()                     # the rig's sword in its hand, as the FK switch left it
+        found = rig_sword(rig)
+        if found is not None:
+            side, grip = found
+            # the mocap space mirrors depth for a mirrored take, which turns its handedness round
+            held = (side, (grip[0], grip[1], -grip[2] if mirror_depth else grip[2]))
+            info["sword_hand"] = side
     ref = {s + n: find_bone(rig, s + n) for s in ('Left', 'Right') for n in ('Arm', 'ForeArm', 'Hand', 'UpLeg')}
     if len(frames) >= 2 and all(ref.values()):
         h = {n: mw @ b.bone.head_local for n, b in ref.items()}
@@ -2242,7 +2345,8 @@ def setup_retarget(context, rig, empties, hips_motion=True, mirror_depth=False, 
             reach = arm_reach_directions(empties, frames, fps, upper_len, fore_len, rig_torso, rig_width,
                                          shoulders=arm_heads, grip=grip, sword=sword_dirs)
     if len(frames) >= 2:
-        for side, (wrist, elbow, curl, hand_dir, palm) in arm_directions(empties, frames, fps, sword_dirs).items():
+        for side, (wrist, elbow, curl, hand_dir, palm) in arm_directions(empties, frames, fps, sword_dirs,
+                                                                          held).items():
             arm, fore, hand = (drive_bone(rig, side + n) for n in ("Arm", "ForeArm", "Hand"))
             index1, pinky1 = find_bone(rig, side + "HandIndex1"), find_bone(rig, side + "HandPinky1")
             if side in reach:
@@ -2455,7 +2559,9 @@ class RetargetToMixamo(bpy.types.Operator):
                 msg += " No hand points with this take, fingers left as they are."
         if self.sword:
             if "sword" in info:
-                msg += f" Hands turned to the sword, clearly seen in {info['sword']:.0%} of the frames."
+                msg += f" Hands turned to the sword, clearly seen in {info['sword']:.0%} of the frames"
+                msg += (f", the rig's own sword (in its {info['sword_hand'].lower()} hand) laid along it."
+                        if "sword_hand" in info else ".")
             else:
                 msg += " No tracked sword with this take."
         if info.get("layers_off"):

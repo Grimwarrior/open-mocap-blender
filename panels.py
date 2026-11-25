@@ -187,8 +187,9 @@ class PoseTrackingPanel(bpy.types.Panel):
         layout.operator("object.start_tracking", text="Start Pose Tracking", icon='PLAY').track = "front_pose"
         if PackageInstaller.gemx_python() or PackageInstaller.gemx_repo():
             row = layout.row(align=True)
-            row.operator("object.open_mocap_track_gemx", text="Track with GEM-X", icon='OUTLINER_OB_ARMATURE')
+            row.operator("object.open_mocap_track_gemx", text="Track with GEM-X", icon='OUTLINER_OB_ARMATURE').view = 'FRONT'
             row.prop(scene, "gemx_fov", text="FOV")
+            row.prop(scene, "gemx_reuse", text="", icon='FILE_REFRESH')
             if gvar.gemx_status:
                 layout.label(text=gvar.gemx_status, icon='SORTTIME' if gvar.gemx_status.endswith("...") else 'INFO')
         layout.operator("object.clear_video_path", text="Delete Video", icon='X').video = "front_video_pose"
@@ -201,6 +202,9 @@ class PoseTrackingPanel(bpy.types.Panel):
                 layout.label(text = gvar.side_video_path, icon = 'FILE_MOVIE')
             layout.operator("object.open_mocap_filebrowser", text="Select Side Video", icon='FILEBROWSER').video = "side_video_pose"
             layout.operator("object.start_tracking", text="Start Pose Tracking", icon='PLAY').track = "side_pose"
+            if PackageInstaller.gemx_python() or PackageInstaller.gemx_repo():
+                layout.operator("object.open_mocap_track_gemx", text="Track Side with GEM-X",
+                                icon='OUTLINER_OB_ARMATURE').view = 'SIDE'
             layout.operator("object.clear_video_path", text="Delete Video", icon='X').video = "side_video_pose"
 
             # Further views: any other direction, any number. Each is tracked once and kept in the list.

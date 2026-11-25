@@ -171,7 +171,9 @@ def write_joints(a, repo, out_pt, out_npz, width, height):
            "frame_times": cond["frame_times"].numpy().reshape(-1), "fps": np.array(float(res.get("sampling_fps", 30.0))),
            "width": np.array(width), "height": np.array(height),
            "obs_conf": kp.reshape(-1, kp.shape[-2], kp.shape[-1])[:, :, 2],
-           "static_conf": torch.sigmoid(res["static_conf_logits"][0]).numpy(), "joints_rest": joints_rest}
+           "static_conf": torch.sigmoid(res["static_conf_logits"][0]).numpy(), "joints_rest": joints_rest,
+           # the 2D keypoints GEM-X saw (pixels, confidence): Track Sword searches the video around them
+           "kp2d": kp.reshape(-1, kp.shape[-2], kp.shape[-1])}
     np.savez(out_npz, **out)
     print("DONE " + out_npz, flush=True)
     return 0

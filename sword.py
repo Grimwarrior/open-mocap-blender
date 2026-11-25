@@ -217,24 +217,51 @@ def track_frames(read_frames, frames, vis, times, video_fps, width, height, prog
     """
     if len(frames) == 0:
         return []
-    scores = view_scores(read_frames, frames, vis, times, video_fps, width, height, progress)
+    scores, sides = view_scores(read_frames, frames, vis, times, video_fps, width, height, progress,
+                                with_sides=True)
     path, best = track_angles(scores, video_fps or 30.0)
     conf = np.clip(best / CONF_SCALE, 0.0, 1.0)
-    return [[float(np.cos(ANGLES[p])), float(np.sin(ANGLES[p])), float(c)] for p, c in zip(path, conf)]
+    return [[float(np.cos(ANGLES[p])), float(np.sin(ANGLES[p])), float(c), float(sides[k, p])]
+            for k, (p, c) in enumerate(zip(path, conf))]
 
 
-def view_scores(read_frames, frames, vis, times, video_fps, width, height, progress=None):
-    """(N, N_ANGLES) ray scores of every tracked frame of one video (see track_frames)."""
+# One hand or two. With both hands on the handle the blade is searched from between them. Where they are
+# apart (GRIP_SPLIT of the body's height in the picture), only one holds the sword and the point between
+# them is the middle of the body (KatanaKomibination_RTL frames 133-163: right hand overhead or out to the
+# side with the sword, left arm reaching the other way); there each hand is searched from, the better ray
+# wins, and the row says which hand had it (4th value: 1 right, -1 left, 0 both together).
+GRIP_SPLIT = 0.12
+HAND_GRIPS = {1: (16, 18, 20), -1: (15, 17, 19)}
+
+
+def hand_grips(points, vis):
+    """{1: right, -1: left} (N, 2) visibility-weighted centre of each hand's points."""
+    vis = np.asarray(vis, dtype=np.float64)
+    out = {}
+    for side, idx in HAND_GRIPS.items():
+        w = np.clip(vis[:, list(idx)], 0.05, 1.0)
+        out[side] = np.sum(points[:, list(idx)] * w[:, :, None], axis=1) / w.sum(axis=1)[:, None]
+    return out
+
+
+def view_scores(read_frames, frames, vis, times, video_fps, width, height, progress=None, with_sides=False):
+    """
+        (N, N_ANGLES) ray scores of every tracked frame of one video (see track_frames); with_sides also
+        (N, N_ANGLES) which hand each ray was searched from (see GRIP_SPLIT).
+    """
     n = len(frames)
     wanted = np.rint(np.asarray(times, dtype=np.float64) * video_fps).astype(int)
     points = picture_points(frames, width, height)
     grip, size = grips_and_sizes(points, vis)
+    hands = hand_grips(points, vis)
+    apart = np.linalg.norm(hands[1] - hands[-1], axis=1) > GRIP_SPLIT * size
+    sides = np.zeros((n, N_ANGLES), dtype=np.int8)
     last = int(wanted.max())
     every = max(1, (last + 1) // BG_SAMPLES)
     samples = [downscale(img).astype(np.uint8) for i, img in read_frames() if i % every == 0 and i <= last]
     scores = np.zeros((n, N_ANGLES))
     if not samples:
-        return scores
+        return (scores, sides) if with_sides else scores
     background = np.median(np.stack(samples), axis=0).astype(np.float32)
     del samples
     rows = {}
@@ -248,11 +275,17 @@ def view_scores(read_frames, frames, vis, times, video_fps, width, height, progr
             continue
         work = downscale(img)
         for k in rows[i]:
-            scores[k] = frame_scores(work, background, points[k], grip[k], size[k])
+            if apart[k]:
+                right = frame_scores(work, background, points[k], hands[1][k], size[k])
+                left = frame_scores(work, background, points[k], hands[-1][k], size[k])
+                scores[k] = np.maximum(right, left)
+                sides[k] = np.where(right >= left, 1, -1)
+            else:
+                scores[k] = frame_scores(work, background, points[k], grip[k], size[k])
             done += 1
         if progress:
             progress(done / n)
-    return scores
+    return (scores, sides) if with_sides else scores
 
 
 def video_reader(path):
