@@ -106,6 +106,28 @@ hips_path = rig.pose.bones["Hips"].path_from_id("location")
 assert all(fc.data_path != hips_path or len(fc.keyframe_points) == 21 for fc in addon.foot_lock.curve_bag(rig))
 print("Palm lock passed sway, floor, hand turn and torso checks")
 
+# Constraints: one that only places the arm (a control rig's Copy Location to its shoulder) may stay on;
+# one that turns it must be baked first, and the message names it.
+arm_r = rig.pose.bones["RightArm"]
+place = arm_r.constraints.new('COPY_LOCATION')
+place.name, place.target, place.subtarget = "Copy Location", rig, "RightUpLeg"   # unkeyed: holds the arm in place
+place.target_space = place.owner_space = 'LOCAL'
+rig.animation_data.action = source
+assert lock(rig, floor_z=0.0) == {'FINISHED'}
+assert np.ptp(palms(hands)[..., :2], axis=0).max() < .0006
+rig.animation_data.action = source
+aim = arm_r.constraints.new('DAMPED_TRACK')
+aim.name, aim.target, aim.subtarget = "Aim", rig, "Hips"
+try:
+    lock(rig, floor_z=0.0)
+except RuntimeError as error:
+    assert "RightArm: Aim" in str(error) and "Copy Location" not in str(error), str(error)
+else:
+    raise AssertionError("a constraint turning the arm was let through")
+arm_r.constraints.remove(aim)
+arm_r.constraints.remove(place)
+print("Palm lock passed location-only and turning constraint checks")
+
 # Floor rule: no contact at a floor half a metre up; Multi Level finds them without a floor.
 rig.animation_data.action = source
 count = len(bpy.data.actions)

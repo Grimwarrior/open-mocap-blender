@@ -17,7 +17,7 @@ import numpy as np
 from mathutils import Vector
 
 from . import retarget
-from .foot_lock import (MODE_ITEMS, bridge, continuous_keys, curve_bag, marker_masks, runs, set_time,
+from .foot_lock import (MODE_ITEMS, blocking_constraints, bridge, continuous_keys, curve_bag, marker_masks, runs, set_time,
                         world_vertices, write_rotation)
 
 SIDES = ("Left", "Right")
@@ -294,9 +294,10 @@ class LockHands(bpy.types.Operator):
                 context.view_layer.update()
             if rest != 'POSE':
                 raise ValueError("Switch the armature to Pose Position before locking palms")
-            for palm in palms:
-                if any(not c.mute and c.influence > 0 for b in palm.controls for c in b.constraints):
-                    raise ValueError("Bake and disable the constraints driving the arm controls first")
+            blocking = blocking_constraints([b for palm in palms for b in palm.controls])
+            if blocking:
+                raise ValueError("Bake and disable the constraints that turn the arm controls first ("
+                                 + ", ".join(blocking) + ")")
             markers = [(m.name, m.frame) for m in scene.timeline_markers] if self.use_markers else []
             old.use_fake_user = True
             copy = old.copy()

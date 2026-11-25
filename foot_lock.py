@@ -328,6 +328,17 @@ def continuous_keys(rig, bones):
             c.update()
 
 
+# Constraints that only move a bone (a control rig's arm held at its shoulder control, Copy Location)
+# leave the rotations the locks key alone, so they may stay on.
+LOCATION_ONLY = {'COPY_LOCATION', 'LIMIT_LOCATION', 'LIMIT_DISTANCE'}
+
+
+def blocking_constraints(bones):
+    """'bone: constraint' for every active constraint on these bones that can change their rotation."""
+    return [f"{b.name}: {c.name}" for b in bones for c in b.constraints
+            if not c.mute and c.influence > 0 and c.type not in LOCATION_ONLY]
+
+
 def write_rotation(rig, bone, world, previous, frame):
     # Convert to the bone's basis without touching its location, scale or rotation mode.
     m = bone.matrix.copy()
@@ -593,9 +604,10 @@ class LockFeet(bpy.types.Operator):
                 context.view_layer.update()
             if rest != 'POSE':
                 raise ValueError("Switch the armature to Pose Position before locking feet")
-            for boot in boots:
-                if any(not c.mute and c.influence > 0 for b in boot.controls for c in b.constraints):
-                    raise ValueError("Bake and disable the constraints driving the leg controls first")
+            blocking = blocking_constraints([b for boot in boots for b in boot.controls])
+            if blocking:
+                raise ValueError("Bake and disable the constraints that turn the leg controls first ("
+                                 + ", ".join(blocking) + ")")
             hips = retarget.drive_bone(rig, "Hips") if self.lower_hips else None
             if hips is not None and (any(not c.mute and c.influence > 0 for c in hips.constraints)
                                      or any(hips.lock_location)):
