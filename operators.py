@@ -373,6 +373,7 @@ class CombineMotionData(bpy.types.Operator):
                 combined, rep = combine.combine_multi(
                     front, views, gvar.position_times, gvar.position_vis,
                     smoothing=scene.combine_smoothing, bone_strength=scene.combine_bone_strength,
+                    smoothing_method=scene.combine_smoothing_method,
                     offset=None if (scene.combine_auto_offset or not side) else scene.combine_offset,
                     sync=scene.combine_sync,
                     side_angle=None if (scene.combine_auto_angle or not side) else scene.combine_side_angle,

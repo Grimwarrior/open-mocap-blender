@@ -41,8 +41,12 @@ def strength_scale(strength):
 class OneEuro:
     """One Euro filter for a set of points (..., 3): one speed per point."""
 
-    def __init__(self, strength=50.0):
-        self.set_strength(strength)
+    def __init__(self, strength=50.0, cutoffs=None):
+        """:param cutoffs: (min cutoff, beta, max cutoff) instead of the live hand defaults at `strength`."""
+        if cutoffs is None:
+            self.set_strength(strength)
+        else:
+            self.min_cutoff, self.beta, self.max_cutoff = cutoffs
         self.reset()
 
     def set_strength(self, strength):
@@ -80,6 +84,73 @@ class OneEuro:
         self.raw = x.copy()
         self.time = time
         return self.value.copy()
+
+
+def _unit(v):
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    return v / np.maximum(n, 1e-12)
+
+
+def slerp(a, b, t):
+    """Unit vectors a -> b (..., 3) turned a share t (..., 1) of the way along the great circle."""
+    dot = np.clip(np.sum(a * b, axis=-1, keepdims=True), -1.0, 1.0)
+    theta = np.arccos(dot)
+    s = np.sin(theta)
+    small = s < 1e-6
+    w1 = np.where(small, 1.0 - t, np.sin((1.0 - t) * theta) / np.where(small, 1.0, s))
+    w2 = np.where(small, t, np.sin(t * theta) / np.where(small, 1.0, s))
+    return _unit(w1 * a + w2 * b)
+
+
+class OneEuroDirections:
+    """
+        One Euro filter for unit vectors (..., 3), a bone's direction: it turns along the great circle
+        toward each new direction, by a share set from the direction's angular speed (rad/s), as PEAR's
+        filter turns rotation matrices geodesically instead of averaging their entries.
+    """
+
+    def __init__(self, cutoffs):
+        self.min_cutoff, self.beta, self.max_cutoff = cutoffs
+        self.raw = self.value = self.derivative = self.time = None
+
+    def update(self, units, time):
+        x = _unit(np.asarray(units, dtype=float))
+        dt = None if self.time is None else time - self.time
+        if dt is None or not 0 < dt <= MAX_GAP or self.raw.shape != x.shape:
+            self.raw, self.value = x.copy(), x.copy()
+            self.derivative = np.zeros(x.shape[:-1] + (1,))
+            self.time = time
+            return self.value.copy()
+        turn = np.arccos(np.clip(np.sum(self.raw * x, axis=-1, keepdims=True), -1.0, 1.0)) / dt
+        self.derivative += alpha(DERIVATIVE_CUTOFF, dt) * (turn - self.derivative)
+        cutoff = np.minimum(self.max_cutoff, self.min_cutoff + self.beta * self.derivative)
+        self.value = slerp(self.value, x, alpha(cutoff, dt))
+        self.raw, self.time = x, time
+        return self.value.copy()
+
+
+ZERO_PHASE = 'CASCADE'      # 'CASCADE': backward over the forward pass's output; 'AVERAGE': the two passes averaged
+
+
+def zero_phase(make, values, times, scale=1.0, directions=False):
+    """
+        Offline, without lag: a filter from `make()` run forward and backward over the take. CASCADE
+        filters the forward result backward (as filtfilt does: the lags cancel, the smoothing adds up);
+        AVERAGE averages the two passes (the forward one trails a move as much as the backward one leads).
+        :param values: (N, ..., 3); times (N,) seconds. :return: filtered values, same shape.
+    """
+    values = np.asarray(values, dtype=float)
+    times = np.asarray(times, dtype=float)
+
+    def run(v, t):
+        f = make()
+        return np.array([f.update(a, b) if directions else f.update(a, b, scale) for a, b in zip(v, t)])
+
+    forward = run(values, times)
+    if ZERO_PHASE == 'CASCADE':
+        return run(forward[::-1], -times[::-1])[::-1]
+    both = forward + run(values[::-1], -times[::-1])[::-1]
+    return _unit(both) if directions else both / 2.0
 
 
 def hand_length(points):

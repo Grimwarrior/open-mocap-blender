@@ -50,6 +50,11 @@
 
 import numpy as np
 
+try:
+    from . import smoothing as _smoothing
+except ImportError:                                   # the tests import this module on its own
+    import smoothing as _smoothing
+
 N_PTS = 40
 NOSE, L_EAR, R_EAR = 0, 7, 8
 L_SHOULDER, R_SHOULDER = 11, 12
@@ -209,6 +214,69 @@ def _gauss_timed(values, times, sigma, **kwargs):
         grid = np.linspace(t[0], t[-1], max(3, int(round((t[-1] - t[0]) * fps)) + 1))
         filtered = _gauss(_interp(grid, t, values[indices]), sigma, **kwargs)
         out[indices] = _interp(t, grid, filtered)
+    return out
+
+
+# Smoothing choice for step 6. 'PEAKS': the peak-keeping Gaussian on every joint's depth.
+# 'ONE_EURO': the depth comes from the skeleton smoothed as a body, not as loose points: the hip
+# centre's path, every bone's direction (turned along the great circle, so a swinging limb keeps its
+# arc and length) and length, and the hand and face points with the joint they hang on, each by a
+# One Euro filter (as RGB MoCap's PEAR live preview smooths rotations, MIT) run forward, then
+# backward over that, for no lag. Its cutoffs scale with Smoothing: EURO_* at 1.5 frames. Width and
+# height keep the light peak-keeping smoothing either way: the front view measures them, and taking
+# them from the smoothed bones tripled their error (0.40 -> 1.39 % of body height).
+# Measured on tests/synthetic_combine.py (two cameras / 70 deg / noisy / separate takes / real
+# cameras, depth error % and jitter): PEAKS 1.08 1.06 1.92 4.18 2.26, jitter 0.95 0.95 1.17 0.97 1.17;
+# ONE_EURO 1.20 1.17 1.99 4.18 2.28, jitter 1.09 1.09 1.34 1.49 1.36; strike speed kept alike (85-87 %).
+# It does not beat PEAKS there, on still or on moving frames, and neither did One Euro on each point
+# alone: speed-adaptive smoothing pays off live, where future frames are unknown (smoothing.LiveHands);
+# offline a symmetric peak-keeping window does better. Kept as an option to compare on real takes.
+SMOOTH_METHOD = 'PEAKS'
+EURO_DIRECTION = (4.0, 0.5, 60.0)      # bone directions: min cutoff (Hz), beta per rad/s, max cutoff (Hz)
+EURO_PATH = (4.0, 0.5, 60.0)           # hip path, lengths and hand/face offsets: beta per body size / s
+EURO_REFERENCE_SIGMA = 1.5
+
+
+def _euro_cutoffs(base, sigma):
+    """(min cutoff, beta, max cutoff) for a Smoothing of `sigma` frames: more smoothing, lower cutoffs."""
+    k = EURO_REFERENCE_SIGMA / max(sigma, 1e-6)
+    return base[0] * k, base[1] * k, base[2] * k
+
+
+def euro_skeleton(P, times, sigma):
+    """
+        :param P: (N, 40, 3) x, y and depth in front-view units; times (N,) seconds.
+        :param sigma: the Smoothing setting (frames); 0 is off.
+        :return: (N, 40, 3) smoothed as a body (see SMOOTH_METHOD).
+    """
+    if sigma <= 0 or len(times) < 3:
+        return P.copy()
+    out = P.copy()
+    fps = _fps(times)
+    breaks = np.flatnonzero(np.diff(times) > max(MAX_INTERP_GAP_S, 1.5 / fps)) + 1
+    for idx in np.split(np.arange(len(times)), breaks):
+        if len(idx) >= 3:
+            out[idx] = _euro_chunk(P[idx], times[idx], sigma)
+    return out
+
+
+def _euro_chunk(P, t, sigma):
+    path = _euro_cutoffs(EURO_PATH, sigma)
+    turn = _euro_cutoffs(EURO_DIRECTION, sigma)
+    size = max(float(np.median(np.linalg.norm(P[:, SHOULDER_C] - P[:, HIP_C], axis=1))), 1e-6)
+    vec = lambda v: _smoothing.zero_phase(lambda: _smoothing.OneEuro(cutoffs=path), v, t, size)
+    out = np.empty_like(P)
+    out[:, HIP_C] = vec(P[:, HIP_C])
+    bones = np.array([P[:, c] - P[:, p] for p, c in SEGMENTS]).swapaxes(0, 1)        # (N, bones, 3)
+    lengths = vec(np.linalg.norm(bones, axis=2, keepdims=True))
+    ways = _smoothing.zero_phase(lambda: _smoothing.OneEuroDirections(turn), bones, t, directions=True)
+    for b, (p, c) in enumerate(SEGMENTS):                                             # parents come first
+        out[:, c] = out[:, p] + lengths[:, b] * ways[:, b]
+    for anchor, points in FOLLOWERS.items():
+        out[:, points] = out[:, [anchor]] + vec(P[:, points] - P[:, [anchor]])
+    for c, members in CENTROIDS.items():
+        if c not in (HIP_C, SHOULDER_C, EAR_C):
+            out[:, c] = out[:, list(members)].mean(axis=1)
     return out
 
 
@@ -763,12 +831,13 @@ def _fill_gaps(rel, w, fps, times=None):
 
 def combine_improved(front_list, side_list, front_times, side_times, front_vis=None, side_vis=None,
                      smoothing=1.5, bone_strength=0.8, offset=None, sync="OFFSET", side_angle=None,
-                     front_depth_confidence=None):
+                     front_depth_confidence=None, smoothing_method=None):
     """
         :param front_list/side_list: tracked frames (flat 40 * [x, y, z]).
         :param front_times/side_times: time of each tracked frame in its own video (seconds).
         :param front_vis/side_vis: 40 visibility scores per frame (optional).
         :param smoothing: Gaussian sigma in frames for depth (half of it for x/y). 0 = off.
+        :param smoothing_method: 'PEAKS' or 'ONE_EURO' (see SMOOTH_METHOD); None: SMOOTH_METHOD.
         :param bone_strength: 0..1, how strongly depth is corrected to keep bone lengths.
         :param offset: force the side time offset (seconds) instead of finding it.
         :param sync: 'OFFSET' one time offset (both videos filmed at the same time), 'WARP' time warp
@@ -916,10 +985,12 @@ def combine_improved(front_list, side_list, front_times, side_times, front_vis=N
     w_eff = w + (1 - w) * conf
 
     # 6. Smoothing
-    D = _gauss_timed(D, tF, smoothing, peaks=SMOOTH_PEAKS)
-    XY = _gauss_timed(F[:, :, :2], tF, smoothing / 2, peaks=SMOOTH_PEAKS)
     F_out = F.copy()
-    F_out[:, :, :2] = XY
+    if (smoothing_method or SMOOTH_METHOD) == 'ONE_EURO':
+        D = euro_skeleton(np.concatenate([F[:, :, :2], D[:, :, None]], axis=2), tF, smoothing)[:, :, 2]
+    else:
+        D = _gauss_timed(D, tF, smoothing, peaks=SMOOTH_PEAKS)
+    F_out[:, :, :2] = _gauss_timed(F[:, :, :2], tF, smoothing / 2, peaks=SMOOTH_PEAKS)
 
     # 7. Constant bone lengths
     persp = front_perspective_scale(F_out, fps)
@@ -1028,7 +1099,7 @@ def fit_view_direction(F, D, view):
 
 
 def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5, bone_strength=0.8,
-                  offset=None, sync="OFFSET", side_angle=None, front_depth_confidence=None):
+                  offset=None, sync="OFFSET", side_angle=None, front_depth_confidence=None, smoothing_method=None):
     """
         Front video plus any number of other views.
         :param views: [{"frames": flat 40 * [x, y, z] per frame, "times": [...], "vis": [...] or None,
@@ -1041,7 +1112,8 @@ def combine_multi(front_list, views, front_times, front_vis=None, smoothing=1.5,
     tF = np.asarray(front_times, dtype=np.float64)
     visF = np.clip(np.asarray(front_vis, dtype=np.float64), 0.0, 1.0) if front_vis is not None else np.ones((len(F), N_PTS))
     fps = _fps(tF)
-    common = dict(smoothing=smoothing, bone_strength=bone_strength, front_depth_confidence=front_depth_confidence)
+    common = dict(smoothing=smoothing, bone_strength=bone_strength, front_depth_confidence=front_depth_confidence,
+                  smoothing_method=smoothing_method)
     notes = [dict(name=v.get("name") or f"view {i + 1}", use="left out", reason="") for i, v in enumerate(views)]
 
     # A first depth from the front view and one other: the side view, or the first further one that works

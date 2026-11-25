@@ -246,6 +246,7 @@ class PoseTrackingPanel(bpy.types.Panel):
                 sub.enabled = not scene.combine_auto_angle
                 sub.prop(scene, "combine_side_angle", text="Angle")
                 box.prop(scene, "combine_smoothing")
+                box.prop(scene, "combine_smoothing_method", text="")
                 box.prop(scene, "combine_bone_strength")
                 row = box.row(align=True)
                 row.prop(scene, "combine_perspective", toggle=True)

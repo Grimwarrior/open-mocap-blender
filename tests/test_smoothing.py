@@ -6,6 +6,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import smoothing as S  # noqa: E402
 
 
@@ -112,6 +113,52 @@ class LiveHandsBehaviour(unittest.TestCase):
         self.assertAlmostEqual(live.filters["R"].min_cutoff, S.MIN_CUTOFF / S.strength_scale(90))
         live.set_strength(0)
         self.assertEqual(live.filters, {})
+
+
+class OfflineRotations(unittest.TestCase):
+    """The offline One Euro on bone directions (Combine Data's ONE_EURO smoothing)."""
+
+    def test_slerp_turns_along_the_great_circle(self):
+        a, b = np.array([[1.0, 0, 0]]), np.array([[0, 1.0, 0]])
+        np.testing.assert_allclose(S.slerp(a, b, np.array([[0.5]])), [[np.sqrt(0.5), np.sqrt(0.5), 0]], atol=1e-12)
+        np.testing.assert_allclose(S.slerp(a, a, np.array([[0.3]])), a)
+
+    def test_two_passes_leave_no_lag(self):
+        t = np.arange(0, 3, 1 / 30)
+        angle = 2.0 * t                                              # turning at 2 rad/s
+        way = np.stack([np.cos(angle), np.sin(angle), 0 * t], axis=1)[:, None]
+        rng = np.random.default_rng(0)
+        noisy = S._unit(way + rng.normal(size=way.shape) * 0.03)
+        cut = (4.0, 0.5, 60.0)
+        f = S.OneEuroDirections(cut)
+        forward = np.array([f.update(v, ti) for v, ti in zip(noisy, t)])
+        both = S.zero_phase(lambda: S.OneEuroDirections(cut), noisy, t, directions=True)
+        err = lambda w: np.degrees(np.arccos(np.clip(np.sum(w[15:-15] * way[15:-15], axis=-1), -1, 1))).mean()
+        self.assertLess(err(both), 0.5 * err(forward))               # the forward pass alone trails
+        self.assertLess(err(both), np.degrees(0.03) * 1.2)
+        np.testing.assert_allclose(np.linalg.norm(both, axis=-1), 1.0, atol=1e-9)
+
+    def test_combine_with_one_euro_bones(self):
+        import combine
+        import synthetic_combine as bench
+        take = bench.make_take(seed=0)
+        rows = {}
+        for method in ("PEAKS", "ONE_EURO"):
+            frames, report = combine.combine_improved(take["front"], take["side"], take["tF"], take["tS"], take["visF"],
+                                                      take["visS"], smoothing_method=method)
+            self.assertTrue(report.get("combined", True))
+            rows[method] = bench.evaluate(frames, take)
+        euro, peaks = rows["ONE_EURO"], rows["PEAKS"]
+        self.assertLess(euro["depth"], 1.3 * peaks["depth"])          # 1.20 against 1.08 % (three seeds)
+        self.assertGreater(euro["strike"], 80.0)
+        self.assertEqual(euro["xy"], peaks["xy"])                    # width/height smoothed the same way
+
+    def test_off_and_short_takes_pass_through(self):
+        import combine
+        P = np.random.default_rng(1).normal(size=(10, 40, 3))
+        t = np.arange(10) / 30.0
+        np.testing.assert_array_equal(combine.euro_skeleton(P, t, 0.0), P)
+        np.testing.assert_array_equal(combine.euro_skeleton(P[:2], t[:2], 1.5), P[:2])
 
 
 if __name__ == "__main__":

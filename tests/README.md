@@ -12,7 +12,10 @@ build the add-on, open Blender, load detector models, or change a Blender scene.
 tests use mock Blender objects; they do not validate Blender's dependency graph or UI.
 `test_smoothing.py` checks the live hand filter against a synthetic hand with known motion
 (still, slow drift, finger curl and fast swipes, 2% jitter): steadier when still, not worse when
-slow, and under a quarter of a hand length behind in a fast swipe.
+slow, and under a quarter of a hand length behind in a fast swipe. Its `OfflineRotations` tests
+cover Combine Data's One Euro on Bones: great-circle turns, no lag from the forward-backward
+passes, and a full combine that stays within 30% of the Gaussian's depth error with the same
+width/height and at least 80% of the strike speed.
 
 Run the foot-lock integration check from the same directory with Blender 5.1:
 

@@ -78,6 +78,14 @@ def register():
     bpy.types.Scene.combine_smoothing = bpy.props.FloatProperty(
         name="Smoothing", default=1.5, min=0.0, max=10.0,
         description="Smoothing over time in frames (depth; half of it for width/height). 0 = off")
+    bpy.types.Scene.combine_smoothing_method = bpy.props.EnumProperty(
+        name="Smoothing Method", default='PEAKS',
+        items=[('PEAKS', "Peak-Keeping Gaussian",
+                "Every joint's depth on its own, with a window that follows peaks and fast moves (best measured)"),
+               ('ONE_EURO', "One Euro on Bones",
+                "Depth from the skeleton smoothed as a body: hip path, each bone's turn and length, by a "
+                "speed-adaptive One Euro filter run both ways. Steadier holds in theory; measured a little "
+                "jitterier than the Gaussian on the synthetic test")])
     bpy.types.Scene.combine_auto_offset = bpy.props.BoolProperty(
         name="Auto Sync", default=True,
         description="Find the time offset between the front and side videos automatically")
@@ -228,6 +236,7 @@ def unregister():
     del bpy.types.Scene.realtime_tracking
     del bpy.types.Scene.combine_method
     del bpy.types.Scene.combine_smoothing
+    del bpy.types.Scene.combine_smoothing_method
     del bpy.types.Scene.combine_bone_strength
     del bpy.types.Scene.combine_perspective
     del bpy.types.Scene.combine_fov
